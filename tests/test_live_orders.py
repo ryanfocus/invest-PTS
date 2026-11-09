@@ -21,6 +21,7 @@ from day_script import DAY, PREVIOUS_DAY, at, calm_history, clock, minute, rally
 from fake_skcom import TMF_INDEX, TX_INDEX, FakeSkcom, reply_row
 from recording import RecordingNotifier
 import intraday
+import paths
 import position_file
 import settings
 
@@ -80,6 +81,26 @@ def test_a_strong_open_sends_a_market_order_writes_the_fill_and_reports_it():
         "uncertain": None,
     }
 
+
+
+# --- 委託失敗的處理（ticket 07）完成之前，排程的進入點不接受自動下單 ---
+
+
+def test_until_order_failures_are_handled_the_scheduled_program_refuses_auto_ordering(
+        tmp_path, monkeypatch, caplog):
+    """`run()` 已經會真的下單，但委託被拒、成交不確定還沒有處理（ticket 07）：成交不確定時
+    部位檔不會記成「不確定」、也不告警，排程重啟後照缺了一筆的檔繼續進場；被拒的單則每次
+    重啟再送一次。所以在 07 完成之前，`main()` 看到自動下單打開就拒絕啟動：不讀帳密、
+    不登入、不送單。**ticket 07 拿掉這條測試與 `main()` 裡的防護。**"""
+    with open(paths.config_path(), encoding="utf-8") as fh:
+        text = fh.read().replace("auto_enabled: false", "auto_enabled: true")
+    config = tmp_path / "settings.yaml"
+    config.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(paths, "config_path", lambda: str(config))
+    monkeypatch.setattr(paths, "env_path", lambda: str(tmp_path / "不該讀到這裡.env"))
+
+    assert intraday.main() == 1
+    assert "ticket 07" in caplog.text
 
 
 # --- 自動下單關閉：零呼叫（規格第 42 條）---
@@ -222,6 +243,53 @@ def test_the_fill_is_on_file_before_the_message_goes_out():
     assert notifier.lots_on_file == [1, 2]
 
 
+def _locked(monkeypatch) -> None:
+    """置換那一步失敗：Windows 上防毒或索引程式剛好開著正式檔時，`os.replace` 就是這樣。"""
+    def denied(src, dst):
+        raise PermissionError(13, "存取被拒")
+    monkeypatch.setattr(os, "replace", denied)
+
+
+def test_a_fill_that_cannot_be_written_to_the_position_file_is_reported_and_ends_entries(
+        monkeypatch, state_dir):
+    """單已經成交，寫部位檔卻失敗。部位檔是出場程式唯一看的東西：沒有這一口的話，13:25
+    什麼都不平，微台就帶著部位過夜。所以立刻發「部位還在」的告警，講明這次成交了什麼、
+    要人自己平掉；之後的部位檔和帳上對不上，加碼上限與部位不虧都算不準，今天不再進場
+    （08:51 條件仍然成立，也不送）。盤中程式不因此中止：原始行情照樣記到收工。"""
+    _locked(monkeypatch)
+    broker = FakeBroker(contracts=CONTRACTS,
+                        events=rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
+                        minute_bars={PREVIOUS_DAY: calm_history(45000)})
+    notifier = RecordingNotifier()
+    outcome = intraday.run(broker, _config(), today=DAY, notify=notifier)
+
+    assert [(o.side, o.lots) for o in broker.orders] == [(BUY, 1)]
+    assert notifier.sent == [
+        "【要你處理】PTS 部位還在，部位檔卻沒記到這次成交\n"
+        "這次：買進微台 1 口 @ 45150（委託序號 2315610000001）\n"
+        "帳上 PTS 共多單 1 口，部位檔只記到 0 口\n"
+        "原因：PermissionError: [Errno 13] 存取被拒\n"
+        "出場程式和盤中程式都只認部位檔，不知道這 1 口：請到券商 APP 確認帳戶，"
+        "自行平掉這 1 口。盤中程式今天不再進場。\n"
+        "2026/11/09 08:50:00",
+    ]
+    assert outcome.ending is intraday.Ending.STREAM_ENDED
+    assert os.listdir(state_dir) == []
+
+
+def test_when_the_write_fails_after_earlier_fills_the_alert_says_how_many_lots_are_on_file(
+        monkeypatch):
+    """部位檔已經有今天稍早的 2 口：出場程式會平那 2 口，要人自己平的只有寫不進去的這 1 口。
+    檔案維持寫壞之前的樣子。"""
+    content = _on_file()
+    _locked(monkeypatch)
+    broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
+    assert len(broker.orders) == 1
+    assert sent[0].splitlines()[1:3] == ["這次：買進小台 1 口 @ 45150（委託序號 2315610000001）",
+                                         "帳上 PTS 共多單 3 口，部位檔只記到 2 口"]
+    assert _file() == content
+
+
 def test_the_fill_is_on_file_even_with_discord_switched_off():
     _, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
                    config=_config(discord_enabled=False))
@@ -286,11 +354,38 @@ def test_a_position_already_on_file_today_decides_the_product_not_the_settings()
 
 
 def test_the_lots_on_file_count_toward_the_cap():
-    """加碼上限 3、部位檔已有 2 口：今天只剩 1 口的空間。"""
+    """加碼上限 3、每次 2 口、部位檔已有 2 口：今天只剩 1 口的空間，第一筆就只送 1 口。
+    重啟時沒把檔裡的口數算進去的話，第一筆會送 2 口、衝過上限。"""
     _on_file()
     broker, _ = _run(rally("08:45", 7) + [trade(at("08:52:00"), 45170)],
-                     config=_config(max_position=3))
+                     config=_config(lots_per_entry=2, max_position=3))
     assert [o.lots for o in broker.orders] == [1]
+
+
+def test_a_position_on_file_that_is_losing_blocks_conditions_1_and_2():
+    """部位檔記著多單 2 口 @ 46000，小台現價只有 45100 上下：部位在虧，條件 1、2 要求的
+    「部位不虧」不成立，整個早上一筆都不送。重啟時沒把檔裡的部位恢復的話，會被當成
+    沒有部位（「部位不虧」直接成立）而照樣加碼。"""
+    _on_file(entries=[{"order_seq": "2315619999999", "lots": 2, "price": 46000.0}])
+    broker, sent = _run(rally("08:45", 8) + [trade(at("08:53:00"), 45180)])
+    assert broker.orders == []
+    assert sent == []
+
+
+@pytest.mark.parametrize("auto", [True, False], ids=["自動下單", "模擬模式"])
+def test_a_signal_against_the_direction_on_file_is_never_entered(auto):
+    """一天只做一個方向（規格第 17 條）。部位檔記著今天稍早的多單 2 口 @ 44000，重啟後
+    這一次卻判斷成開低（例如前一交易日的 1 分 K 這次查不到，往前多退一天，昨收變了），
+    條件 2 每分鐘成立。賣單一送出，倉別「自動」會把它變成平倉：帳上剩 1 口，部位檔卻記成
+    多單 3 口，13:25 出場程式賣 3 口，就開出空單 2 口帶過夜。所以一筆都不送、不寫、
+    不發成交訊息；模擬模式也不把反向的口數累計進部位。"""
+    content = _on_file(entries=[{"order_seq": "2315619999999", "lots": 2, "price": 44000.0}])
+    events = (rally("08:45", 6, open_=44900, step=-10, bichai=-1500)
+              + [trade(at("08:51:00"), 44830)])
+    broker, sent = _run(events, config=_config(auto_order_enabled=auto))
+    assert broker.orders == []
+    assert sent == []
+    assert _file() == content
 
 
 def test_a_position_file_left_from_another_day_is_not_todays_position():
