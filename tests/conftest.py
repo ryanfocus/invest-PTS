@@ -34,6 +34,15 @@ def market_dir(tmp_path_factory, monkeypatch):
     return directory
 
 
+@pytest.fixture(autouse=True)
+def state_dir(tmp_path_factory, monkeypatch):
+    """**測試絕不碰正式的部位檔。** 出場程式 13:25 照著它平倉；混進一份假劇本寫的部位，
+    它就會去平一個不存在的部位——那一筆「平倉」單是開出來的反向新倉。"""
+    directory = tmp_path_factory.mktemp("state")
+    monkeypatch.setattr(paths, "state_dir", lambda: str(directory))
+    return directory
+
+
 class _RealComForbidden:
     def __init__(self, *args, **kwargs):
         raise AssertionError(

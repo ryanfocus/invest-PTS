@@ -64,6 +64,9 @@ class FakeBroker:
         # 這是唯一會動到錢的路徑，證明它沒被走過比證明它走對了更重要。
         # 被 `ensure_sendable` 擋下的委託沒有送出去，所以不在這裡。
         self.orders: list[OrderRequest] = []
+        # `events(product)` 被要求訂閱的交易商品，依序。劇本用不到它，但真 broker 拿它去
+        # 訂閱：流程訂錯商品，「部位不虧」看的就是別的商品的價格。
+        self.streamed: list[str] = []
 
     def login(self) -> None:
         if self._login_error is not None:
@@ -84,6 +87,7 @@ class FakeBroker:
         但傳錯代碼的流程在真 broker 上會訂錯商品，不能在這裡默默放行。"""
         if product not in PRODUCT_CODES:
             raise ValueError(f"交易商品必須是 {PRODUCT_CODES} 其中之一，收到 {product!r}")
+        self.streamed.append(product)
         for event in self._events:
             if isinstance(event, ProductTrade):
                 self._last_product_price = event.price

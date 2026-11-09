@@ -40,7 +40,7 @@ def test_every_module_imports_on_a_machine_without_the_capital_component(tmp_pat
 
     modules = ["paths", "settings", "calendar_tw", "broker", "broker.capital_wire",
                "broker.fake", "broker.capital", "indicators", "raw_market", "intraday",
-               "strategy", "messages", "notifiers.discord"]
+               "strategy", "messages", "notifiers.discord", "position_file"]
     code = "import " + ", ".join(modules)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(ROOT)])}
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,

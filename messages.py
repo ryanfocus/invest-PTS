@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from broker import MTX_CODE, TMF_CODE, TX_CODE
 import strategy
@@ -32,6 +32,22 @@ def entry(*, at: datetime, product: str, direction: str, condition: strategy.Con
         f"觸發：{condition.value}\n"
         f"累計：{_HOLDING_TEXT[direction]} {total_lots} 口，均價 {_points(avg_price)}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def position_file_unreadable(*, day: date, reason: str) -> str:
+    """部位檔讀不懂（規格第 38 條）。盤中程式這一天不進場。
+
+    刻意不說「今天沒有部位」：真相是「可能有部位，但讀不到記錄」。要人做的事寫在前面：
+    看帳戶。出場程式也讀同一個檔，同樣不會自動平倉——不講的話，使用者會以為 13:25
+    有人替他收尾。
+    """
+    return (
+        "【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場\n"
+        f"原因：{reason}\n"
+        "今天 PTS 可能已經有部位：請到券商 APP 確認帳戶。"
+        "13:25 的出場程式同樣讀不懂這個檔，不會替你平倉。\n"
+        f"{day:%Y/%m/%d}"
     )
 
 
