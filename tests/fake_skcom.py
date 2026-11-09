@@ -15,11 +15,11 @@
   * 行情：`SKQuoteLib_RequestTicks` 回 `(page, 代碼)`；訂閱之後，`market` 劇本裡的行情事件
     （逐筆成交、累計筆數）在下一次訊息幫浦時送達。成交事件只帶商品的系統索引
     `nIndex`，對應哪個商品要先用 `SKQuoteLib_GetStockByNoLONG` 查（`stock_index`）
+  * 結構（`SKSTOCKLONG`、`FUTUREORDER`）只認型別庫裡有的欄位名，見 `_Struct`
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 
 STOCKS_READY = 3003
 
@@ -48,6 +48,56 @@ PRODUCT_LIST = (
     "TM0000AM,微台近,20261118,TMFK600;"
     "TM2611AM,微台2611,20261118,TMFK6;"
 )
+
+
+class _Struct:
+    """群益 comtypes 結構的替身：**只認型別庫裡有的欄位名**，寫錯就 AttributeError。
+
+    為什麼不用 SimpleNamespace：它什麼名字都收，`stock.nStockidx`（真的叫 `nStockIdx`）
+    這種錯字在測試裡會過，實機卻在交出第一個行情事件前就當掉（2026-11 審查發現）。
+    真的 ctypes 結構讀錯名字會拋錯，**寫**錯名字卻會默默多一個沒人看的屬性——
+    委託欄位拼錯，送出去的就是預設值。這裡讀寫都擋，讓兩種錯字都在測試裡失敗。
+    沒寫過的欄位讀到預設值（字串 None、數字 0），和剛建立的真結構一樣；
+    `vars()` 只列出寫過的欄位。
+    """
+
+    FIELDS: frozenset[str] = frozenset()
+
+    def _check(self, name: str) -> None:
+        if name not in self.FIELDS:
+            raise AttributeError(f"{type(self).__name__} 沒有欄位 {name!r}")
+
+    def __setattr__(self, name: str, value) -> None:
+        self._check(name)
+        super().__setattr__(name, value)
+
+    def __getattr__(self, name: str):        # 只有沒寫過的名字才會走到這裡
+        self._check(name)
+        return None if name.startswith("bstr") else 0
+
+
+# 欄位名照抄 2.13.58 的 comtypes 產生檔（comtypes/gen/_75AAD71C_..._0_1_0.py 的 `_fields_`）。
+# 型別庫的名稱表不分大小寫、只存一種寫法：是 `nStockIdx`。官方文件與範例的事件參數寫成
+# `nStockidx`，但事件參數是照位置傳的，名字不算數；結構的欄位名才算數。
+class SKSTOCKLONG(_Struct):
+    FIELDS = frozenset((
+        "nStockIdx", "sDecimal", "sTypeNo", "bstrMarketNo", "bstrStockNo", "bstrStockName",
+        "bstrStockNoSpread", "nOpen", "nHigh", "nLow", "nClose", "nTickQty", "nRef", "nBid",
+        "nBc", "nAsk", "nAc", "nTBc", "nTAc", "nFutureOI", "nTQty", "nYQty", "nUp", "nDown",
+        "nSimulate", "nDayTrade", "nTradingDay", "nTradingLotFlag", "nDealTime", "nOddLotBid",
+        "nOddLotAsk", "nOddLotClose", "nOddLotQty",
+    ))
+
+
+class FUTUREORDER(_Struct):
+    FIELDS = frozenset((
+        "bstrFullAccount", "bstrStockNo", "bstrStockNo2", "bstrPrice", "bstrPrice2",
+        "bstrTrigger", "bstrTrigger2", "bstrMovingPoint", "bstrDealPrice", "sTradeType",
+        "sBuySell", "sBuySell2", "sDayTrade", "sNewClose", "nQty", "sReserved", "nTimeFlag",
+        "nOrderPriceType", "bstrCIDTandem", "bstrOrderSign", "bstrSettlementMonth",
+        "bstrStrikePrice", "bstrOrderType", "bstrSeqNo", "bstrBookNo", "nCallPut", "nCurrency",
+        "nTriggerDirection", "nResultFormat", "nFlag",
+    ))
 
 
 # 商品的系統索引（逐筆成交事件只帶這個）。數字本身沒有意義，只要三個商品互不相同。
@@ -88,7 +138,7 @@ class FakeSkcom:
         # 所有函式呼叫，依序：(元件名, 函式名, 參數)
         self.calls: list[tuple] = []
         # 送到 SendFutureOrderCLR 的委託物件
-        self.sent: list[SimpleNamespace] = []
+        self.sent: list[FUTUREORDER] = []
         self._sinks: dict[str, list] = {}
         self._pending: list[tuple[str, str, tuple]] = []
         self._sent_any = False
@@ -115,11 +165,11 @@ class FakeSkcom:
                 if handler is not None:
                     handler(*args)
 
-    def new_future_order(self) -> SimpleNamespace:
-        return SimpleNamespace()
+    def new_future_order(self) -> FUTUREORDER:
+        return FUTUREORDER()
 
-    def new_stock(self) -> SimpleNamespace:
-        return SimpleNamespace()
+    def new_stock(self) -> SKSTOCKLONG:
+        return SKSTOCKLONG()
 
     # --- 給元件替身用 ---
 
@@ -175,7 +225,7 @@ class FakeSkcom:
     def _SKQuoteLib_GetStockByNoLONG(self, code, stock):
         ret = self.quote_codes.get("SKQuoteLib_GetStockByNoLONG", 0)
         if ret == 0:
-            stock.nStockidx = self.stock_index[code]
+            stock.nStockIdx = self.stock_index[code]
         return stock, ret
 
     def _SKQuoteLib_RequestFutureTradeInfo(self, page, code):

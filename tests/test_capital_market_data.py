@@ -180,7 +180,7 @@ def test_trading_tx_subscribes_its_ticks_only_once():
 def _trade_info(buy_deals: int, sell_deals: int, code: str = TX_CODE) -> tuple:
     """`OnNotifyFutureTradeInfoLONG` 的參數（文件 4-4-q）。前四個數字是**委託**的
     筆數與口數，筆差用不到；最後兩個才是**成交**買進／賣出筆數。"""
-    #                               sMarketNo nStockidx 委買筆 委賣筆 委買口 委賣口 成交買筆 成交賣筆
+    #                               sMarketNo nStockIdx 委買筆 委賣筆 委買口 委賣口 成交買筆 成交賣筆
     return "OnNotifyFutureTradeInfoLONG", (code, 2, TX_INDEX, 9000, 9100, 30000, 31000,
                                            buy_deals, sell_deals)
 

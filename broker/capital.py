@@ -249,7 +249,7 @@ class _QuoteEvents:
 
     OnNotifyHistoryTicksLONG = OnNotifyTicksLONG
 
-    def OnNotifyFutureTradeInfoLONG(self, bstrStockNo, sMarketNo, nStockidx, nBuyTotalCount,
+    def OnNotifyFutureTradeInfoLONG(self, bstrStockNo, sMarketNo, nStockIdx, nBuyTotalCount,
                                     nSellTotalCount, nBuyTotalQty, nSellTotalQty,
                                     nBuyDealTotalCount, nSellDealTotalCount):
         """大台的累計筆數（文件 4-4-q）。筆差用的是最後兩個：**成交**買進／賣出筆數。
@@ -483,8 +483,8 @@ class CapitalBroker:
             stock, ret = self._quote.SKQuoteLib_GetStockByNoLONG(code, self._com.new_stock())
             if ret != 0:
                 raise QuoteUnavailable(f"查不到 {code} 的商品資料，{self._message(ret)}")
-            self._quote_events.tick_codes[stock.nStockidx] = code
-            logger.info("已訂閱 %s 的逐筆成交（page %d，索引 %s）", code, page, stock.nStockidx)
+            self._quote_events.tick_codes[stock.nStockIdx] = code
+            logger.info("已訂閱 %s 的逐筆成交（page %d，索引 %s）", code, page, stock.nStockIdx)
         ret = self._quote.SKQuoteLib_RequestFutureTradeInfo(ctypes.c_short(0), TX_CODE)
         if ret != 0:
             raise QuoteUnavailable(f"訂閱 {TX_CODE} 的累計成交筆數失敗，{self._message(ret)}")
