@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from broker import MTX_CODE, TMF_CODE, TX_CODE
+from broker import DAY_TRADE_CODES, MTX_CODE, TMF_CODE, TX_CODE
 import strategy
 
 _PRODUCT_TEXT = {TX_CODE: "大台", MTX_CODE: "小台", TMF_CODE: "微台"}
@@ -34,6 +34,69 @@ def entry(*, at: datetime, product: str, direction: str, condition: strategy.Con
         f"{_SIDE_TEXT[direction]}{_PRODUCT_TEXT[product]} {lots} 口 @ {_points(price)}\n"
         f"觸發：{condition.value}{how}\n"
         f"累計：{_HOLDING_TEXT[direction]} {total_lots} 口，均價 {_points(avg_price)}\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def order_not_sent(*, at: datetime, product: str, direction: str, lots: int,
+                   reason: str, held_lots: int) -> str:
+    """委託沒有送出去（規格第 41、51 條）：**確定沒有部位**。盤中程式今天不再進場。
+
+    刻意叫人**不必**看帳戶（invest-os 2026-08-25 的教訓）：這一則對應的是「確定沒有送出去」，
+    叫人白跑幾趟券商 APP 之後，真的要看帳戶的那一則（`fill_unknown`）就沒人看了。
+    要做的事是排除原因：保證金不足、憑證過期這類原因明天還在，明天會再被拒一次。
+    `held_lots` 是部位檔裡今天稍早已確認的口數：它們照常了結，講出來使用者才不會起疑。
+    """
+    earlier = (f"今天稍早的{_HOLDING_TEXT[direction]} {held_lots} 口不受影響，照常了結。\n"
+               if held_lots else "")
+    return (
+        "【要你處理】PTS 委託沒有送出去，今天不再進場\n"
+        f"這次：{_SIDE_TEXT[direction]}{_PRODUCT_TEXT[product]} {lots} 口\n"
+        f"原因：{reason}\n"
+        f"{earlier}"
+        "帳上不會因為這筆多出部位，不必看帳戶。"
+        "請依原因處理（例如補足保證金、更新憑證），明天開盤前排除。\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order_seq: str,
+                 known_filled: int, reason: str, held_lots: int, file_error: str | None) -> str:
+    """委託送出去了，但不知道成交幾口（規格第 41、50 條）：**可能有部位**。
+
+    所有告警裡最需要人立刻動手的一則，所以講的是「去做什麼」：先看帳戶，再看誰會了結。
+    大台、小台標了當沖，券商 13:30 照樣強平。微台沒有當沖強平，要人平幾口取決於部位檔：
+
+      * 已記成「不確定」（`file_error` 是 None）：出場程式看到它就**整個**不平（規格第 50 條），
+        連部位檔裡確認過的 `held_lots` 口也不平——要人平的是兩者加起來。
+      * 寫不進去：檔裡還是之前「已確認」的那一份，出場程式 13:25 照樣平那 `held_lots` 口，
+        要人平的**只有這一筆**。這時叫人全部平掉，出場程式再平一次就是反向新倉過夜。
+
+    `known_filled` 是已知**至少**成交的口數：對帳時至少要看到這麼多。
+    """
+    name = _PRODUCT_TEXT[product]
+    holding = _HOLDING_TEXT[direction]
+    seq = f"委託序號 {order_seq}" if order_seq else "沒拿到委託序號"
+    known = f"，已知至少成交 {known_filled} 口" if known_filled else ""
+    if file_error is None:
+        on_file = "部位檔已記為「不確定」：盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。"
+    else:
+        on_file = (f"部位檔寫不進「不確定」（{file_error}），還是之前的樣子："
+                   "出場程式不知道這筆委託。盤中程式今天不再進場。")
+    if product in DAY_TRADE_CODES:
+        who_closes = f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
+    elif file_error is None:
+        held = f"（部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的）" if held_lots else ""
+        who_closes = f"{name}沒有當沖強平：PTS 今天的{name}部位{held}要你自己在 13:30 前平掉。"
+    else:
+        held = f"出場程式只會平部位檔裡的{holding} {held_lots} 口，" if held_lots else ""
+        who_closes = f"{name}沒有當沖強平：{held}這筆實際成交的要你自己在 13:30 前平掉。"
+    return (
+        "【要你處理】PTS 委託送出去了，但不知道成交幾口\n"
+        f"這次：{_SIDE_TEXT[direction]}{name} {lots} 口（{seq}）{known}\n"
+        f"原因：{reason}\n"
+        f"{on_file}\n"
+        f"請到券商 APP 確認這筆成交了幾口。{who_closes}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 

@@ -21,7 +21,6 @@ from day_script import DAY, PREVIOUS_DAY, at, calm_history, clock, minute, rally
 from fake_skcom import TMF_INDEX, TX_INDEX, FakeSkcom, reply_row
 from recording import RecordingNotifier
 import intraday
-import paths
 import position_file
 import settings
 
@@ -80,27 +79,6 @@ def test_a_strong_open_sends_a_market_order_writes_the_fill_and_reports_it():
         "exits": [],
         "uncertain": None,
     }
-
-
-
-# --- 委託失敗的處理（ticket 07）完成之前，排程的進入點不接受自動下單 ---
-
-
-def test_until_order_failures_are_handled_the_scheduled_program_refuses_auto_ordering(
-        tmp_path, monkeypatch, caplog):
-    """`run()` 已經會真的下單，但委託被拒、成交不確定還沒有處理（ticket 07）：成交不確定時
-    部位檔不會記成「不確定」、也不告警，排程重啟後照缺了一筆的檔繼續進場；被拒的單則每次
-    重啟再送一次。所以在 07 完成之前，`main()` 看到自動下單打開就拒絕啟動：不讀帳密、
-    不登入、不送單。**ticket 07 拿掉這條測試與 `main()` 裡的防護。**"""
-    with open(paths.config_path(), encoding="utf-8") as fh:
-        text = fh.read().replace("auto_enabled: false", "auto_enabled: true")
-    config = tmp_path / "settings.yaml"
-    config.write_text(text, encoding="utf-8")
-    monkeypatch.setattr(paths, "config_path", lambda: str(config))
-    monkeypatch.setattr(paths, "env_path", lambda: str(tmp_path / "不該讀到這裡.env"))
-
-    assert intraday.main() == 1
-    assert "ticket 07" in caplog.text
 
 
 # --- 自動下單關閉：零呼叫（規格第 42 條）---

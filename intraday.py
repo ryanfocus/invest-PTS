@@ -7,11 +7,23 @@
 每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。條件成立時：
 
   * 自動下單打開：送出市價 IOC → 把實際成交寫進部位檔 → 發一則成交訊息（ticket 06）。
-    委託失敗的處理（ticket 07）完成之前，`main()` 拒絕在自動下單打開時啟動。
   * 自動下單關閉（模擬模式）：在交易商品當下的價格模擬成交，發一則標示「模擬」的訊息，
     **完全不呼叫下單 API**、不寫部位檔（ticket 04）。
 
 立刻進場與突破進場被觸發走的是同一條路（`_Trading._execute`），開關只在那裡分岔。
+
+## 委託出事（ticket 07）
+
+分界線是「單有沒有送出去」（規格第 41、50、51 條）。不管哪一種，**今天都不再進場**，
+發一則告警，盤中程式照樣跑到 13:20（原始行情繼續記）：
+
+  * **委託沒有送出去**（`OrderFailed`：被拒、憑證、回報連線斷了）：確定沒有部位，部位檔
+    不動。不再進場是因為同一個原因下一分鐘還在，否則每分鐘都會再被拒、再告警一次。
+  * **委託送出去了，但不知道成交幾口**（`FillUnknown`，以及送單時任何其他意外——這裡分不出
+    單出去了沒有，分不清就是可能有部位）：部位檔改成「不確定」，出場程式看到就不自動平倉。
+  * **部位還在**，部位檔卻沒記到（ticket 06 的 `_FillNotOnFile`）。
+
+三則告警用固定的說法開頭，使用者一眼分得出是哪一種（`messages`）。
 
 ## 突破進場的盯價
 
@@ -59,7 +71,8 @@ import position_file
 import settings
 import strategy
 from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
-                    OrderRequest, ProductTrade, TxTrade, TxTradeCounts)
+                    FillUnknown, OrderFailed, OrderRequest, ProductTrade, TxTrade,
+                    TxTradeCounts)
 from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
@@ -322,6 +335,22 @@ class _FillNotOnFile(Exception):
         self.on_file = on_file
 
 
+class _Uncertain(Exception):
+    """進場單送出去了，卻不知道成交幾口。訊息是不確定的原因。
+
+    `file_error` 是 None 代表部位檔已經記成「不確定」；否則是寫不進去的原因，
+    部位檔還是之前那一份（還沒有檔就是沒有）。
+    """
+
+    def __init__(self, *, order_seq: str, requested_lots: int, known_filled: int, reason: str,
+                 file_error: str | None):
+        super().__init__(reason)
+        self.order_seq = order_seq
+        self.requested_lots = requested_lots
+        self.known_filled = known_filled
+        self.file_error = file_error
+
+
 class _Orders:
     """真實下單：送出市價 IOC → 寫部位檔。只有自動下單打開時才存在。
 
@@ -339,25 +368,34 @@ class _Orders:
     def enter(self, direction: str, lots: int) -> position_file.Fill | None:
         """送出進場單，回傳**實際**成交（規格第 29 條）。0 口（當下沒有對手價）是 None。
 
-        委託失敗（`OrderFailed`／`FillUnknown`）目前原樣往外拋，盤中程式中止。
-        「當天停止進場、記成不確定、告警」是 ticket 07 的事，接在這裡。
+        出事的時候拋三種例外之一，分界線是「單有沒有送出去、成交有沒有記到」：
 
-        成交了卻寫不進部位檔是 `_FillNotOnFile`；`self.record` 維持檔裡那一份。
+          * `OrderFailed`：委託沒有送出去，確定沒有部位。部位檔不動。
+          * `_Uncertain`：送出去了，但不知道成交幾口（`FillUnknown`，或送單時任何其他意外）。
+            部位檔已經改成「不確定」——寫不進去的話，原因在 `file_error`。
+          * `_FillNotOnFile`：成交了卻寫不進部位檔；`self.record` 維持檔裡那一份。
         """
-        result = self._broker.place_order(OrderRequest(
-            contract=self._contract, side=_ENTRY_SIDE[direction], lots=lots,
-            trading_day=self._today))
+        request = OrderRequest(contract=self._contract, side=_ENTRY_SIDE[direction], lots=lots,
+                               trading_day=self._today)
+        try:
+            result = self._broker.place_order(request)
+        except OrderFailed:
+            raise
+        except FillUnknown as exc:
+            raise self._uncertain(direction, lots, exc.order_seq, exc.known_filled,
+                                  str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            # broker 的契約是只拋上面兩種，但它沒做到的時候，這裡分不出單出去了沒有。
+            # 分不清就是「可能有部位」（broker/__init__.py 的分界線）：當成沒送出去的話，
+            # 部位檔不記，出場程式以為今天沒進場，部位直接過夜。
+            raise self._uncertain(direction, lots, "", 0,
+                                  f"送單時發生意外（{type(exc).__name__}）：{exc}") from exc
         if not result.filled_lots:
             logger.warning("委託 %s 沒有成交（市價 IOC 當下沒有對手價），部位不變",
                            result.order_seq)
             return None
         fill = position_file.Fill(result.order_seq, result.filled_lots, result.avg_price)
-        record = self.record or position_file.PositionRecord(
-            trading_day=self._today, product=self._contract.code,
-            order_code=self._contract.order_code,
-            contract_month=self._contract.contract_month, direction=direction,
-            last_trading_day=self._contract.last_trading_day,
-            status=position_file.CONFIRMED, entries=())
+        record = self._current(direction)
         record = replace(record, entries=record.entries + (fill,))
         # ⚠️ 成交之後的**下一件事**就是寫檔（規格第 52 條）：發通知、記 log 都排在後面。
         #    中間任何一步出事（Discord 掛了、程式被關掉），出場程式仍然知道這幾口。
@@ -370,6 +408,41 @@ class _Orders:
             raise _FillNotOnFile(fill, record, self.record, exc) from exc
         self.record = record
         return fill
+
+    def _current(self, direction: str) -> position_file.PositionRecord:
+        """今天的部位檔內容；還沒有檔的話，用這次要下單的合約與方向開一份空的。"""
+        return self.record or position_file.PositionRecord(
+            trading_day=self._today, product=self._contract.code,
+            order_code=self._contract.order_code,
+            contract_month=self._contract.contract_month, direction=direction,
+            last_trading_day=self._contract.last_trading_day,
+            status=position_file.CONFIRMED, entries=())
+
+    def _uncertain(self, direction: str, lots: int, order_seq: str, known_filled: int,
+                   reason: str) -> _Uncertain:
+        """把送出去卻不知道成交幾口的那一筆記進部位檔，狀態改成「不確定」。
+
+        已經確認的成交照留在 `entries`：它們是真的。不確定的那一筆不放進 `entries`——
+        不知道口數，也沒有成交價——而是記在 `uncertain`，出場程式看到就不自動平倉。
+        """
+        def uncertain(file_error: str | None) -> _Uncertain:
+            return _Uncertain(order_seq=order_seq, requested_lots=lots,
+                              known_filled=known_filled, reason=reason, file_error=file_error)
+
+        try:
+            order = position_file.UncertainOrder(
+                stage=position_file.ENTRY, order_seq=order_seq, requested_lots=lots,
+                known_filled=known_filled)
+            record = replace(self._current(direction), status=position_file.UNCERTAIN,
+                             uncertain=order)
+            position_file.write(record)
+        except Exception as exc:  # noqa: BLE001
+            # 寫不進去（檔案被鎖、磁碟滿），或 broker 給的數字組不成一筆記錄：部位檔還是
+            # 之前那一份，出場程式照它平倉。冒出 `run()` 的話程式帶著 traceback 結束，
+            # 一則告警都沒有；所以照樣告警，講清楚檔裡還是舊的。
+            return uncertain(f"{type(exc).__name__}: {exc}")
+        self.record = record
+        return uncertain(None)
 
 
 def _held(record: position_file.PositionRecord | None) -> strategy.Position | None:
@@ -399,8 +472,9 @@ class _Trading:
         self._product = product
         self.position = _held(record)
         # 當天不再進場。部位不確定時，帳上的口數不知道，部位不虧、加碼上限都算不了
-        # （規格第 50 條）；成交寫不進部位檔時也打開（`_not_on_file`）。ticket 07 在
-        # 委託被拒、成交不確定時也會把它打開。
+        # （規格第 50 條）——啟動時讀到「不確定」、或今天這裡送出的委託變成不確定
+        # （`_fill_unknown`）；委託被拒（`_not_sent`）、成交寫不進部位檔（`_not_on_file`）
+        # 時也打開。只在記憶體裡：被拒之後重啟，會再試一次。
         self._stopped = record is not None and record.status == position_file.UNCERTAIN
         if self._stopped:
             logger.warning("部位檔記著一筆不確定的委託（%s），今天不再進場", record.uncertain)
@@ -504,6 +578,12 @@ class _Trading:
             return
         try:
             fill = self._orders.enter(decision.direction, decision.lots)
+        except OrderFailed as exc:
+            self._not_sent(decision, exc, now)
+            return
+        except _Uncertain as exc:
+            self._fill_unknown(decision, exc, now)
+            return
         except _FillNotOnFile as exc:
             self._not_on_file(exc, now)
             return
@@ -519,6 +599,38 @@ class _Trading:
             condition=decision.condition, lots=fill.lots, price=fill.price,
             total_lots=record.entered_lots, avg_price=record.avg_price, simulated=False,
             trigger=trigger))
+
+    def _not_sent(self, decision: strategy.Enter, exc: OrderFailed, now: datetime) -> None:
+        """委託沒有送出去：確定沒有部位，部位檔不動。今天不再進場，告警只發這一次。
+
+        不再進場，是因為被拒的原因（保證金不足、憑證問題）下一分鐘還在：條件每分鐘成立，
+        就每分鐘再被拒一次、再發一則告警（規格第 51 條）。
+        """
+        self._stopped = True
+        logger.error("%s 的委託沒有送出去，今天不再進場：%s", decision.condition.value, exc)
+        self._send(messages.order_not_sent(
+            at=now, product=self._product, direction=decision.direction, lots=decision.lots,
+            reason=str(exc), held_lots=self.position.lots if self.position else 0))
+
+    def _fill_unknown(self, decision: strategy.Enter, exc: _Uncertain, now: datetime) -> None:
+        """委託送出去了，但不知道成交幾口：部位檔已記成「不確定」。今天不再進場、告警。
+
+        不再進場，是因為帳上的口數從這一刻起不知道：部位不虧、加碼上限都算不了
+        （規格第 50 條）。盤中程式照樣跑到收工，原始行情繼續記。
+        """
+        self._stopped = True
+        logger.error("%s 的委託 %s 送出去了，但不知道成交幾口（已知至少 %d 口），"
+                     "今天不再進場：%s", decision.condition.value,
+                     exc.order_seq or "（沒有序號）", exc.known_filled, exc)
+        if exc.file_error is None:
+            logger.error("部位檔已記為不確定")
+        else:
+            logger.error("部位檔寫不進「不確定」，還是之前的樣子：%s", exc.file_error)
+        self._send(messages.fill_unknown(
+            at=now, product=self._product, direction=decision.direction,
+            lots=exc.requested_lots, order_seq=exc.order_seq, known_filled=exc.known_filled,
+            reason=str(exc), held_lots=self.position.lots if self.position else 0,
+            file_error=exc.file_error))
 
     def _not_on_file(self, exc: _FillNotOnFile, now: datetime) -> None:
         """成交了、部位檔卻沒記到：告警（「部位還在」），今天不再進場。
@@ -586,14 +698,6 @@ def main() -> int:
     _setup_logging(today)
 
     config = settings.load()
-    if config.auto_order_enabled:
-        # ticket 07 接上委託失敗的處理時拿掉（連同 test_live_orders 裡對應的那條測試）。
-        # `run()` 已經會真的下單，但委託被拒、成交不確定目前只會讓程式帶著例外結束：
-        # 不確定的那一筆不會記成「不確定」、不告警，排程重啟後照缺了一筆的部位檔繼續進場；
-        # 被拒的單則每次重啟再送一次（規格第 50、51 條）。
-        logger.error("自動下單（order.auto_enabled: true）要等委託失敗的處理（ticket 07）完成"
-                     "才能打開，盤中程式不啟動。把 config/settings.yaml 的 auto_enabled 改回 false")
-        return 1
     secrets = settings.load_secrets(config)
     broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
     webhook = secrets.discord_webhook
