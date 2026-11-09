@@ -21,6 +21,12 @@
     而本機時鐘和交易所差個一兩秒，就會把每一分鐘最後幾秒的成交切到下一根。
   * **時鐘（Clock）與累計筆數帶的是本機收到的時刻**。13:20 收工看它們，因為沒有成交的
     時候也要收工（臨時休市那天正是一筆今天的成交都沒有）。
+
+兩種時間**都要看**的地方是判斷：K 棒結束時，讓它結束的那筆成交如果比本機時鐘晚了
+`_MAX_LAG` 以上，那一根照樣組起來（開盤價、RSI 要用），但不判斷。晚啟動或重啟時，群益
+第一次訂閱會先回補當天已經過去的成交，時間是交易所當時的時間；只看成交自己的時間，
+09:30 才啟動的話 08:49 起的每一根都會被當成「剛結束」，在現在的價格補進場——實機下單
+之後就是對過去的分鐘再送一次單。報價延遲送到的成交也是同一回事（規格第 53 條）。
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ import messages
 import paths
 import settings
 import strategy
-from broker import Broker, BrokerError, ProductTrade, TxTrade, TxTradeCounts
+from broker import Broker, BrokerError, Clock, ProductTrade, TxTrade, TxTradeCounts
 from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
@@ -47,6 +53,11 @@ logger = logging.getLogger(__name__)
 # 13:20 進場截止，盤中程式在那一刻收工（規格「兩支程式」一節）。13:19 那根到這時結束，
 # 照樣交出來；之後的事件不組 K 棒、也不寫進原始行情。時刻是策略常數，定義在策略判斷。
 SESSION_END = strategy.ENTRY_CUTOFF
+
+# 成交最多可以比本機時鐘晚多久，還算是即時收到的。要大過本機時鐘和交易所的誤差
+# （一兩秒，久沒對時可能更多）加上成交時間只到秒、時鐘每秒才一個；要小過重啟所需的時間
+# （排程最快一分鐘後重啟，再加上登入），回補的分鐘才不會被當成即時的再判斷一次。
+_MAX_LAG = timedelta(seconds=30)
 
 # 往前找幾個交易日的 1 分 K 當暖身與昨收。日曆認得國定假日，認不得颱風假這類臨時休市
 # （那天查不到 K 棒），所以查不到就再往前一天。
@@ -112,11 +123,21 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     raw = RawMarketWriter(today)
     confirmed = False               # 收到今天日盤的成交了
     other_day: date | None = None   # 收過哪一個別的交易日的大台成交
+    local_now: datetime | None = None   # 最新的本機時鐘（見模組說明「時間」）
 
     def _close(closed: indicators.ClosedBar | None, now: datetime) -> None:
-        if closed is not None:
-            bars.append(closed)
-            _log_bar(closed, trading.rsi(bars))
+        if closed is None:
+            return
+        bars.append(closed)
+        _log_bar(closed, trading.rsi(bars))
+        if local_now is None:
+            # 真的 broker 第一個事件一定是時鐘；沒有的話分不出這根是不是回補的
+            logger.warning("1 分 K %s 結束時還沒收到本機時鐘，分不出是不是回補的舊成交，不判斷",
+                           f"{closed.bar.start:%H:%M}")
+        elif local_now - now > _MAX_LAG:
+            logger.info("1 分 K %s 結束於 %s，本機已經 %s（回補的舊成交或報價延遲），不判斷",
+                        f"{closed.bar.start:%H:%M}", f"{now:%H:%M:%S}", f"{local_now:%H:%M:%S}")
+        else:
             trading.on_bar(bars, now)
 
     ending = Ending.STREAM_ENDED
@@ -127,6 +148,8 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 if isinstance(event, TxTrade):
                     other_day = event.time.date()
                 continue
+            if isinstance(event, Clock):
+                local_now = event.time
             if event.time >= end_at:
                 state, closed = indicators.close_forming(state)
                 _close(closed, event.time)

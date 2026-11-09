@@ -8,14 +8,15 @@
 判斷——08:49 那根在 08:50:00 判斷，這就是「08:50 開始」的第一次判斷。
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
-from broker import MTX_CODE, TMF_CODE, TX_CODE, MinuteBar, ProductTrade, QuoteUnavailable
+from broker import (MTX_CODE, TMF_CODE, TX_CODE, Clock, MinuteBar, ProductTrade,
+                    QuoteUnavailable)
 from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, history as history_bars, minute,
-                        rally, trade, whole_morning)
+from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, counts,
+                        history as history_bars, minute, rally, replayed, trade, whole_morning)
 from recording import RecordingNotifier
 import intraday
 import paths
@@ -83,6 +84,23 @@ def test_entries_stop_at_the_position_cap():
                    config=_config(max_position=3))
     assert _times(sent) == ["08:50:00", "08:51:00", "08:52:00"]
     assert sent[-1].splitlines()[2] == "累計：多單 3 口，均價 45160"
+
+
+def test_several_lots_per_entry_are_cut_to_what_is_left_under_the_cap():
+    """每次 3 口、加碼上限 5：08:50 進 3 口；08:51 只剩 2 口的空間，進 2 口；之後滿了。
+    均價照口數加權：(45150 × 3 + 45160 × 2) ÷ 5 = 225770 ÷ 5 = 45154。"""
+    _, sent = _run(rally("08:45", 7) + [trade(at("08:52:00"), 45170)],
+                   config=_config(lots_per_entry=3, max_position=5))
+    assert sent == [
+        "【模擬】PTS 做多：買進微台 3 口 @ 45150\n"
+        "觸發：條件 1（早盤做多）\n"
+        "累計：多單 3 口，均價 45150\n"
+        "2026/11/09 08:50:00",
+        "【模擬】PTS 做多：買進微台 2 口 @ 45160\n"
+        "觸發：條件 1（早盤做多）\n"
+        "累計：多單 5 口，均價 45154\n"
+        "2026/11/09 08:51:00",
+    ]
 
 
 def test_the_average_is_weighted_by_lots_and_shown_to_two_decimals():
@@ -188,6 +206,13 @@ def test_yesterdays_close_is_the_last_bar_of_the_previous_day_session(last_close
     assert len(sent) == entries
 
 
+def test_without_todays_0845_bar_there_is_no_open_and_nothing_is_entered_all_day():
+    """今日開盤價是 08:45 那根的開盤價（規格第 17 條）。開盤時報價斷了，第一筆大台成交在
+    08:46：之後一路強勢、開高也看似成立，但拿 08:46 的價格當開盤價只是猜，條件 1、2 整天不判斷。"""
+    _, sent = _run(rally("08:46", 6) + [trade(at("08:52:00"), 45170)])
+    assert sent == []
+
+
 def test_a_trading_day_without_bars_is_skipped_when_looking_for_yesterday():
     """週五臨時休市（颱風假），日曆不知道，查不到 K 棒；昨收要往前找到週四。
     今天開 45100：週四收 45099 → 開高、進場。拿錯成週三（收 45100，開盤價等於昨收）
@@ -227,6 +252,40 @@ def test_without_bars_of_the_previous_day_it_records_the_market_but_never_enters
     assert notifier.sent == []
     assert len(outcome.bars) == 6
     assert (market_dir / "TX-20261109.csv").exists()
+
+
+# --- 晚啟動或重啟：回補的舊成交不判斷 ---
+
+
+def test_a_late_start_judges_only_the_minutes_after_the_backfill():
+    """08:51:50 才啟動。群益先回補 08:45 起的成交（交易所當時的時間），累計筆數只有現在的值。
+    回補的 08:49、08:50 那兩根照樣組起來（開盤價、RSI 要用），但那兩分鐘早就過去了，
+    不在 08:51:50 的價格補進場；接上即時行情後，08:52:00 結束的 08:51 那根才判斷。"""
+    events = ([clock(at("08:51:50"))]
+              + [counts(at("08:51:50"), buy=20000, sell=21500)]
+              + replayed(rally("08:45", 7))
+              + rally("08:52", 1, open_=45170)
+              + [trade(at("08:53:00"), 45190)])
+    _, sent = _run(events)
+    assert sent == [
+        "【模擬】PTS 做多：買進微台 1 口 @ 45170\n"
+        "觸發：條件 1（早盤做多）\n"
+        "累計：多單 1 口，均價 45170\n"
+        "2026/11/09 08:52:00",
+        "【模擬】PTS 做多：買進微台 1 口 @ 45180\n"
+        "觸發：條件 1（早盤做多）\n"
+        "累計：多單 2 口，均價 45175\n"
+        "2026/11/09 08:53:00",
+    ]
+
+
+@pytest.mark.parametrize("skew", [-5, 5])
+def test_a_local_clock_a_few_seconds_off_the_exchange_still_enters(skew):
+    """本機時鐘和交易所差幾秒是常態：即時收到的成交不能因此被當成回補的舊成交。"""
+    events = [clock(e.time + timedelta(seconds=skew)) if isinstance(e, Clock) else e
+              for e in rally("08:45", 6) + [trade(at("08:51:00"), 45160)]]
+    _, sent = _run(events)
+    assert _times(sent) == ["08:50:00", "08:51:00"]
 
 
 def test_with_auto_order_switched_on_it_refuses_to_start_until_real_orders_exist():

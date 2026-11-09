@@ -340,6 +340,9 @@ _KLINE_FIELDS = 7
 # 日盤的 K 棒標籤：標起點是 08:45…13:44，標終點是 08:46…13:45。文件沒說是哪一種
 # （notes/capital-api.md 第 3 節），所以看有沒有 08:45 那根來分辨：標終點的話，
 # 08:45 之前沒有日盤，不會有這個標籤。
+# ⚠️ 兩頭都有（08:45 與 13:45，301 根）就分辨不了：標起點加上 13:45:00 的成交、標終點
+#    加上 08:45:00 的開盤集合競價自成一根，都是這個樣子。拒絕整批，不挑一根丟掉——
+#    兩種情況下真正的收盤價（昨收）都在 13:45 那根。
 _SESSION_OPEN = time(8, 45)
 _SESSION_LAST_LABEL = time(13, 45)
 
@@ -366,9 +369,12 @@ def parse_minute_bars(rows: list[str], day: date) -> list[MinuteBar]:
         if at.date() == day and _SESSION_OPEN <= at.time() <= _SESSION_LAST_LABEL:
             labelled.append((at, o, h, low, c))
 
-    end_labelled = labelled and all(at.time() != _SESSION_OPEN for at, *_ in labelled)
-    shift = timedelta(minutes=1) if end_labelled else timedelta(0)
-    bars = [MinuteBar(at - shift, o, h, low, c) for at, o, h, low, c in labelled]
-    # 換算成起點之後，日盤是 08:45–13:44；標起點時的 13:45 不屬於日盤
-    return sorted((b for b in bars if b.start.time() < _SESSION_LAST_LABEL),
+    labels = {at.time() for at, *_ in labelled}
+    if {_SESSION_OPEN, _SESSION_LAST_LABEL} <= labels:
+        raise QuoteUnavailable(
+            f"群益的 1 分 K 同時有 08:45 與 13:45（{len(labelled)} 根），分不出標的是起點還是終點；"
+            "丟掉哪一根都可能丟掉日盤的收盤價")
+    shift = timedelta(minutes=1) if _SESSION_OPEN not in labels else timedelta(0)
+    # 換算成起點之後一律是 08:45–13:44
+    return sorted((MinuteBar(at - shift, o, h, low, c) for at, o, h, low, c in labelled),
                   key=lambda b: b.start)

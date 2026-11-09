@@ -84,14 +84,17 @@ def calm_history(close: float = 45000, day: date = PREVIOUS_DAY) -> list[MinuteB
 
 def minute(hhmm: str, open_: float, close: float, *, bichai: int | None = None,
            product: float | None = None, day: date = DAY) -> list:
-    """一分鐘的劇本：`:00` 成交在開盤價、`:20` 累計筆數（給了筆差才有）、`:30` 成交在收盤價、
-    `:40` 交易商品成交（沒給就是大台的收盤價）。
+    """一分鐘的劇本：`:00` 本機時鐘與成交在開盤價、`:20` 累計筆數（給了筆差才有）、
+    `:30` 成交在收盤價、`:40` 交易商品成交（沒給就是大台的收盤價）。
+
+    時鐘和成交在同一秒：本機時鐘和交易所一致、成交即時收到。盤中程式拿最新的時鐘分辨
+    即時的成交與回補的舊成交，沒有時鐘就不判斷。
 
     這根 K 棒要等**下一分鐘的第一筆成交**才結束，策略也在那時判斷——所以劇本最後要再接
     一分鐘（或一筆成交），最後那根才會被判斷到。
     """
     base = datetime.combine(day, datetime.strptime(hhmm, "%H:%M").time())
-    events: list = [TxTrade(base, float(open_))]
+    events: list = [Clock(base), TxTrade(base, float(open_))]
     if bichai is not None:
         buy = 20000
         events.append(TxTradeCounts(base + timedelta(seconds=20), buy_count=buy,
@@ -112,3 +115,10 @@ def rally(start: str, n: int, *, open_: float = 45100, step: float = 10, bichai:
         o = open_ + i * step
         events += minute(f"{t0 + timedelta(minutes=i):%H:%M}", o, o + step, bichai=bichai, day=day)
     return events
+
+
+def replayed(events: list) -> list:
+    """群益第一次訂閱時回補的當天成交：只有成交（大台與交易商品），帶的是交易所當時的時間；
+    沒有時鐘，也沒有累計筆數（筆數沒有歷史，只有現在的累計值）。晚啟動或重啟時，
+    這一段會在第一個時鐘之後一口氣送來。"""
+    return [e for e in events if isinstance(e, (TxTrade, ProductTrade))]

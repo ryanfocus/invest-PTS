@@ -66,6 +66,15 @@ def test_bars_labelled_by_their_start_minute_are_kept_as_they_are():
     assert bars[-1].close == 45300.0
 
 
+def test_bars_labelled_both_0845_and_1345_are_quote_unavailable_rather_than_a_dropped_close():
+    """301 根、兩頭都有：標起點加上 13:45:00 的成交，或標終點加上 08:45:00 的開盤集合競價
+    自成一根，都會這樣。不管是哪一種，13:45 那根的收盤價才是日盤的收盤價（昨收）；
+    分不出是哪一種就不能挑一根丟掉，丟了昨收就悄悄變成倒數第二根。"""
+    skcom = FakeSkcom(klines={"20261106": _day(_labels("08:45", 301))})
+    with pytest.raises(QuoteUnavailable, match="08:45.*13:45"):
+        _broker(skcom).minute_bars(FRIDAY)
+
+
 def test_the_documented_format_variations_are_read():
     """文件裡出現過的寫法：月日不補零、日期與時間之間空白或逗號、逗號後有沒有空白。"""
     rows = ["2026/1/5 08:46 45000,45005,44995,45001,10",
