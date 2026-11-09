@@ -47,19 +47,20 @@ class _Tracked:
     不必手寫一份清單擺在旁邊等著過期。
     """
 
-    def __init__(self, data, prefix: str = "", seen: set | None = None):
+    def __init__(self, data: object, prefix: str = "", seen: set[str] | None = None):
+        """`data` 是 yaml 剛解析出來、還沒驗證過的值（不一定是 mapping）。"""
         self._data = data
         self._prefix = prefix
         self.seen = set() if seen is None else seen
 
-    def _get(self, key: str):
+    def _get(self, key: str) -> tuple[str, object]:
         full = f"{self._prefix}{key}"
         if not isinstance(self._data, dict) or key not in self._data:
             raise SettingsError(f"設定檔缺少 {full}")
         return full, self._data[key]
 
-    def __getitem__(self, key: str):
-        """一個設定值（葉節點）。"""
+    def __getitem__(self, key: str) -> object:
+        """一個設定值（葉節點），還沒驗證過：交給 `_switch`、`_product` 這些檢查。"""
         full, value = self._get(key)
         self.seen.add(full)
         return value
@@ -115,7 +116,7 @@ def _build(raw: _Tracked) -> Config:
     )
 
 
-def _whole_number(value, key: str) -> int:
+def _whole_number(value: object, key: str) -> int:
     """≥ 1 的整數。
 
     ⚠️ `bool` 是 `int` 的子類：yaml 的 `yes` 會變成 True，而 True == 1。
@@ -126,7 +127,7 @@ def _whole_number(value, key: str) -> int:
     return value
 
 
-def _product(value) -> str:
+def _product(value: object) -> str:
     """設定檔的商品名稱 → 報價代碼。只收這三個名字，大小寫與空白都不寬容——
     猜對使用者的意思沒有好處，猜錯的代價是下到別的商品上。"""
     if not isinstance(value, str) or value not in PRODUCT_NAMES:
@@ -136,7 +137,7 @@ def _product(value) -> str:
     return PRODUCT_NAMES[value]
 
 
-def _switch(value, key: str) -> bool:
+def _switch(value: object, key: str) -> bool:
     """開關必須是真正的布林值。
 
     ⚠️ yaml 的 `auto_enabled: "false"` 會解析成字串 "false"，而非空字串一律為真——
@@ -151,7 +152,7 @@ def _switch(value, key: str) -> bool:
     return value
 
 
-def flatten_keys(data: dict, prefix: str = "") -> set:
+def flatten_keys(data: dict, prefix: str = "") -> set[str]:
     """把巢狀 dict 的鍵攤平成 {"a.b", "a.c"}。"""
     keys = set()
     for key, value in data.items():
@@ -163,7 +164,7 @@ def flatten_keys(data: dict, prefix: str = "") -> set:
     return keys
 
 
-def consumed_keys(raw: dict) -> set:
+def consumed_keys(raw: dict) -> set[str]:
     """`build()` 實際讀到的設定鍵，供漂移檢查使用。"""
     tracked = _Tracked(raw)
     _build(tracked)

@@ -243,7 +243,7 @@ def ensure_sendable(request: OrderRequest) -> None:
 #     由 broker 濾掉；**不是今天的回補照樣送出**，日期留在時間上——「報價屬於前一個交易日」
 #     是盤中流程要判斷的事（規格第 10 條），broker 先濾掉的話它就看不到證據了。
 #
-# 細節與出處見 scratchpad 的 notes/capital-api.md 第 1–4 節。
+# 細節與出處見 docs/capital-api.md 第 1–4 節。
 
 
 @dataclass(frozen=True)

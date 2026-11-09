@@ -36,7 +36,7 @@
 「今天不再進場」寫成檔（停止進場記錄，`stop_path`），告警之前先寫：盤中程式當掉被重啟
 （規格第 48 條）之後看到它，照樣不進場、不再告警。只放在記憶體的話，被拒的單會在重啟後
 再送一次、再告警一次。部位檔記著「不確定」卻沒有停止進場記錄，就是送單的那一輪來不及告警：
-重啟後的這一輪替它告警（`_Trading.announce`）。
+重啟後的這一輪替它告警（`_Trading.report_uncertain_entry_left_by_last_run`）。
 
 ## 可靠度（ticket 09）
 
@@ -102,6 +102,7 @@ import paths
 import position_file
 import raw_market
 import settings
+import state_files
 import strategy
 from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
                     FillUnknown, LoginFailed, OrderFailed, OrderRequest, ProductTrade, TxTrade,
@@ -110,9 +111,9 @@ from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
 
-# 13:20 進場截止，盤中程式在那一刻收工（規格「兩支程式」一節）。13:19 那根到這時結束，
+# 進場截止（GLOSSARY），盤中程式在那一刻收工（規格「兩支程式」一節）。13:19 那根到這時結束，
 # 照樣交出來；之後的事件不組 K 棒、也不寫進原始行情。時刻是策略常數，定義在策略判斷。
-SESSION_END = strategy.ENTRY_CUTOFF
+ENTRY_CUTOFF = strategy.ENTRY_CUTOFF
 
 # 成交最多可以比本機時鐘晚多久，還算是即時收到的。要大過本機時鐘和交易所的誤差
 # （一兩秒，久沒對時可能更多）加上成交時間只到秒、時鐘每秒才一個；要小過重啟所需的時間
@@ -141,9 +142,9 @@ class Ending(enum.Enum):
     # 到 13:20 都沒有今天日盤的成交，收過的卻是別的交易日的（臨時休市，規格第 10 條）。
     # 結論為什麼要等到 13:20，見 `run()` 裡的說明。
     QUOTES_FROM_ANOTHER_DAY = "報價屬於前一個交易日，不判斷"
-    CUTOFF = "13:20 收工"
+    CUTOFF = f"{ENTRY_CUTOFF:%H:%M} 進場截止，收工"
     # 真的群益串流不會自己結束；會走到這裡的只有假 broker 的劇本放完了。
-    STREAM_ENDED = "行情串流在 13:20 之前結束"
+    STREAM_ENDED = f"行情串流在 {ENTRY_CUTOFF:%H:%M} 進場截止之前結束"
     # 排程每分鐘叫醒盤中程式（ticket 10）：今天稍早那一輪已經走到結局，這一輪什麼都不做
     FINISHED_EARLIER = "今天稍早已經收工，這次被叫醒什麼都不做"
     # 今天稍早登入失敗過（`login_failed_path`）：重試沒有用，帳密錯了還會把帳號鎖住
@@ -185,7 +186,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         return SessionOutcome(Ending.NOT_A_TRADING_DAY)
     if _finished_earlier(today):
         return SessionOutcome(Ending.FINISHED_EARLIER)
-    if (failed := _read_login_failed(today)) is not None:
+    if (failed := state_files.read_marker(login_failed_path(today))) is not None:
         logger.error("今天登入失敗過（%s），不再登入。排除原因之後刪掉 %s，排程下一次叫醒時"
                      "就會再登入", failed, login_failed_path(today))
         return SessionOutcome(Ending.LOGIN_FAILED_EARLIER)
@@ -224,7 +225,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     trading = _Trading(config, notify, _load_history(broker, today),
                        _load_settlement_day(broker, today), orders,
                        today=today, product=product, record=record)
-    end_at = datetime.combine(today, SESSION_END)
+    end_at = datetime.combine(today, ENTRY_CUTOFF)
     # 盤中重啟：今天稍早收到的行情在原始行情檔裡，K 棒與筆差從那裡接著組（見 `_Restored`）
     restored = _Restored(raw_market.read(today))
     state = restored.state
@@ -283,17 +284,18 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 continue
             if isinstance(event, TxTrade) and restored.covers(event):
                 continue    # 重啟前那一輪就收過、記過、組進 K 棒了
-            trading.announce(event.time)
+            # 只有第一個事件會做事：上一輪送出進場單之後、告警之前就停了，這一輪替它告警
+            trading.report_uncertain_entry_left_by_last_run(event.time)
             if isinstance(event, Clock):
                 local_now = event.time
             if event.time >= end_at:
                 state, closed = indicators.close_forming(state)
                 _close(closed, event.time)
                 ending = Ending.CUTOFF
-                trading.cancel_breakout(f"{SESSION_END:%H:%M} 進場截止")
+                trading.cancel_breakout(f"{ENTRY_CUTOFF:%H:%M} 進場截止")
                 if not confirmed and other_day is not None:
                     logger.warning("到 %s 都沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
-                                   f"{SESSION_END:%H:%M}", other_day)
+                                   f"{ENTRY_CUTOFF:%H:%M}", other_day)
                     ending = Ending.QUOTES_FROM_ANOTHER_DAY
                 pulse.finish(event.time)
                 break
@@ -706,14 +708,16 @@ class _Trading:
         # 時也打開。打開時寫下停止進場記錄（`_stop`），重啟後照樣不進場。
         self._stopped = record is not None and record.status == position_file.UNCERTAIN
         # 部位檔記著一筆不確定的進場單，卻沒有停止進場記錄：送出那筆委託的那一輪在告警之前就停了
-        # （送單前記下「不確定」之後被硬性中止，`_Orders.enter`）。這一輪替它告警（`announce`）。
+        # （送單前記下「不確定」之後被硬性中止，`_Orders.enter`）。這一輪替它告警
+        # （`report_uncertain_entry_left_by_last_run`）。
         self._unannounced: position_file.PositionRecord | None = None
         if self._stopped:
             logger.warning("部位檔記著一筆不確定的委託（%s），今天不再進場", record.uncertain)
-            if record.uncertain.stage == position_file.ENTRY and _read_stop(today) is None:
+            if (record.uncertain.stage == position_file.ENTRY
+                    and state_files.read_marker(stop_path(today)) is None):
                 self._unannounced = record
         else:
-            earlier = _read_stop(today)
+            earlier = state_files.read_marker(stop_path(today))
             if earlier is not None:
                 self._stopped = True
                 logger.warning("今天稍早已經停止進場，重啟後照樣不進場：%s", earlier)
@@ -722,10 +726,12 @@ class _Trading:
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
         self.breakout: strategy.Breakout | None = None
 
-    def announce(self, now: datetime) -> None:
+    def report_uncertain_entry_left_by_last_run(self, now: datetime) -> None:
         """重啟前那一輪送出進場單之後、告警之前就停了：替它發「委託送出去了，但…」的告警
-        （規格第 50 條），並寫下停止進場記錄——之後再重啟就不再講一次。`now` 是這一輪的
-        第一個事件（啟動時還沒有任何時間，見模組說明「時間」）。"""
+        （規格第 50 條），並寫下停止進場記錄——之後再重啟就不再講一次。
+
+        每個事件都可以呼叫，只有第一次會做事：`now` 要用這一輪第一個事件的時間（啟動時還沒有
+        任何時間，見模組說明「時間」），所以不在啟動時發。"""
         record, self._unannounced = self._unannounced, None
         if record is None:
             return
@@ -752,7 +758,7 @@ class _Trading:
         first = today[0].bar
         # 開盤價是 08:45 那根的開盤價。今天第一根不是 08:45（開盤時報價斷了），
         # 就不知道今天是開高還是開低，條件 1、2 整天都不會成立。
-        today_open = first.open if first.start.time() == indicators.DAY_SESSION_OPEN else None
+        today_open = first.open if first.start.time() == calendar_tw.DAY_SESSION_OPEN else None
         if today_open is None and len(today) == 1:
             logger.warning("今天第一根 1 分 K 是 %s 不是 08:45，不知道開盤價，條件 1、2 今天不判斷",
                            f"{first.start:%H:%M}")
@@ -875,7 +881,8 @@ class _Trading:
         不再進場，是因為帳上的口數從這一刻起不知道：部位不虧、加碼上限都算不了
         （規格第 50 條）。盤中程式照樣跑到收工，原始行情繼續記。
 
-        停止進場記錄寫在告警之前：重啟後看到它，就知道這一則已經發過（`announce` 不再發）。
+        停止進場記錄寫在告警之前：重啟後看到它，就知道這一則已經發過
+        （`report_uncertain_entry_left_by_last_run` 不再發）。
         """
         self._stop(now, f"委託 {exc.order_seq or '（沒有序號）'} 送出去了，"
                         f"但不知道成交幾口：{exc}")
@@ -946,7 +953,8 @@ class _Trading:
 
 
 class _QuoteWatch:
-    """報價中斷偵測：日盤期間連續 3 分鐘沒有即時的大台報價，就發一則告警（規格第 53 條）。
+    """報價中斷偵測：日盤開盤到進場截止之間，連續 3 分鐘沒有即時的大台報價就發一則告警
+    （規格第 53 條）。
 
     看兩路：大台的即時成交（K 棒與盯價用）與累計成交筆數（筆差用）。少了任何一路，判斷就缺
     一條腿，所以從**比較早斷的那一路**算起。群益 broker 斷線時時鐘事件照樣每秒來（它是訊息
@@ -975,8 +983,9 @@ class _QuoteWatch:
     """
 
     def __init__(self, today: date):
-        self._open = datetime.combine(today, indicators.DAY_SESSION_OPEN)
-        self._end = datetime.combine(today, SESSION_END)
+        # 從日盤開盤算起；盤中程式在進場截止就收工，偵測也就做到那時
+        self._open = datetime.combine(today, calendar_tw.DAY_SESSION_OPEN)
+        self._end = datetime.combine(today, ENTRY_CUTOFF)
         self._started: datetime | None = None
         self.trade_at: datetime | None = None       # 最後一筆即時收到的大台成交
         self.counts_at: datetime | None = None      # 最後一次累計成交筆數
@@ -1092,29 +1101,16 @@ def login_failed_path(day: date) -> str:
     知道這件事（規格第 54 條），心跳記錄寫了「收工了」，出場程式就不講了。
 
     排除原因之後刪掉它，排程下一次叫醒時就會再登入；放著不管，隔一個交易日也照常登入。
+    檔案存在就算數，內容只是給人看的原因（標記檔，`state_files`）。
     """
-    return os.path.join(paths.state_dir(), f"login-failed-{day:%Y%m%d}.txt")
-
-
-def _read_login_failed(day: date) -> str | None:
-    """今天稍早登入失敗的原因；沒有失敗過是 None。檔案存在就算，內容只是給人看的。"""
-    path = login_failed_path(day)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read().strip()
-    except (OSError, ValueError) as exc:     # UTF-8 的解碼錯誤是 ValueError
-        return f"（記錄在 {path}，但讀不懂：{type(exc).__name__}: {exc}）"
+    return state_files.daily("login-failed", day)
 
 
 def _write_login_failed(day: date, reason: str) -> None:
     """寫不進去只記 log：這一輪照樣以登入失敗結束，代價是下一分鐘會再試一次。"""
     path = login_failed_path(day)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(reason + "\n")
+        state_files.write_marker(path, reason)
     except Exception as exc:  # noqa: BLE001
         logger.error("登入失敗記錄寫不進 %s（%s: %s）：排程下一次叫醒時會再登入一次",
                      path, type(exc).__name__, exc)
@@ -1131,44 +1127,24 @@ def stop_path(day: date) -> str:
     今天出過事，重啟後照常加碼。所以寫成檔，重啟時看到它就不進場。
 
     只有盤中程式自己讀，出場程式不看（兩支程式之間只靠部位檔與心跳記錄，規格「兩支程式」
-    一節）。放在部位檔旁邊，不在 `logs/`：30 天清除的範圍外，但一天一個小檔，留著無妨。
+    一節）。**檔案存在就是停過**，內容只是寫給人看的原因；讀不懂（寫到一半斷電、被改壞）也一樣
+    不進場（`state_files.read_marker`）。
     """
-    return os.path.join(paths.state_dir(), f"entries-stopped-{day:%Y%m%d}.txt")
-
-
-def _read_stop(day: date) -> str | None:
-    """今天稍早停止進場的原因；沒有停過是 None。
-
-    **檔案存在就是停過**，內容只是寫給人看的原因。讀不懂（寫到一半斷電、被改壞）也一樣
-    不進場：和部位檔同一個道理，讀不懂不能當成「沒事」。
-    """
-    path = stop_path(day)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read().strip()
-    except (OSError, ValueError) as exc:     # UTF-8 的解碼錯誤是 ValueError
-        return f"（記錄在 {path}，但讀不懂：{type(exc).__name__}: {exc}）"
+    return state_files.daily("entries-stopped", day)
 
 
 def _write_stop(day: date, line: str) -> None:
-    """寫下停止進場記錄。
+    """寫下停止進場記錄：接在後面，一次停止一行。
 
-    直接附加，不像部位檔先寫暫存檔再置換：重啟時只看檔案在不在，寫到一半也一樣算數；
-    少了置換那一步，部位檔被防毒鎖住、`os.replace` 失敗的時候，這裡照樣寫得進去——
-    那正是最需要它的時候（「不確定」或成交寫不進部位檔）。
+    不像部位檔先寫暫存檔再置換（理由見 `state_files`）：部位檔被防毒鎖住、`os.replace` 失敗的
+    時候，這裡照樣寫得進去——那正是最需要它的時候（「不確定」或成交寫不進部位檔）。
 
     寫不進去只記 log，不往外拋：接著要發的告警比它要緊，冒出 `run()` 的話一則都發不出去。
     今天這一輪照樣停止進場（記憶體裡），只是重啟後記不得。
     """
     path = stop_path(day)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())       # 真的落到磁碟：寫完緊接著可能就是當機重啟
+        state_files.write_marker(path, line, append=True)
     except Exception as exc:  # noqa: BLE001
         logger.error("停止進場記錄寫不進 %s（%s: %s）：盤中程式若重啟，今天可能會再進場",
                      path, type(exc).__name__, exc)
@@ -1256,15 +1232,18 @@ def _lock(fd: int, on: bool) -> None:
 
 
 def _setup_logging(today: date) -> None:
-    """同時寫到畫面與 `logs/intraday-YYYYMMDD.log`。後者跟著 `logs/` 30 天清除（ticket 10）；
-    要長期保留的是原始行情，K 棒隨時能從它重算。"""
+    """同時寫到畫面與 `logs/intraday-YYYYMMDD.log`（`paths.daily_log`）。後者跟著 `logs/`
+    30 天清除（ticket 10）；要長期保留的是原始行情，K 棒隨時能從它重算。
+
+    root logger 已經有 handler 時（例如測試裡）`basicConfig` 什麼都不做，所以 log 檔延到第一次
+    寫入才打開：沒被用上的 handler 不會留著一個開著的檔。"""
     os.makedirs(paths.logs_dir(), exist_ok=True)
-    log_file = os.path.join(paths.logs_dir(), f"intraday-{today:%Y%m%d}.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stderr),
-                  logging.FileHandler(log_file, encoding="utf-8")],
+                  logging.FileHandler(paths.daily_log("intraday", today), encoding="utf-8",
+                                      delay=True)],
     )
 
 

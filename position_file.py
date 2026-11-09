@@ -46,15 +46,14 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import paths
+import state_files
 import strategy
 from broker import MARKET_ORDER_LOT_CAP, PRODUCT_CODES, ContractInfo
 
@@ -200,7 +199,7 @@ class PositionRecord:
 
 def path_for(day: date) -> str:
     """那個交易日的部位檔。"""
-    return os.path.join(paths.state_dir(), f"position-{day:%Y%m%d}.json")
+    return state_files.daily("position", day, ".json")
 
 
 _FILE_NAME = re.compile(r"position-(\d{8})\.json")
@@ -235,11 +234,10 @@ def read(day: date) -> PositionRecord | None:
     是哪裡不對，給人工處理時對照。
     """
     path = path_for(day)
-    if not os.path.exists(path):
-        return None
     try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = state_files.read_json(path)
+        if data is None:
+            return None
         record = _from_json(data)
     except (ValueError, OSError) as exc:     # JSON 與 UTF-8 的解碼錯誤也是 ValueError
         raise Unreadable(f"{path}：{exc}") from exc
@@ -249,25 +247,8 @@ def read(day: date) -> PositionRecord | None:
 
 
 def write(record: PositionRecord) -> None:
-    """原子寫入。
-
-    暫存檔刻意建在**目標檔案的同一個目錄**：跨磁碟的 `os.replace` 不是原子的，
-    而系統暫存目錄與程式目錄很可能不在同一個磁碟上。
-    """
-    path = path_for(record.trading_day)
-    directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".position-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(_to_json(record), fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())       # 真的落到磁碟，不只是進了作業系統的快取
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    """原子寫入（`state_files.write_json`：先寫暫存檔再置換，規格第 52 條）。"""
+    state_files.write_json(path_for(record.trading_day), _to_json(record))
     logger.info("部位檔已更新：%s %s 進場 %d 口、還沒平 %d 口（%s）", record.order_code,
                 record.direction, record.entered_lots, record.open_lots, record.status)
 
@@ -305,7 +286,7 @@ def _fill_json(fill: Fill) -> dict:
     return {"order_seq": fill.order_seq, "lots": fill.lots, "price": fill.price}
 
 
-def _from_json(data) -> PositionRecord:
+def _from_json(data: object) -> PositionRecord:
     """逐欄檢查型別再組回記錄。欄位之間的關係由 `PositionRecord` 自己檢查。
 
     ⚠️ 型別要嚴格：`true` 在 Python 裡等於 1、`"2"` 看起來也像 2——寬容地收下的話，
@@ -334,7 +315,7 @@ def _from_json(data) -> PositionRecord:
     )
 
 
-def _object(value, fields: tuple[str, ...], where: str) -> dict:
+def _object(value: object, fields: tuple[str, ...], where: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{where}應該是一個物件（{{…}}），目前是 {type(value).__name__}")
     missing = [f for f in fields if f not in value]
@@ -346,7 +327,7 @@ def _object(value, fields: tuple[str, ...], where: str) -> dict:
     return value
 
 
-def _fills(value, key: str) -> tuple[Fill, ...]:
+def _fills(value: object, key: str) -> tuple[Fill, ...]:
     if not isinstance(value, list):
         raise ValueError(f"{key} 應該是一個清單（[…]），目前是 {type(value).__name__}")
     fills = []
@@ -358,26 +339,26 @@ def _fills(value, key: str) -> tuple[Fill, ...]:
     return tuple(fills)
 
 
-def _text(value, key: str, *, empty_ok: bool = False) -> str:
+def _text(value: object, key: str, *, empty_ok: bool = False) -> str:
     if not isinstance(value, str) or not (value or empty_ok):
         raise ValueError(f"{key} 應該是一段文字，目前是 {value!r}")
     return value
 
 
-def _whole(value, key: str) -> int:
+def _whole(value: object, key: str) -> int:
     # bool 是 int 的子類：不先排除的話，`true` 會被當成 1 口
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{key} 應該是整數，目前是 {value!r}")
     return value
 
 
-def _number(value, key: str) -> float:
+def _number(value: object, key: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{key} 應該是數字，目前是 {value!r}")
     return float(value)
 
 
-def _day(value, key: str) -> date:
+def _day(value: object, key: str) -> date:
     if not isinstance(value, str) or not _ISO_DAY.fullmatch(value):
         raise ValueError(f"{key} 應該是 YYYY-MM-DD 格式的日期，目前是 {value!r}")
     return date.fromisoformat(value)

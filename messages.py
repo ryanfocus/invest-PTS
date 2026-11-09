@@ -86,7 +86,7 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
     on_file = (f"部位檔已記為「不確定」{missing}：盤中程式今天不再進場，"
                "13:25 的出場程式也不會自動平倉。")
     if product in DAY_TRADE_CODES:
-        who_closes = f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
+        who_closes = _broker_closes_today(name)
     else:
         held = f"（部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的）" if held_lots else ""
         who_closes = f"{name}沒有當沖強平：PTS 今天的{name}部位{held}要你自己在 13:30 前平掉。"
@@ -98,6 +98,11 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
         f"請到券商 APP 確認這筆成交了幾口。{who_closes}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
+
+
+def _broker_closes_today(name: str) -> str:
+    """大台、小台進場時標了當沖，券商 13:30 強平（ADR-0002）：不確定或沒記到的時候，也不必自己平。"""
+    return f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
 
 
 def position_file_unreadable(*, day: date, reason: str) -> str:
@@ -127,7 +132,7 @@ def fill_not_on_file(*, at: datetime, product: str, direction: str, lots: int, p
     """
     name = _PRODUCT_TEXT[product]
     if product in DAY_TRADE_CODES:
-        who_closes = f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
+        who_closes = _broker_closes_today(name)
     else:
         who_closes = (f"{name}沒有當沖強平：PTS 今天的{name}部位共 {total_lots} 口"
                       "要你自己在 13:30 前平掉。")
@@ -221,19 +226,36 @@ def exit_uncertain(*, at: datetime, record: position_file.PositionRecord,
     兩個數字都寫出來——檔裡確定的口數與不確定那一筆的委託口數——使用者對帳戶時才知道
     要看到的範圍。`closed` 同 `exit_incomplete`：告警這一刻已經過了微台的期限。
     """
-    u = record.uncertain
-    stage = "進場" if u.stage == position_file.ENTRY else "平倉"
-    side = (_SIDE_TEXT if u.stage == position_file.ENTRY else _CLOSE_SIDE_TEXT)[record.direction]
+    order, held = _uncertain_order_lines(record)
     looked_up = "" if lookup is None else f"券商的成交紀錄：{lookup}\n"
     return (
         "【要你處理】PTS 委託送出去了，但不知道成交幾口，出場程式不再送單\n"
-        f"不確定的委託：{stage}{side}{_PRODUCT_TEXT[record.product]} {u.requested_lots} 口"
-        f"（委託序號 {u.order_seq or '沒有拿到'}），已知至少成交 {u.known_filled} 口\n"
+        f"{order}\n"
         f"{looked_up}"
-        f"部位檔記到的部位（不含這一筆）：{_HOLDING_TEXT[record.direction]} {record.open_lots} 口\n"
+        f"{held}\n"
         f"{_check_account(record, closed)}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
+
+
+def _uncertain_order_lines(record: position_file.PositionRecord) -> tuple[str, str]:
+    """部位檔記著一筆不確定的委託時，講那一筆與檔裡確定的部位的兩行（不含換行）。
+
+    兩個數字都寫出來：檔裡確定的口數與不確定那一筆的委託口數，使用者對帳戶時才知道要看到的
+    範圍（`exit_uncertain`、`exit_missed`）。
+    """
+    u = record.uncertain
+    stage = "進場" if u.stage == position_file.ENTRY else "平倉"
+    side = (_SIDE_TEXT if u.stage == position_file.ENTRY else _CLOSE_SIDE_TEXT)[record.direction]
+    return (f"不確定的委託：{stage}{side}{_PRODUCT_TEXT[record.product]} {u.requested_lots} 口"
+            f"（{_seq_text(u.order_seq)}），已知至少成交 {u.known_filled} 口",
+            f"部位檔記到的部位（不含這一筆）：{_HOLDING_TEXT[record.direction]} "
+            f"{record.open_lots} 口")
+
+
+def _seq_text(order_seq: str) -> str:
+    """委託序號；送出去卻沒拿到序號時照實講。"""
+    return f"委託序號 {order_seq or '沒有拿到'}"
 
 
 def _check_account(record: position_file.PositionRecord, closed: bool) -> str:
@@ -242,7 +264,7 @@ def _check_account(record: position_file.PositionRecord, closed: bool) -> str:
     大台、小台叫人自己平的話，會和券商 13:30 的當沖強平撞在一起：兩邊都平，多平的
     就是反向新倉。所以只請他在強平之後確認。微台的期限見 `exit_incomplete`。
     """
-    if record.product != TMF_CODE:
+    if record.product in DAY_TRADE_CODES:
         return ("大台、小台標了當沖，券商 13:30 會強平：13:30 之後請到券商 APP 確認帳戶裡"
                 "已經沒有 PTS 的部位。")
     if record.settles_today and closed:
@@ -313,15 +335,12 @@ def exit_missed(*, at: datetime, record: position_file.PositionRecord) -> str:
     day = f"{record.trading_day:%m/%d}"
     settled = (f"{record.order_code} 的最後交易日是 {record.last_trading_day:%m/%d}：過了那天 13:30 "
                "還在的口數由交易所以最後結算價現金了結，不必再平。")
-    u = record.uncertain
-    if u is not None:
-        stage = "進場" if u.stage == position_file.ENTRY else "平倉"
-        side = (_SIDE_TEXT if u.stage == position_file.ENTRY else _CLOSE_SIDE_TEXT)[record.direction]
+    if record.uncertain is not None:
+        order, held = _uncertain_order_lines(record)
         return (
             f"【要你處理】PTS 委託送出去了，但不知道成交幾口：{day} 的微台沒有平倉\n"
-            f"不確定的委託：{stage}{side}{_PRODUCT_TEXT[record.product]} {u.requested_lots} 口"
-            f"（委託序號 {u.order_seq or '沒有拿到'}），已知至少成交 {u.known_filled} 口\n"
-            f"部位檔記到的部位（不含這一筆）：{_HOLDING_TEXT[record.direction]} {record.open_lots} 口\n"
+            f"{order}\n"
+            f"{held}\n"
             f"{_missed_reason(day)}\n"
             f"請到券商 APP 確認帳戶，自行平掉 PTS 還在的微台部位。{settled}\n"
             f"{at:%Y/%m/%d %H:%M:%S}"
@@ -383,7 +402,7 @@ def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,
                   f"{record.open_lots - u.known_filled} 口")
     lost = ""
     if u is not None and u != on_file.uncertain:
-        lost = f"部位檔也沒記到那筆不確定的平倉委託（委託序號 {u.order_seq or '沒有拿到'}）\n"
+        lost = f"部位檔也沒記到那筆不確定的平倉委託（{_seq_text(u.order_seq)}）\n"
     return (
         "【要你處理】PTS 部位檔沒記到出場程式這次的平倉\n"
         f"{actual}；部位檔記的是平倉 {on_file_exited} 口\n"
@@ -394,16 +413,15 @@ def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,
     )
 
 
-def intraday_not_running(*, at: datetime, stopped_at: datetime | None = None) -> str:
+def intraday_not_running(*, at: datetime, log: str, stopped_at: datetime | None = None) -> str:
     """出場程式發現盤中程式今天沒有跑（規格第 38、54 條），或跑到 `stopped_at` 就停了
     （當掉之後排程沒有把它重啟）。
 
     平常沒有例行訊息，這一則是使用者唯一會發現的管道。講清楚兩件事：今天少了什麼（進場的
     判斷），以及出場不受影響——不講的話，使用者會以為部位沒人平。要做的事是排除原因，
-    所以指出去哪裡看。
+    所以指出去哪裡看：`log` 是盤中程式今天的 log（`paths.shown_log`）。
     """
     after_hours = _EXIT_GOES_ON
-    log = _intraday_log(at)
     deadline = _BEFORE_NEXT_OPEN
     if stopped_at is None:
         return (
@@ -421,23 +439,19 @@ def intraday_not_running(*, at: datetime, stopped_at: datetime | None = None) ->
     )
 
 
-def heartbeat_unreadable(*, at: datetime, reason: str) -> str:
-    """出場程式讀不懂心跳記錄：不知道盤中程式今天有沒有跑完，照實講，請人去看 log。"""
+def heartbeat_unreadable(*, at: datetime, reason: str, log: str) -> str:
+    """出場程式讀不懂心跳記錄：不知道盤中程式今天有沒有跑完，照實講，請人去看 log（`log`）。"""
     return (
         "【要你處理】PTS 心跳記錄讀不懂，不知道盤中程式今天有沒有跑完\n"
         f"原因：{reason}\n"
         f"{_EXIT_GOES_ON}\n"
-        f"請看 {_intraday_log(at)} 確認盤中程式今天有沒有跑完，{_BEFORE_NEXT_OPEN}\n"
+        f"請看 {log} 確認盤中程式今天有沒有跑完，{_BEFORE_NEXT_OPEN}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 
 
 _EXIT_GOES_ON = "出場程式照常處理部位檔裡的部位。"
 _BEFORE_NEXT_OPEN = "下一個交易日 08:40 之前排除。"
-
-
-def _intraday_log(at: datetime) -> str:
-    return f"logs/intraday-{at:%Y%m%d}.log"
 
 
 def exit_crashed(*, at: datetime, reason: str, closed: bool = False) -> str:

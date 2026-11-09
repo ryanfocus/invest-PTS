@@ -27,7 +27,7 @@ import csv
 import logging
 import os
 from datetime import date, datetime
-from typing import IO
+from typing import IO, Any
 
 import paths
 from broker import TxTrade, TxTradeCounts
@@ -90,7 +90,8 @@ class RawMarketWriter:
         self._day = day
         self._pending: list[tuple] | None = []     # confirm() 之後是 None
         self._fh: IO[str] | None = None
-        self._csv = None
+        # `csv.writer(...)` 回傳的型別在標準函式庫裡沒有公開的名字（typeshed 叫它 `_csv._writer`）
+        self._csv: Any = None
 
     def trade(self, event: TxTrade) -> None:
         self._write((_time(event), _price(event.price), "", ""))

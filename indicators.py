@@ -10,14 +10,11 @@ RSI 也在這裡：期數由策略判斷給（策略常數只出現在那一處�
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from typing import Sequence
 
 from broker import MinuteBar, TxTrade, TxTradeCounts
-
-# 大台日盤（一般交易時段）。作者的回測只用日盤 1 分 K，不含夜盤（規格第 2 條）。
-DAY_SESSION_OPEN = time(8, 45)
-DAY_SESSION_CLOSE = time(13, 45)
+from calendar_tw import DAY_SESSION_CLOSE, DAY_SESSION_OPEN
 
 _MINUTE = timedelta(minutes=1)
 

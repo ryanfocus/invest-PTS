@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
+from typing import Iterable
 
 from broker import (BUY, PRODUCT_CODES, ContractInfo, MinuteBar, OrderRequest,
                     ProductListUnavailable, QuoteUnavailable)
+from calendar_tw import DAY_SESSION_CLOSE, DAY_SESSION_OPEN
 
 # ── OnNewData 的欄位位置 ──────────────────────────────────────────────
 #
@@ -45,9 +47,12 @@ CANCELLED = "C"      # IOC 的剩餘量會走這裡，收到它才代表委託�
 
 @dataclass(frozen=True)
 class ReplyRow:
-    """一列已經看懂的委託回報。"""
+    """一列已經看懂的委託回報。
 
-    seq: str
+    沒有序號欄位：認哪一列是自己的，`summarize_fills` 用整列子字串比對（成交列的 `[0]` 是空的，
+    序號只在 `[47]`），不靠解析出來的欄位。
+    """
+
     type: str
     failed: bool
     qty: int
@@ -75,7 +80,6 @@ class FillSummary:
     # 這筆委託的成交均價（依口數加權）。沒有成交時是 None。
     avg_price: float | None
     rejected: bool
-    matched_rows: int
     saw_cancel: bool = False
     reject_reason: str = ""
     # 帶著這筆委託序號、卻解析不了的列數。不是 0 就代表彙整出來的口數可能少算。
@@ -121,7 +125,7 @@ class FillSummary:
 _NO_REASON = "券商沒有附上原因"
 
 
-def summarize_fills(rows, seq: str) -> FillSummary:
+def summarize_fills(rows: Iterable[str], seq: str) -> FillSummary:
     """彙整同一筆委託的回報，算出實際成交的口數與均價。
 
     四條規則，都是不對稱的——因為代價不對稱：
@@ -142,11 +146,10 @@ def summarize_fills(rows, seq: str) -> FillSummary:
        單確實送出去了，只是我們認不出回報，**絕不等於沒有部位**。
     """
     if not seq:
-        return FillSummary(filled_lots=0, avg_price=None, rejected=False, matched_rows=0)
+        return FillSummary(filled_lots=0, avg_price=None, rejected=False)
 
     filled = 0
     cost = 0.0
-    matched = 0
     unreadable = 0
     reject_reason = ""
     saw_cancel = False
@@ -157,7 +160,6 @@ def summarize_fills(rows, seq: str) -> FillSummary:
         if parsed is None:
             unreadable += 1
             continue
-        matched += 1
         if parsed.failed and not reject_reason:
             reject_reason = parsed.error or _NO_REASON
         if parsed.type == FILLED:
@@ -171,7 +173,6 @@ def summarize_fills(rows, seq: str) -> FillSummary:
         avg_price=cost / filled if filled else None,
         # 有成交就不是失敗——剩餘量被取消是 IOC 的常態，不是錯誤
         rejected=bool(reject_reason) and filled == 0,
-        matched_rows=matched,
         saw_cancel=saw_cancel,
         reject_reason=reject_reason if filled == 0 else "",
         unreadable_rows=unreadable,
@@ -209,8 +210,6 @@ def parse_reply_row(row: str) -> ReplyRow | None:
             return None
 
     return ReplyRow(
-        seq=fields[_KEY_NO].strip() or (
-            fields[_SEQ_NO].strip() if len(fields) > _SEQ_NO else ""),
         type=row_type,
         failed=fields[_ORDER_ERR].strip() == "Y",
         qty=int(qty),
@@ -338,13 +337,14 @@ def build_future_order_fields(request: OrderRequest, account: str) -> dict:
 _KLINE_SEPARATORS = re.compile(r"[,\s]+")
 _KLINE_FIELDS = 7
 # 日盤的 K 棒標籤：標起點是 08:45…13:44，標終點是 08:46…13:45。文件沒說是哪一種
-# （notes/capital-api.md 第 3 節），所以看有沒有 08:45 那根來分辨：標終點的話，
+# （docs/capital-api.md 第 3 節），所以看有沒有 08:45 那根來分辨：標終點的話，
 # 08:45 之前沒有日盤，不會有這個標籤。
 # ⚠️ 兩頭都有（08:45 與 13:45，301 根）就分辨不了：標起點加上 13:45:00 的成交、標終點
 #    加上 08:45:00 的開盤集合競價自成一根，都是這個樣子。拒絕整批，不挑一根丟掉——
 #    兩種情況下真正的收盤價（昨收）都在 13:45 那根。
-_SESSION_OPEN = time(8, 45)
-_SESSION_LAST_LABEL = time(13, 45)
+_SESSION_OPEN = DAY_SESSION_OPEN
+# 兩種標法下可能出現的最後一個標籤：標終點時，最後一根（13:44–13:45）就標收盤的那一刻。
+_SESSION_LAST_LABEL = DAY_SESSION_CLOSE
 
 
 def parse_minute_bars(rows: list[str], day: date) -> list[MinuteBar]:

@@ -57,12 +57,14 @@ def test_a_real_fill_is_read_with_its_quantity_and_price():
     assert (fill.type, fill.qty, fill.price) == ("D", 1, 45245.0)
 
 
-def test_a_fill_row_has_no_order_key_so_the_trailing_sequence_is_used():
+def test_a_fill_row_has_no_order_key_but_is_still_counted_by_its_trailing_sequence():
     """官方文件：「國內期選：成交單無此欄，可使用新增的 SeqNo 比對」。真實資料證實了：
-    成交列的 `[0]` 是空的，序號只在最後一欄。兩列要配得起來，加總才加得到一起。"""
-    ack, fill = (parse_reply_row(r) for r in _real())
-    assert _real()[1].split(",")[0] == ""
-    assert ack.seq == fill.seq == "9999999999999"
+    成交列的 `[0]` 是空的，序號只在最後一欄。只看 `[0]` 的話，成交那一列配不上自己的委託，
+    成交口數就少算了。"""
+    rows = _real()
+    assert rows[1].split(",")[0] == ""
+    summary = summarize_fills(rows, "9999999999999")
+    assert summary.filled_lots == parse_reply_row(rows[1]).qty == 1
 
 
 # --- 形狀檢查：看不懂就回 None，絕不猜 ---
@@ -123,14 +125,14 @@ def test_someone_elses_orders_on_the_same_line_are_not_counted():
     rows = _spread() + _real() + _ours()
     summary = summarize_fills(rows, "2315610127873")          # 出場那一筆
     assert (summary.filled_lots, summary.avg_price) == (1, 44680.0)
-    assert summary.matched_rows == 2
+    assert summary.is_settled(requested_lots=1)
 
 
 def test_without_a_sequence_number_nothing_is_counted():
     """空字串是任何字串的子字串。invest-os 原本寫 `if seq and seq not in row`，
     序號拿不到時整條過濾被跳過，視窗內**每一列**期貨回報都被算成自己的成交。"""
     summary = summarize_fills(_ours() + _real(), "")
-    assert summary.filled_lots == 0 and summary.matched_rows == 0
+    assert summary.filled_lots == 0 and not summary.rejected
     assert not summary.is_settled(requested_lots=1)
 
 

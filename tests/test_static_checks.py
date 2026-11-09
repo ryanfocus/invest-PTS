@@ -38,10 +38,8 @@ def test_every_module_imports_on_a_machine_without_the_capital_component(tmp_pat
     (tmp_path / "comtypes" / "client.py").write_text(
         "raise ImportError('模擬沒有安裝 comtypes')", encoding="utf-8")
 
-    modules = ["paths", "settings", "calendar_tw", "broker", "broker.capital_wire",
-               "broker.fake", "broker.capital", "indicators", "raw_market", "intraday",
-               "strategy", "messages", "notifiers.discord", "position_file", "exit_program",
-               "heartbeat", "housekeeping", "scheduled"]
+    modules = _production_modules()
+    assert "broker.capital" in modules and "intraday" in modules, modules
     code = "import " + ", ".join(modules)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(ROOT)])}
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,
@@ -49,6 +47,21 @@ def test_every_module_imports_on_a_machine_without_the_capital_component(tmp_pat
                             errors="replace", timeout=60)
     assert result.returncode == 0, (
         f"有模組在載入時就需要群益元件——COM 的初始化必須延遲到函式內。\n{result.stderr}")
+
+
+def _production_modules() -> list[str]:
+    """版控裡的正式模組（`tests/`、`tools/` 以外的 .py），寫成 import 用的名字。
+
+    從版控推導，不手寫清單：新模組在載入時就碰 COM、又忘了加進清單的話，這條照樣綠燈，
+    而它要守的正是沒有群益元件的機器。"""
+    names = []
+    for path in _tracked("*.py"):
+        rel = path.relative_to(ROOT).with_suffix("")
+        if rel.parts[0] in ("tests", "tools"):
+            continue
+        parts = rel.parts[:-1] if rel.name == "__init__" else rel.parts
+        names.append(".".join(parts))
+    return sorted(names)
 
 
 # --- 測試跑不到的程式碼 ---

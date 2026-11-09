@@ -40,11 +40,11 @@ def redact_webhook(text: str, webhook_url: str) -> str:
     return out
 
 
-def send(text: str, webhook_url: str, timeout=(5, 10)) -> bool:
+def send(text: str, webhook_url: str, timeout: tuple[float, float] = (5, 10)) -> bool:
     """送出一則訊息。回傳是否成功。
 
     失敗只記 log、不拋例外：Discord 掛掉不該讓盤中程式中止——判斷與記錄行情比通知重要。
-    有 timeout：沒有的話，Discord 掛住就拖住整個行情迴圈。
+    有 timeout（連線、讀取各幾秒）：沒有的話，Discord 掛住就拖住整個行情迴圈。
     """
     if not webhook_url:
         logger.warning("Discord webhook 沒有設定，這則訊息沒有送出")

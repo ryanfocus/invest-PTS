@@ -28,7 +28,7 @@ from datetime import datetime
 
 import paths
 
-# 排程的參數 → (模組, 當天 log 的檔名開頭, 給人看的名字)。log 檔名與兩支程式的 `_setup_logging` 一致。
+# 排程的參數 → (模組, 當天 log 的名字（`paths.daily_log`）, 給人看的名字)
 PROGRAMS = {
     "intraday": ("intraday", "intraday", "盤中程式"),
     "exit": ("exit_program", "exit", "出場程式"),
@@ -55,7 +55,7 @@ def _record_crash(log_name: str, label: str, trace: str) -> None:
     """把 traceback 附加到那支程式當天的 log。程式自己的 log 可能還沒設定好（死在 import），
     所以不經過 logging。寫不進去也不拋：已經沒有別的地方能講了。"""
     now = datetime.now()
-    path = os.path.join(paths.logs_dir(), f"{log_name}-{now:%Y%m%d}.log")
+    path = paths.daily_log(log_name, now.date())
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:

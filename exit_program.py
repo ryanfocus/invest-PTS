@@ -64,9 +64,11 @@ import messages
 import paths
 import position_file
 import settings
+import state_files
 import strategy
-from broker import (BUY, MARKET_ORDER_LOT_CAP, SELL, TMF_CODE, Broker, BrokerError,
+from broker import (BUY, DAY_TRADE_CODES, MARKET_ORDER_LOT_CAP, SELL, Broker, BrokerError,
                     FillUnknown, OrderFailed, OrderRequest)
+from calendar_tw import DAY_SESSION_CLOSE
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +80,8 @@ _EXIT_SIDE = {strategy.LONG: SELL, strategy.SHORT: BUY}
 _RETRIES = 3
 _RETRY_INTERVAL = timedelta(minutes=1)
 
-# 過了就不送平倉單。日盤 13:45 收盤（規格第 55 條：之後才補跑就請使用者在夜盤處理）；
-# 結算日的近月 13:30 就停止交易，還在的口數由交易所以最後結算價現金了結。
-_DAY_SESSION_CLOSE = time(13, 45)
+# 過了就不送平倉單。日盤收盤（`calendar_tw.DAY_SESSION_CLOSE`，規格第 55 條：之後才補跑就請
+# 使用者在夜盤處理）；結算日的近月 13:30 就停止交易，還在的口數由交易所以最後結算價現金了結。
 _SETTLEMENT_CLOSE = time(13, 30)
 
 
@@ -162,7 +163,7 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
         # 新倉；當成沒有部位，微台就過夜。檔案原封不動，留給人工處理。
         logger.error("部位檔讀不懂，不送任何單：%s", exc)
         say(messages.exit_position_file_unreadable(
-            at=now, reason=str(exc), closed=now.time() >= _DAY_SESSION_CLOSE))
+            at=now, reason=str(exc), closed=now.time() >= DAY_SESSION_CLOSE))
         return Ending.POSITION_FILE_UNREADABLE
     if record is None:
         return Ending.NO_POSITION
@@ -176,7 +177,7 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
     if not record.open_lots:
         logger.info("部位檔的出場口數已經等於進場口數，部位已經了結")
         return Ending.ALREADY_CLOSED
-    if record.product != TMF_CODE:
+    if record.product in DAY_TRADE_CODES:
         logger.info("今天的部位是 %s %s %d 口，標了當沖，交給券商 13:30 強平，不送單",
                     record.order_code, record.direction, record.open_lots)
         return Ending.LEFT_TO_BROKER
@@ -215,7 +216,7 @@ def _report_missed(today: date, now: datetime, say: Callable[[str], None]) -> No
             say(messages.exit_missed_unreadable(at=now, day=day, reason=str(exc)))
             record = None
         # 大台、小台那天 13:30 已經被券商當沖強平（規格第 30 條），跟出場程式有沒有跑無關
-        if (record is not None and record.product == TMF_CODE
+        if (record is not None and record.product not in DAY_TRADE_CODES
                 and (record.open_lots or record.status == position_file.UNCERTAIN)):
             logger.error("%s 的部位檔還記著微台 %s %d 口沒平（%s）：出場程式那天沒有跑完，不送單",
                          day, record.direction, record.open_lots, record.status)
@@ -231,18 +232,16 @@ def done_path(day: date) -> str:
 
     **做完才寫**：那天跑到一半當掉、被砍掉、斷電的話沒有這份記錄，下一次執行就會把那天
     當成沒跑完、照部位檔再講一次。寧可多講一次，不要安靜。
-    放在部位檔旁邊（`state/`，不在 30 天清除的範圍），一天一個小檔。
+    標記檔：存在就算數，內容只是給人看的（`state_files`）。
     """
-    return os.path.join(paths.state_dir(), f"exit-done-{day:%Y%m%d}.txt")
+    return state_files.daily("exit-done", day)
 
 
 def _mark_done(day: date, how: str) -> None:
     """寫下出場記錄。寫不進去只記 log：代價是下一次執行再講一次那天的部位。"""
     path = done_path(day)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(how + "\n")
+        state_files.write_marker(path, how)
     except Exception as exc:  # noqa: BLE001
         logger.error("出場記錄寫不進 %s（%s: %s）：下一次執行會再講一次 %s 的部位",
                      path, type(exc).__name__, exc, day)
@@ -256,16 +255,18 @@ def _check_heartbeat(today: date, now: datetime, say: Callable[[str], None]) -> 
     except heartbeat.Unreadable as exc:
         # 當成「有跑」是安靜地漏掉，當成「沒跑」是在講不知道的事
         logger.error("心跳記錄讀不懂，不知道盤中程式今天有沒有跑完：%s", exc)
-        say(messages.heartbeat_unreadable(at=now, reason=str(exc)))
+        say(messages.heartbeat_unreadable(at=now, reason=str(exc),
+                                          log=paths.shown_log("intraday", today)))
         return
     if beat is None or beat.trading_day != today:
         logger.error("今天沒有盤中程式的心跳記錄（%s），盤中程式今天沒有跑", beat)
-        say(messages.intraday_not_running(at=now))
+        say(messages.intraday_not_running(at=now, log=paths.shown_log("intraday", today)))
     elif not beat.finished:
         # 盤中程式 13:20 收工時會寫「收工了」。出場程式在進場截止之後才走到這裡，
         # 所以還沒收工就是半路停了，而且之後沒有再起來。
         logger.error("盤中程式最後的心跳是 %s，之後沒有再跑，也沒有收工", beat.last_alive)
-        say(messages.intraday_not_running(at=now, stopped_at=beat.last_alive))
+        say(messages.intraday_not_running(at=now, log=paths.shown_log("intraday", today),
+                                          stopped_at=beat.last_alive))
     else:
         logger.info("盤中程式今天跑完了（最後的心跳 %s）", beat.last_alive)
 
@@ -273,7 +274,7 @@ def _check_heartbeat(today: date, now: datetime, say: Callable[[str], None]) -> 
 def _deadline(record: position_file.PositionRecord) -> datetime:
     """微台最後能送平倉單的時刻：日盤收盤；結算日是近月停止交易的 13:30。
     出場程式過了它就不送單，告警也照它決定要人在日盤、夜盤處理，還是交給交易所了結。"""
-    close = _SETTLEMENT_CLOSE if record.settles_today else _DAY_SESSION_CLOSE
+    close = _SETTLEMENT_CLOSE if record.settles_today else DAY_SESSION_CLOSE
     return datetime.combine(record.trading_day, close)
 
 
@@ -363,8 +364,8 @@ class _MicroExit:
             close = f"近月 {_SETTLEMENT_CLOSE:%H:%M} 停止交易"
             closed = f"今天結算的近月 {_SETTLEMENT_CLOSE:%H:%M} 已經停止交易"
         else:
-            close = f"日盤 {_DAY_SESSION_CLOSE:%H:%M} 收盤"
-            closed = f"日盤 {_DAY_SESSION_CLOSE:%H:%M} 已經收盤"
+            close = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 收盤"
+            closed = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 已經收盤"
         if rounds:
             reason = ((f"委託沒有送出去（最後一次：{problem}），" if problem
                        else "市價 IOC 沒有全部成交，") + f"重試到{close}仍未完成")
@@ -534,7 +535,7 @@ def _scheduled_exit() -> int:
         now = datetime.now()
         _send(config, notify, messages.exit_crashed(
             at=now, reason=f"{type(exc).__name__}: {exc}",
-            closed=now.time() >= _DAY_SESSION_CLOSE))
+            closed=now.time() >= DAY_SESSION_CLOSE))
         return 1
     return status
 
@@ -550,14 +551,15 @@ def _discord_switch_of_broken_settings() -> bool:
 
 
 def _setup_logging(today: date) -> None:
-    """同時寫到畫面與 `logs/exit-YYYYMMDD.log`（跟著 `logs/` 30 天清除，ticket 10）。"""
+    """同時寫到畫面與 `logs/exit-YYYYMMDD.log`（`paths.daily_log`，跟著 `logs/` 30 天清除，
+    ticket 10）。log 檔延到第一次寫入才打開，理由同 `intraday._setup_logging`。"""
     os.makedirs(paths.logs_dir(), exist_ok=True)
-    log_file = os.path.join(paths.logs_dir(), f"exit-{today:%Y%m%d}.log")
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stderr),
-                  logging.FileHandler(log_file, encoding="utf-8")],
+                  logging.FileHandler(paths.daily_log("exit", today), encoding="utf-8",
+                                      delay=True)],
     )
 
 

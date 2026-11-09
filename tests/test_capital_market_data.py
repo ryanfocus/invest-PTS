@@ -2,7 +2,7 @@
 
 斷言兩種東西：**向群益訂了什麼**，以及**群益送來的東西變成了哪些行情事件**。
 事件的參數格式照官方文件 4-4-l／4-4-m／4-4-q 與 invest-os 的實測（`84500` 沒有前導零、
-價格放大 100 倍、試撮 `nSimulate=1`），細節見 notes/capital-api.md 第 1、2、4 節。
+價格放大 100 倍、試撮 `nSimulate=1`），細節見 docs/capital-api.md 第 1、2、4 節。
 """
 
 from datetime import datetime, timedelta

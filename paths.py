@@ -14,6 +14,11 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import date
+
+# 程式資料夾底下的兩個資料夾名稱。訊息裡給人看的位置也從這裡組（`shown_log`、`shown_state`）。
+_LOGS = "logs"
+_STATE = "state"
 
 
 def app_root() -> str:
@@ -40,7 +45,26 @@ def env_path() -> str:
 
 def logs_dir() -> str:
     """執行紀錄與券商回覆的原始存檔。含未遮罩的期貨帳號，30 天後清除（ticket 10）。"""
-    return os.path.join(app_root(), "logs")
+    return os.path.join(app_root(), _LOGS)
+
+
+def daily_log(program: str, day: date) -> str:
+    """那支程式那一天的執行紀錄：`logs/<program>-YYYYMMDD.log`（`program` 是 intraday／exit）。
+
+    三個地方要的是同一個檔：程式自己的 `_setup_logging`、`scheduled.py` 寫 traceback 的地方、
+    告警叫人去看的位置（`shown_log`）。各自組檔名的話，改了一處，traceback 就悄悄寫進
+    告警沒叫人去看的那個檔。
+    """
+    return os.path.join(logs_dir(), _daily_log_name(program, day))
+
+
+def shown_log(program: str, day: date) -> str:
+    """`daily_log` 寫在訊息裡給人看的樣子：程式資料夾底下的相對位置，例如 `logs/intraday-20261109.log`。"""
+    return f"{_LOGS}/{_daily_log_name(program, day)}"
+
+
+def _daily_log_name(program: str, day: date) -> str:
+    return f"{program}-{day:%Y%m%d}.log"
 
 
 def market_data_dir() -> str:
@@ -55,14 +79,18 @@ def market_data_dir() -> str:
 
 
 def state_dir() -> str:
-    """部位檔與心跳記錄（`heartbeat`）：盤中程式與出場程式之間唯一的溝通管道。
-
-    盤中程式的停止進場記錄（`intraday.stop_path`）也放這裡：只有盤中程式自己在重啟後讀。
+    """部位檔與心跳記錄（盤中程式與出場程式之間唯一的溝通管道），以及各支程式留給自己下一次
+    執行的記錄。裡面有哪些檔、怎麼寫，見 `state_files`。
 
     ⚠️ **刻意不放在 `logs/` 底下。** `logs/` 每 30 天清一次；部位檔被清掉的那一刻，
        出場程式就以為今天沒有部位。它不含帳號，只有委託序號、口數與價格。
     """
-    return os.path.join(app_root(), "state")
+    return os.path.join(app_root(), _STATE)
+
+
+def shown_state(path: str) -> str:
+    """`state/` 底下的檔寫在訊息裡給人看的樣子，例如 `state/login-failed-20261109.txt`。"""
+    return f"{_STATE}/{os.path.basename(path)}"
 
 
 def capital_log_dir() -> str:

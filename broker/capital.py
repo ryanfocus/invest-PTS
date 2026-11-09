@@ -37,7 +37,7 @@ import os
 import time
 from collections import deque
 from datetime import date, datetime, timedelta
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import paths
 from broker import (
@@ -60,9 +60,9 @@ from broker import (
     TX_CODE,
     ensure_sendable,
 )
-from broker.capital_wire import (ReportUnreadable, build_future_order_fields, parse_fills,
-                                 parse_minute_bars, parse_order_book_no, parse_product_list,
-                                 summarize_fills)
+from broker.capital_wire import (FillSummary, ReportUnreadable, build_future_order_fields,
+                                 parse_fills, parse_minute_bars, parse_order_book_no,
+                                 parse_product_list, summarize_fills)
 
 logger = logging.getLogger(__name__)
 
@@ -124,10 +124,14 @@ class _RealCom:
 
     測試把它整個換掉（`CapitalBroker(com=...)`），而 `tests/conftest.py` 會讓
     任何沒換掉的測試直接失敗——這台開發機裝著群益元件，忘了換就是真的登入。
+    替身（`tests/fake_skcom.FakeSkcom`）照這裡的方法與回傳實作；這個類別就是那份契約。
+
+    元件、事件 handle、委託結構都是 comtypes 依型別庫動態產生的物件，型別寫成 `Any`：
+    它們的欄位與方法名稱以群益的型別庫為準（docs/capital-api.md），Python 這邊看不出來。
     """
 
     def __init__(self) -> None:
-        self._sk = None
+        self._sk: Any = None
 
     def load(self) -> None:
         import comtypes.client
@@ -137,14 +141,14 @@ class _RealCom:
 
         self._sk = sk
 
-    def create(self, name: str):
+    def create(self, name: str) -> Any:
         """建立一個群益元件，例如 `create("SKCenterLib")`。"""
         import comtypes.client
 
         return comtypes.client.CreateObject(
             getattr(self._sk, name), interface=getattr(self._sk, f"I{name}"))
 
-    def advise(self, lib, sink):
+    def advise(self, lib: Any, sink: object) -> Any:
         """掛上事件接收端。回傳的 handle 要留著，被回收就收不到事件了。"""
         import comtypes.client
 
@@ -156,10 +160,10 @@ class _RealCom:
 
         pythoncom.PumpWaitingMessages()
 
-    def new_future_order(self):
+    def new_future_order(self) -> Any:
         return self._sk.FUTUREORDER()
 
-    def new_stock(self):
+    def new_stock(self) -> Any:
         return self._sk.SKSTOCKLONG()
 
 
@@ -342,7 +346,7 @@ class CapitalBroker:
         pump_interval: float = 0.05,
         now: Callable[[], datetime] = datetime.now,
         sleep: Callable[[float], None] = time.sleep,
-        com=None,
+        com: _RealCom | None = None,
     ):
         self._user_id = user_id
         self._password = password
@@ -359,8 +363,8 @@ class CapitalBroker:
         # 成交查詢兩段之間的等待（測試換掉它，才不必真的等五秒）
         self._sleep = sleep
         self._com = com
-        self._center = None
-        self._handlers: list = []
+        self._center: Any = None
+        self._handlers: list[object] = []
         self._monitoring = False
         self._order_ready = False
 
@@ -381,7 +385,7 @@ class CapitalBroker:
             self._center = None
             raise
 
-    def _build_com(self, com) -> None:
+    def _build_com(self, com: _RealCom) -> None:
         com.load()
         center = com.create("SKCenterLib")
         self._center = center
@@ -418,6 +422,8 @@ class CapitalBroker:
                          self._message(code))
 
     def _pump_until(self, predicate: Callable[[], bool], seconds: float) -> bool:
+        """打訊息幫浦，直到 `predicate` 成立（True）或過了 `seconds` 秒（False）。
+        幫浦的間隔和行情串流同一個（`pump_interval`）。"""
         deadline = time.monotonic() + seconds
         while True:
             self._com.pump()
@@ -425,7 +431,7 @@ class CapitalBroker:
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(0.05)
+            time.sleep(self._pump_interval)
 
     def _pump_for(self, seconds: float) -> None:
         self._pump_until(lambda: False, seconds)
@@ -512,7 +518,7 @@ class CapitalBroker:
     # --- 行情 ---
 
     def minute_bars(self, day: date) -> list[MinuteBar]:
-        """指定交易日的大台日盤 1 分 K（細節與出處見 notes/capital-api.md 第 3 節）。
+        """指定交易日的大台日盤 1 分 K（細節與出處見 docs/capital-api.md 第 3 節）。
 
         `SKQuoteLib_RequestKLineAMByDate(TX00, 0 分線, 1 新版格式, 1 AM 盤, 日期, 日期, 1 分)`，
         從 `OnNotifyKLineData` 一列一列收，收到結束通知才算齊。盤別由 `sTradeSession`
@@ -562,7 +568,7 @@ class CapitalBroker:
     def events(self, product: str) -> Iterator[MarketEvent]:
         """訂閱大台與交易商品 `product` 的行情，依收到的順序產生行情事件。串流不會自己結束。
 
-        訂閱三樣東西（細節與出處見 notes/capital-api.md 第 1、2、4 節）：
+        訂閱三樣東西（細節與出處見 docs/capital-api.md 第 1、2、4 節）：
 
           * 大台的逐筆成交（`RequestTicks`）→ `TxTrade`。第一次訂閱會先回補當天的成交，
             休市時回補的是最近一個日盤。
@@ -747,7 +753,7 @@ class CapitalBroker:
     def _await_fill(self, seq: str, since: int, requested_lots: int) -> OrderResult:
         """等到這筆委託確定結束為止。等的是 `is_settled()`，不是「有沒有收到回報」。"""
 
-        def _summary():
+        def _summary() -> FillSummary:
             return summarize_fills(self._reply_events.rows[since:], seq)
 
         def _done() -> bool:

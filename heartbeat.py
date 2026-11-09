@@ -15,19 +15,19 @@
                                                 已經在跑，就是半路停了（當掉、被關掉）
     }
 
-寫入方式同部位檔：先寫暫存檔再置換，讀不懂就拋 `Unreadable`——讀不懂不能當成「有跑」。
+寫入方式同部位檔：先寫暫存檔再置換（`state_files.write_json`），讀不懂就拋 `Unreadable`——
+讀不懂不能當成「有跑」。
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import paths
+import state_files
 
 
 class Unreadable(Exception):
@@ -49,31 +49,16 @@ def path() -> str:
 def read() -> Heartbeat | None:
     """心跳記錄；從來沒寫過（或被刪掉）是 None。記的是別天的照樣回傳，由呼叫端比對交易日。"""
     target = path()
-    if not os.path.exists(target):
-        return None
     try:
-        with open(target, encoding="utf-8") as fh:
-            return _from_json(json.load(fh))
+        data = state_files.read_json(target)
+        return None if data is None else _from_json(data)
     except (ValueError, OSError) as exc:     # JSON 與 UTF-8 的解碼錯誤也是 ValueError
         raise Unreadable(f"{target}：{exc}") from exc
 
 
 def write(beat: Heartbeat) -> None:
-    """原子寫入。暫存檔建在同一個目錄（跨磁碟的 `os.replace` 不是原子的）。"""
-    target = path()
-    directory = os.path.dirname(target)
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".heartbeat-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(_to_json(beat), fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, target)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    """原子寫入（`state_files.write_json`）。"""
+    state_files.write_json(path(), _to_json(beat))
 
 
 _FIELDS = ("trading_day", "last_alive", "finished")
@@ -90,7 +75,7 @@ def _to_json(beat: Heartbeat) -> dict:
     }
 
 
-def _from_json(data) -> Heartbeat:
+def _from_json(data: object) -> Heartbeat:
     if not isinstance(data, dict) or set(data) != set(_FIELDS):
         raise ValueError(f"心跳記錄應該正好有 {'、'.join(_FIELDS)} 這幾個欄位，目前是 {data!r}")
     day, alive, finished = data["trading_day"], data["last_alive"], data["finished"]

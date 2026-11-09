@@ -65,7 +65,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -246,7 +246,7 @@ def task_xml(task: Task, *, pythonw: str, now: datetime, user: str) -> str:
             + ET.tostring(root, encoding="unicode"))
 
 
-def _first_day(start: time, now: datetime):
+def _first_day(start: time, now: datetime) -> date:
     """第一次執行的日期：今天的那個時刻還沒到就是今天，否則明天。
 
     起點寫成已經過去的時刻的話，「錯過就補跑」可能一建好排程就把它當成錯過的那一次補跑——
