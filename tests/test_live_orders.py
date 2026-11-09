@@ -21,7 +21,6 @@ from day_script import DAY, PREVIOUS_DAY, at, calm_history, clock, minute, rally
 from fake_skcom import TMF_INDEX, TX_INDEX, FakeSkcom, reply_row
 from recording import RecordingNotifier
 import intraday
-import paths
 import position_file
 import settings
 
@@ -80,27 +79,6 @@ def test_a_strong_open_sends_a_market_order_writes_the_fill_and_reports_it():
         "exits": [],
         "uncertain": None,
     }
-
-
-
-# --- 委託失敗的處理（ticket 07）完成之前，排程的進入點不接受自動下單 ---
-
-
-def test_until_order_failures_are_handled_the_scheduled_program_refuses_auto_ordering(
-        tmp_path, monkeypatch, caplog):
-    """`run()` 已經會真的下單，但委託被拒、成交不確定還沒有處理（ticket 07）：成交不確定時
-    部位檔不會記成「不確定」、也不告警，排程重啟後照缺了一筆的檔繼續進場；被拒的單則每次
-    重啟再送一次。所以在 07 完成之前，`main()` 看到自動下單打開就拒絕啟動：不讀帳密、
-    不登入、不送單。**ticket 07 拿掉這條測試與 `main()` 裡的防護。**"""
-    with open(paths.config_path(), encoding="utf-8") as fh:
-        text = fh.read().replace("auto_enabled: false", "auto_enabled: true")
-    config = tmp_path / "settings.yaml"
-    config.write_text(text, encoding="utf-8")
-    monkeypatch.setattr(paths, "config_path", lambda: str(config))
-    monkeypatch.setattr(paths, "env_path", lambda: str(tmp_path / "不該讀到這裡.env"))
-
-    assert intraday.main() == 1
-    assert "ticket 07" in caplog.text
 
 
 # --- 自動下單關閉：零呼叫（規格第 42 條）---
@@ -273,7 +251,7 @@ def _locked(monkeypatch) -> None:
 
 
 def test_a_fill_that_cannot_be_written_to_the_position_file_is_reported_and_ends_entries(
-        monkeypatch, state_dir):
+        monkeypatch):
     """單已經成交，寫部位檔卻失敗。部位檔是出場程式唯一看的東西：沒有這一口的話，13:25
     什麼都不平，微台就帶著部位過夜。所以立刻發「部位還在」的告警，講明這次成交了什麼、
     要人自己平掉；之後的部位檔和帳上對不上，加碼上限與部位不虧都算不準，今天不再進場
@@ -296,7 +274,7 @@ def test_a_fill_that_cannot_be_written_to_the_position_file_is_reported_and_ends
         "2026/11/09 08:50:00",
     ]
     assert outcome.ending is intraday.Ending.STREAM_ENDED
-    assert os.listdir(state_dir) == []
+    assert not os.path.exists(position_file.path_for(DAY))
 
 
 def test_when_the_write_fails_after_earlier_fills_the_alert_says_how_many_lots_are_on_file(
@@ -309,6 +287,24 @@ def test_when_the_write_fails_after_earlier_fills_the_alert_says_how_many_lots_a
     assert len(broker.orders) == 1
     assert sent[0].splitlines()[1:3] == ["這次：買進小台 1 口 @ 45150（委託序號 2315610000001）",
                                          "帳上 PTS 共多單 3 口，部位檔只記到 2 口"]
+    assert _file() == content
+
+
+def test_after_a_fill_that_could_not_be_written_a_restart_enters_nothing(monkeypatch):
+    """成交的 1 口寫不進部位檔，檔裡仍是稍早的 2 口；之後盤中程式重啟。重啟後只看得到
+    檔裡的 2 口，照常加碼的話，加碼上限少算 1 口、部位不虧也算在錯的均價上——而告警
+    已經說了「盤中程式今天不再進場」。"""
+    content = _on_file()
+    replace = os.replace
+    _locked(monkeypatch)
+    _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
+    # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
+    monkeypatch.setattr(os, "replace", replace)
+
+    broker, sent = _run(rally("08:45", 8) + [trade(at("08:53:00"), 45180)])
+
+    assert broker.orders == []
+    assert sent == []
     assert _file() == content
 
 
