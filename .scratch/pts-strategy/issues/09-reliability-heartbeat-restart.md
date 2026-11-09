@@ -98,3 +98,15 @@
   把結論寫進規格；選「不發」的話，要改的是 `intraday._QuoteWatch` 與
   `test_no_quotes_after_the_open_may_be_a_day_off_and_the_alert_says_so`、
   `test_a_day_off_found_only_by_the_quotes_is_not_reported_as_the_program_not_running`。
+
+**2026-11-10（第二次審查修正，取代上面「中斷期間不進場本來就成立」那一句）：**
+
+- **報價中斷告警的那一刻，取消等待中的突破進場**（`intraday._Trading.cancel_breakout`）。原本只有
+  累計筆數停住、大台成交照常時，等待中的突破進場照樣被碰到：告警發出「報價恢復之前不會進場」，
+  30 秒後就進了一口。現在中斷期間不進場分兩半：新的進場判斷不出來（成交斷了 K 棒不會即時結束、
+  缺了成交的 K 棒不判斷；筆數停了筆差是不知道，條件 1～4 都要筆差），等待中的那一筆在告警時取消。
+- 取消之後**不恢復**：觸發價是中斷之前的 5 根算的，恢復時價格可能早就超過，那時才進場是追高；
+  和重啟一樣（規格第 48 條、ADR-0001「報價中斷時那一筆就不會進場」）。
+- 告警之前（筆數停了不到 3 分鐘、成交照常），等待中的突破進場照樣會被碰到、會進場：設定之後只看
+  價格（規格第 21 條），價格是即時收到的。3 分鐘以內的筆數停頓不算報價中斷，只讓那幾根的筆差變成
+  不知道。測試：`test_a_waiting_breakout_is_cancelled_when_an_outage_is_reported`。

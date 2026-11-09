@@ -40,9 +40,11 @@
 
   * **心跳記錄**（`_Pulse`、`heartbeat`）：每分鐘寫一次，13:20 收工時寫「收工了」（這一輪在
     13:20 之前活過才寫）。13:25 的出場程式靠它發現盤中程式今天沒跑、或半路停了（規格第 54 條）。
-  * **報價中斷**（`_QuoteWatch`，規格第 53 條）：中斷期間本來就不會進場（K 棒要等成交才結束，
-    盯價只看即時成交）；斷線前後缺了成交的 K 棒還在一次判斷會讀到的最近幾根裡時也不判斷
-    （`_missing_bars`）；筆數停住過的筆差是不知道（`indicators._close`）；連續 3 分鐘發一則告警。
+  * **報價中斷**（`_QuoteWatch`，規格第 53 條）：大台成交或累計筆數任一路連續 3 分鐘沒來，發一則
+    告警，**同時取消等待中的突破進場**——只停了筆數時成交照常，不取消的話它照樣被碰到，告警裡
+    「報價恢復之前不會進場」就不是真的。新的進場則判斷不出來：斷線前後缺了成交的 K 棒還在一次
+    判斷會讀到的最近幾根裡時不判斷（`_missing_bars`），筆數停住過的筆差是不知道
+    （`indicators._close`）。
   * **盤中重啟**（`_Restored`，規格第 48 條）：部位、停止進場記錄照舊從檔案讀；今天已經過去的
     1 分 K 與每根的筆差從原始行情檔讀回，群益回補的成交裡重啟前就處理過的不再處理。
     當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
@@ -52,8 +54,8 @@
 條件 3、4 在 09:45 之後不立刻進場，策略判斷回答的是「設定突破進場」（`strategy.Breakout`）。
 盯價的是這裡（ADR-0001）：等待中的那一筆留在記憶體裡，每一筆**即時收到的**大台成交都問
 它碰到觸發價了沒，碰到就對交易商品進場。同一筆成交如果剛好讓一根 K 棒結束，先判斷、再
-盯價——剛設下的突破進場也要看這一筆。13:20 收工時，等待中的那一筆一併取消（規格第 26 條）；
-它不寫進任何檔案，重啟後也不恢復（規格第 48 條）。
+盯價——剛設下的突破進場也要看這一筆。13:20 收工時，等待中的那一筆一併取消（規格第 26 條），
+報價中斷告警時也是（`_QuoteWatch`）；它不寫進任何檔案，重啟後也不恢復（規格第 48 條）。
 
 ## 時間
 
@@ -266,7 +268,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 state, closed = indicators.close_forming(state)
                 _close(closed, event.time)
                 ending = Ending.CUTOFF
-                trading.cancel_breakout()
+                trading.cancel_breakout(f"{SESSION_END:%H:%M} 進場截止")
                 if not confirmed and other_day is not None:
                     logger.warning("到 %s 都沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
                                    f"{SESSION_END:%H:%M}", other_day)
@@ -277,6 +279,9 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 pulse.beat(event.time)
                 outage = watch.check(event.time)
                 if outage is not None:
+                    # 告警講「報價恢復之前不會進場」：只停了累計筆數時成交照常，等待中的
+                    # 突破進場還會被碰到（見 `_QuoteWatch`）
+                    trading.cancel_breakout("報價中斷")
                     _send(config, notify, outage)
             if isinstance(event, TxTrade):
                 if not confirmed and indicators.in_day_session(event.time):
@@ -768,12 +773,12 @@ class _Trading:
         self._execute(strategy.Enter(breakout.direction, breakout.condition, breakout.lots),
                       trade.time, trigger=breakout.trigger)
 
-    def cancel_breakout(self) -> None:
-        """13:20 進場截止：等待中的突破進場一併取消（規格第 26 條）。沒有進場，不發訊息。"""
+    def cancel_breakout(self, why: str) -> None:
+        """取消等待中的突破進場。沒有進場，不發訊息。兩個時候：13:20 進場截止（規格第 26 條），
+        與報價中斷告警的那一刻（`_QuoteWatch`）。取消就是沒了，之後不恢復。"""
         if self.breakout is not None:
-            logger.info("%s 進場截止，取消等待中的突破進場（%s，觸發價 %g）",
-                        f"{SESSION_END:%H:%M}", self.breakout.condition.value,
-                        self.breakout.trigger)
+            logger.info("%s，取消等待中的突破進場（%s，觸發價 %g）", why,
+                        self.breakout.condition.value, self.breakout.trigger)
             self.breakout = None
 
     def _execute(self, decision: strategy.Enter, now: datetime, *,
@@ -925,7 +930,17 @@ class _QuoteWatch:
     一條腿，所以從**比較早斷的那一路**算起。群益 broker 斷線時時鐘事件照樣每秒來（它是訊息
     幫浦自己產生的），所以中斷看得出來；整個程式卡住的話連時鐘都沒有，那是心跳記錄的事。
 
-    中斷期間本來就不會進場：K 棒要等成交才結束，突破進場也只看即時的成交。這裡只負責講。
+    中斷期間不進場分兩半：
+
+      * **新的進場判斷不出來**，不靠這裡：成交斷了，K 棒不會即時結束，斷線碰到的 K 棒也不判斷
+        （`_missing_bars`）；只有筆數停了，之後每一根的筆差都是不知道，條件 1～4 都要筆差。
+      * **等待中的突破進場在告警的那一刻取消**（`run()` 呼叫 `_Trading.cancel_breakout`）。
+        只停了筆數時大台成交照常，它照樣會被碰到——告警裡說了「報價恢復之前不會進場」，
+        就要做到。取消之後不恢復：觸發價是中斷之前的 5 根算的，恢復時價格可能早就遠遠超過，
+        那時才進場就是追高；和重啟一樣（規格第 48 條、ADR-0001「報價中斷時那一筆就不會進場」）。
+        告警之前（筆數停了不到 3 分鐘）它照樣會進場：設定之後只看價格（規格第 21 條），
+        價格是即時收到的；筆數停了不到 3 分鐘還不算中斷，只讓那幾根的筆差變成不知道
+        （`indicators._close`）。
 
     從什麼時候開始算：日盤 08:45 開盤，或這一輪盤中程式收到第一個時鐘事件（晚啟動、重啟），
     兩者取晚的——重啟之前的空白是心跳記錄要講的事，不是這裡。

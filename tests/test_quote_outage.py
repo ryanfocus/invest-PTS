@@ -100,6 +100,29 @@ def test_counts_that_stop_while_trades_go_on_are_an_outage_too():
         ["最後收到的大台成交：09:03:30；累計成交筆數：09:00:20", "2026/11/09 09:04:00"]]
 
 
+def test_a_waiting_breakout_is_cancelled_when_an_outage_is_reported():
+    """自動下單打開。08:50 條件 1 進一口；10:00 那根筆差從 500 跳到 1600、最高 45180，10:01:00
+    設突破進場，觸發價 45180。累計成交筆數在 10:00:20 之後就不來了，大台成交照常。
+
+    10:04:00 告警「報價恢復之前不會進場」——說了就要做到：10:04:30 大台碰到 45180，不進場。
+    筆數 10:05:20 恢復之後，10:05:30 再碰到 45180 也不進場：等待中的那一筆在告警時就取消了，
+    和重啟一樣不恢復（規格第 48 條；ADR-0001「報價中斷時那一筆就不會進場」）。它的觸發價是
+    中斷之前的 5 根算的，恢復之後的價格可能早就遠遠超過，那時才進場就是追高。"""
+    events = (rally("08:45", 5) + rally("08:50", 70, open_=45150, step=0, bichai=500)
+              + minute("10:00", 45150, 45180, bichai=1600)
+              + minute("10:01", 45170, 45175) + minute("10:02", 45170, 45175)
+              + minute("10:03", 45170, 45175) + minute("10:04", 45175, 45180)
+              + [clock(at("10:05:00")), trade(at("10:05:00"), 45175),
+                 counts(at("10:05:20"), buy=20000, sell=21700), trade(at("10:05:30"), 45180),
+                 product_trade(at("10:05:40"), 45180), trade(at("10:06:00"), 45175)])
+    broker, sent = _run(events, contracts=contracts())
+
+    assert [o.lots for o in broker.orders] == [1]
+    assert [(m.splitlines()[0], m.splitlines()[-1]) for m in sent] == [
+        ("PTS 做多：買進微台 1 口 @ 45150", "2026/11/09 08:50:00"),
+        (_OUTAGE, "2026/11/09 10:04:00")]
+
+
 def test_each_separate_outage_is_reported_once():
     """一次中斷只發一則（中斷 4 分鐘也是一則）；恢復之後又斷了 3 分鐘，是新的一次，再發一則。
     兩次都從比較早斷的筆數（:20）算起。"""
