@@ -18,7 +18,8 @@ import pytest
 
 from broker import FillUnknown, OrderFailed
 from broker.fake import FakeBroker
-from day_script import DAY, PREVIOUS_DAY, at, calm_history, rally, trade
+from day_script import (DAY, PREVIOUS_DAY, at, calm_history, rally, restarted_at, trade,
+                        until)
 from recording import RecordingNotifier
 from test_live_orders import CONTRACTS, _config, _file, _locked, _on_file, _run
 import intraday
@@ -66,9 +67,11 @@ def test_after_a_rejection_a_restart_the_same_day_neither_orders_nor_alerts_agai
     被拒的原因（保證金不足）還在，而第一則告警已經說了「今天不再進場」：重啟後條件照樣
     每分鐘成立，也一筆都不送、不再告警。只記在記憶體裡的話，每重啟一次就再被拒一次、
     再告警一次。"""
-    _run(_all_morning(), order_errors=[OrderFailed("委託被拒：保證金不足")])
+    _run(until(_all_morning(), at("08:50:40")),
+         order_errors=[OrderFailed("委託被拒：保證金不足")])
 
-    broker, sent = _run(_all_morning(), order_errors=[OrderFailed("委託被拒：保證金不足")])
+    broker, sent = _run(restarted_at(_all_morning(), at("08:51:10")),
+                        order_errors=[OrderFailed("委託被拒：保證金不足")])
 
     assert broker.orders == []
     assert sent == []
@@ -221,12 +224,12 @@ def test_when_the_uncertain_state_cannot_be_written_a_restart_still_enters_nothi
     content = _on_file(product="TM0000AM", order_code="TM2611")
     replace = os.replace
     _locked(monkeypatch)
-    _run(_all_morning(), order_errors=[
+    _run(until(_all_morning(), at("08:50:40")), order_errors=[
         FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
     # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
     monkeypatch.setattr(os, "replace", replace)
 
-    broker, sent = _run(_all_morning())
+    broker, sent = _run(restarted_at(_all_morning(), at("08:51:10")))
 
     assert broker.orders == []
     assert sent == []

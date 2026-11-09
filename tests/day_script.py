@@ -148,3 +148,17 @@ def replayed(events: list) -> list:
     沒有時鐘，也沒有累計筆數（筆數沒有歷史，只有現在的累計值）。晚啟動或重啟時，
     這一段會在第一個時鐘之後一口氣送來。"""
     return [e for e in events if isinstance(e, (TxTrade, ProductTrade))]
+
+
+# ── 當掉與重啟（ticket 09）────────────────────────────────────────────────
+
+
+def until(events: list, t: datetime) -> list:
+    """劇本到 `t` 為止：盤中程式在那裡停了（當掉、被關掉），之後的事件它收不到。"""
+    return [e for e in events if e.time <= t]
+
+
+def restarted_at(events: list, t: datetime) -> list:
+    """盤中程式在 `t` 重啟之後，broker 送來的樣子：先一個本機時鐘，接著群益第一次訂閱時
+    回補的今天的成交（到 `t` 為止，只有成交），然後才是 `t` 之後的即時行情。"""
+    return [Clock(t)] + replayed(until(events, t)) + [e for e in events if e.time > t]

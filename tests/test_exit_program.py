@@ -19,10 +19,25 @@ from broker import BUY, SELL, TMF_CODE, FillQuery, FillUnknown, LoginFailed, Ord
 from broker.fake import FakeBroker
 from recording import RecordingNotifier
 import exit_program
+import heartbeat
 import position_file
 import settings
 
 DAY = date(2026, 11, 9)          # 週一，一般交易日；近月 11/18 結算
+
+
+def _intraday_ran(day: date) -> None:
+    """盤中程式那一天照常跑完了：心跳記錄寫著那一天、13:20 收工。"""
+    with open(heartbeat.path(), "w", encoding="utf-8") as fh:
+        json.dump({"trading_day": f"{day:%Y-%m-%d}", "last_alive": f"{day:%Y-%m-%d}T13:20:00",
+                   "finished": True}, fh)
+
+
+@pytest.fixture(autouse=True)
+def intraday_ran_today(state_dir):
+    """這裡的每一個出場情境，盤中程式今天（`DAY`）都照常跑完了。盤中程式沒跑的告警（ticket 09）
+    在 test_heartbeat 測；不放這一份的話，每個情境都會多一則。別天的情境自己再寫一次。"""
+    _intraday_ran(DAY)
 
 
 def _config(**overrides) -> settings.Config:
@@ -326,6 +341,7 @@ def test_an_uncertain_micro_position_is_reported_with_the_deadline_that_applies(
         day, hhmm, last_trading_day, todo):
     """「不確定」時要人自己平微台，期限要講對（規格第 41、55 條）：13:45 之後補跑就是夜盤；
     結算日的近月 13:30 就停止交易，13:30 之後已經不能平，由交易所了結。"""
+    _intraday_ran(day)
     _on_file(day, last_trading_day=last_trading_day, status="UNCERTAIN",
              uncertain=_uncertain("ENTRY"))
     broker, sent, _ = _run(at=_at(hhmm, day))
@@ -465,6 +481,7 @@ SETTLEMENT = date(2026, 11, 18)
 
 
 def test_on_the_settlement_day_the_micro_position_is_closed_before_1330():
+    _intraday_ran(SETTLEMENT)
     _on_file(SETTLEMENT, last_trading_day="2026-11-18")
     broker, sent, _ = _run(at=_at("13:25", SETTLEMENT))
     assert _orders(broker) == [("TM2611", SELL, 3, False, SETTLEMENT)]
@@ -474,6 +491,7 @@ def test_on_the_settlement_day_the_micro_position_is_closed_before_1330():
 def test_on_the_settlement_day_the_alert_gives_1330_as_the_deadline():
     """結算日 13:28 重試用完。近月 13:30 就停止交易：告警照一般日寫「日盤 13:45 收盤」的話，
     使用者以為還有 17 分鐘，其實只剩 2 分鐘，13:30 之後 TM2611 就不能交易了。"""
+    _intraday_ran(SETTLEMENT)
     _on_file(SETTLEMENT, last_trading_day="2026-11-18")
     broker, sent, _ = _run(at=_at("13:25", SETTLEMENT),
                            order_errors=[OrderFailed("保證金不足")] * 4)
@@ -492,6 +510,7 @@ def test_on_the_settlement_day_after_1330_the_exchange_settles_what_is_left():
     """結算日 13:30 之後近月已經停止交易，送出去只會被拒，所以不送。PTS 的微台還是沒有平掉
     （規格第 34、38 條：最後仍有剩餘就告警）：講明還剩幾口、為什麼不必也不能自己平，
     以及結算後要確認什麼——損益照最後結算價算，和回測有落差。部位檔原封不動。"""
+    _intraday_ran(SETTLEMENT)
     content = _on_file(SETTLEMENT, last_trading_day="2026-11-18")
     broker, sent, _ = _run(at=_at("13:35", SETTLEMENT),
                            login_error=AssertionError("近月停止交易後不該登入"))
@@ -508,6 +527,7 @@ def test_on_the_settlement_day_after_1330_the_exchange_settles_what_is_left():
 def test_on_the_settlement_day_retries_stop_at_1330():
     """13:29 第一次被拒，一分鐘後已經 13:30：近月停止交易，不再重試。沒平掉的照樣告警——
     同一個失敗，13:25 開始的話 13:28 會告警，晚兩分鐘開始就不講，是說不通的。"""
+    _intraday_ran(SETTLEMENT)
     _on_file(SETTLEMENT, last_trading_day="2026-11-18")
     broker, sent, _ = _run(at=_at("13:29", SETTLEMENT),
                            order_errors=[OrderFailed("保證金不足")] * 4)

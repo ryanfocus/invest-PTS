@@ -55,7 +55,7 @@ def market_data_dir() -> str:
 
 
 def state_dir() -> str:
-    """部位檔（以及 ticket 09 的心跳記錄）：盤中程式與出場程式之間唯一的溝通管道。
+    """部位檔與心跳記錄（`heartbeat`）：盤中程式與出場程式之間唯一的溝通管道。
 
     盤中程式的停止進場記錄（`intraday.stop_path`）也放這裡：只有盤中程式自己在重啟後讀。
 

@@ -17,7 +17,8 @@ import pytest
 from broker import BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo
 from broker.capital import CapitalBroker
 from broker.fake import FakeBroker
-from day_script import DAY, PREVIOUS_DAY, at, calm_history, clock, minute, rally, trade
+from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, minute, rally,
+                        restarted_at, trade, until)
 from fake_skcom import TMF_INDEX, TX_INDEX, FakeSkcom, reply_row
 from recording import RecordingNotifier
 import intraday
@@ -297,11 +298,12 @@ def test_after_a_fill_that_could_not_be_written_a_restart_enters_nothing(monkeyp
     content = _on_file()
     replace = os.replace
     _locked(monkeypatch)
-    _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
+    morning = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]   # 條件 1 每分鐘成立
+    _run(until(morning, at("08:50:40")))
     # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
     monkeypatch.setattr(os, "replace", replace)
 
-    broker, sent = _run(rally("08:45", 8) + [trade(at("08:53:00"), 45180)])
+    broker, sent = _run(restarted_at(morning, at("08:51:10")))
 
     assert broker.orders == []
     assert sent == []
@@ -563,7 +565,11 @@ def test_fills_of_other_orders_on_the_shared_reply_line_never_become_ptss_positi
     assert [(o.bstrStockNo, o.sBuySell, o.nQty, o.bstrPrice, o.sTradeType, o.sNewClose,
              o.sDayTrade) for o in skcom.sent] == [("TM2611", 0, 1, "M", 1, 2, 0)]
     assert _file()["entries"] == [{"order_seq": "2315610000001", "lots": 1, "price": 45152.0}]
-    assert notifier.sent == ["PTS 做多：買進微台 1 口 @ 45152\n"
-                             "觸發：條件 1（早盤做多）\n"
-                             "累計：多單 1 口，均價 45152\n"
-                             "2026/11/09 08:50:00"]
+    # 08:50 之後劇本沒有行情，本機時鐘一次跳 10 分鐘直到 13:20：那是一次報價中斷，
+    # 後面跟著一則中斷告警（ticket 09，test_quote_outage）。這裡只看成交訊息。
+    assert notifier.sent[0] == ("PTS 做多：買進微台 1 口 @ 45152\n"
+                                "觸發：條件 1（早盤做多）\n"
+                                "累計：多單 1 口，均價 45152\n"
+                                "2026/11/09 08:50:00")
+    assert [m.splitlines()[0] for m in notifier.sent[1:]] == [
+        "【要你處理】PTS 盤中報價中斷超過 3 分鐘"]

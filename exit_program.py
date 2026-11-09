@@ -15,6 +15,9 @@
   * **大台、小台**：不送任何單、不登入。進場時標了當沖，券商 13:30 強平；結算日由交易所以
     最後結算價了結（規格第 30、35 條）。
 
+另外檢查盤中程式今天有沒有跑完（心跳記錄，規格第 54 條）：今天沒跑、半路停了、或心跳記錄
+讀不懂，就發一則 Discord。只告警、不影響出場——出場不依賴盤中程式。
+
 任何不確定的情況都不猜，改發 Discord 請使用者處理：部位檔讀不懂、部位不確定、平倉單送出去
 卻不知道成交（查過券商紀錄仍無法確認全部成交）、重試完仍有剩餘、13:45 之後才補跑、
 結算日 13:30 近月停止交易時還有剩餘、設定檔有錯（`BrokenSettings`）。告警裡要人在幾點前
@@ -47,6 +50,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 
 import calendar_tw
+import heartbeat
 import messages
 import paths
 import position_file
@@ -128,6 +132,7 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
                      f"{now:%H:%M}", f"{strategy.ENTRY_CUTOFF:%H:%M}")
         return _end(Ending.TOO_EARLY)
 
+    _check_heartbeat(today, now, say)
     try:
         record = position_file.read(today)
     except position_file.Unreadable as exc:
@@ -165,6 +170,28 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
         say(messages.exit_not_on_file(at=clock(), record=ledger.record, on_file=ledger.on_file,
                                       reason=ledger.error))
     return _end(ending)
+
+
+def _check_heartbeat(today: date, now: datetime, say: Callable[[str], None]) -> None:
+    """盤中程式今天有沒有跑（規格第 54 條）。只告警、不擋出場：出場不依賴盤中程式（第 49 條），
+    不論今天有沒有部位都要查——沒跑的那天正是不會有部位的那天。"""
+    try:
+        beat = heartbeat.read()
+    except heartbeat.Unreadable as exc:
+        # 當成「有跑」是安靜地漏掉，當成「沒跑」是在講不知道的事
+        logger.error("心跳記錄讀不懂，不知道盤中程式今天有沒有跑完：%s", exc)
+        say(messages.heartbeat_unreadable(at=now, reason=str(exc)))
+        return
+    if beat is None or beat.trading_day != today:
+        logger.error("今天沒有盤中程式的心跳記錄（%s），盤中程式今天沒有跑", beat)
+        say(messages.intraday_not_running(at=now))
+    elif not beat.finished:
+        # 盤中程式 13:20 收工時會寫「收工了」。出場程式在進場截止之後才走到這裡，
+        # 所以還沒收工就是半路停了，而且之後沒有再起來。
+        logger.error("盤中程式最後的心跳是 %s，之後沒有再跑，也沒有收工", beat.last_alive)
+        say(messages.intraday_not_running(at=now, stopped_at=beat.last_alive))
+    else:
+        logger.info("盤中程式今天跑完了（最後的心跳 %s）", beat.last_alive)
 
 
 def _deadline(record: position_file.PositionRecord) -> datetime:

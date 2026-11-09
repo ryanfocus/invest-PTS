@@ -1,0 +1,197 @@
+"""盤中程式當掉被重啟（規格第 48 條）——從最上層打進去，跑兩輪 `intraday.run`。
+
+第一輪的劇本在某個時刻就沒了：程式在那裡停了。第二輪是重啟之後 broker 送來的樣子：
+先一個本機時鐘，接著群益第一次訂閱時回補的今天的成交（`replayed`，只有成交、帶交易所
+當時的時間），然後才是即時的行情。兩輪之間只靠檔案：部位檔、停止進場記錄、原始行情檔。
+
+斷言送出的委託、發出的訊息、部位檔，以及 `run()` 交回的 1 分 K（每根結束時的筆差）。
+"""
+
+import json
+
+import pytest
+
+from broker import MTX_CODE, TMF_CODE
+from broker.fake import FakeBroker
+from day_script import (DAY, PREVIOUS_DAY, at, calm_history, contracts, counts, minute,
+                        rally, restarted_at, trade, until)
+from recording import RecordingNotifier
+import intraday
+import position_file
+import settings
+
+
+def _config(**overrides) -> settings.Config:
+    values = dict(auto_order_enabled=False, product=TMF_CODE, lots_per_entry=1,
+                  max_position=20, discord_enabled=True)
+    values.update(overrides)
+    return settings.Config(**values)
+
+
+def _run(events, *, config=None, **broker_options):
+    """跑一輪，回傳 (broker, 發出的訊息, 結果)。"""
+    broker = FakeBroker(contracts=contracts(), events=events,
+                        minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
+    notifier = RecordingNotifier()
+    outcome = intraday.run(broker, config or _config(), today=DAY, notify=notifier)
+    return broker, notifier.sent, outcome
+
+
+def _bichai(outcome) -> list[tuple]:
+    return [(f"{b.bar.start:%H:%M}", b.bichai) for b in outcome.bars]
+
+
+def test_after_a_restart_the_bichai_of_each_bar_comes_back_from_the_raw_market_file():
+    """08:45 起每根的筆差是 1000、1010、1020…。第一輪在 08:50:40 之後當掉，08:54:10 重啟。
+
+    群益的筆差沒有歷史回補：重啟後回補的只有成交。08:45–08:49 每根結束時的筆差只能從
+    PTS 自己的原始行情檔讀回來。08:50 那根在當掉時還沒結束，08:51–08:53 程式不在：
+    它們結束那一刻的筆數都沒有記到，筆差是「不知道」——不是當掉前最後的那個值，
+    也不是重啟後收到的值。重啟之後的 08:54 起照常。"""
+    day = rally("08:45", 12, bichai=1000, bichai_step=10) + [trade(at("08:57:00"), 45230)]
+    _run(until(day, at("08:50:40")))
+    _, _, outcome = _run(restarted_at(day, at("08:54:10")))
+
+    assert _bichai(outcome) == [
+        ("08:45", 1000), ("08:46", 1010), ("08:47", 1020), ("08:48", 1030), ("08:49", 1040),
+        ("08:50", None), ("08:51", None), ("08:52", None), ("08:53", None),
+        ("08:54", 1090), ("08:55", 1100), ("08:56", 1110)]
+
+
+@pytest.mark.parametrize("restart", ["08:52:50", "08:55:10"],
+                         ids=["當掉時還沒結束的那一根", "程式不在的那幾分鐘"])
+def test_counts_that_piled_up_while_the_program_was_down_are_not_a_bichai_jump(restart):
+    """自動下單打開，08:50 條件 1 進場做多一口，之後大台橫盤（開盤價沒有比上一根高，不是紅K），
+    筆差 1500。08:51:40 之後當掉，最後記到的累計筆數是 08:51:20 的 1500。當機期間筆數照樣在
+    累積，重啟後收到的已經是 1700。
+
+    拿兩者相減，重啟後的第一根就是 +200 的「筆差跳增」，條件 3 立刻追多加碼——那是當機前後
+    的累積，不是一分鐘裡突然大量買進（ticket 09）。兩種重啟時機都不可以：
+
+      * 08:52:50 重啟（排程重啟加上登入，一分鐘多是常態）：08:51 那根在當掉時還沒結束，
+        結束那一刻的筆數沒有記到；08:52:55 收到第一次筆數 1700，08:52 那根和它相減。
+      * 08:55:10 重啟：08:52–08:54 程式不在，那幾根結束時手上的還是當掉前的 1500。
+
+    之後 08:56 那根真的 +100，條件 3 照常加碼，證明重啟後照常在判斷。"""
+    flat = []
+    for i, bichai in enumerate([1500, 1500, 1600, 1700, 1700, 1700, 1800]):
+        flat += minute(f"08:{50 + i}", 45140, 45140, bichai=bichai)
+        if i == 2:
+            flat.append(counts(at("08:52:55"), buy=20000, sell=21700))
+    day = rally("08:45", 5) + flat + [trade(at("08:57:00"), 45140)]
+    on = _config(auto_order_enabled=True)
+    first, _, _ = _run(until(day, at("08:51:40")), config=on)
+    assert [o.lots for o in first.orders] == [1]
+
+    _, sent, _ = _run(restarted_at(day, at(restart)), config=on)
+    assert [(m.splitlines()[1], m.splitlines()[-1]) for m in sent] == [
+        ("觸發：條件 3（追多加碼）", "2026/11/09 08:57:00")]
+
+
+# --- 重啟得很快：當掉前一刻剛判斷過的那一根不再判斷一次 ---
+
+
+def test_a_quick_restart_does_not_judge_the_last_bar_again():
+    """自動下單打開，08:50–08:53 每分鐘條件 1 都成立。08:50:00 那筆成交讓 08:49 那根結束、
+    進場一口，08:50:05 當掉，08:50:20 就重啟了（手動重開、或排程立刻重啟）。
+
+    群益回補的成交裡有 08:50:00 那一筆，離重啟才 20 秒，還算即時；累計筆數一訂閱就推來
+    現在的值（比回補的成交先到）。再拿那筆成交結束一次 08:49 那根，條件 1 照樣成立，
+    就是同一分鐘判斷兩次、多送一口（ticket 04 留下的問題）。重啟前就處理過的成交不再處理。
+    08:50 那根在當掉時還沒結束，筆差當成不知道，08:51 不進場；08:52 起照常，累計接在
+    部位檔原來的口數後面。"""
+    day = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
+    on = _config(auto_order_enabled=True)
+    first, _, _ = _run(until(day, at("08:50:05")), config=on)
+    assert len(first.orders) == 1
+
+    restart = restarted_at(day, at("08:50:20"))
+    restart.insert(1, counts(at("08:50:20"), buy=20000, sell=21500))
+    second, sent, _ = _run(restart, config=on)
+    assert len(second.orders) == 2
+    assert [(m.splitlines()[2], m.splitlines()[-1]) for m in sent] == [
+        ("累計：多單 2 口，均價 45160", "2026/11/09 08:52:00"),
+        ("累計：多單 3 口，均價 45166.67", "2026/11/09 08:53:00")]
+    assert [e["lots"] for e in _position()["entries"]] == [1, 1, 1]
+
+
+def _position() -> dict:
+    with open(position_file.path_for(DAY), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_the_raw_market_file_keeps_each_trade_once_across_a_restart(market_dir):
+    """重啟後群益回補當天的成交，裡面大半重啟前就記過了。原始行情檔每一筆成交只記一次、
+    依時間排好——ticket 03 拿它看筆差，作者日後拿它做 tick 等級的回測，重複的成交會讓
+    兩者都失真。當機期間的成交（08:51–08:54）由回補補上。"""
+    day = rally("08:45", 12, bichai=1000, bichai_step=10) + [trade(at("08:57:00"), 45230)]
+    _run(until(day, at("08:50:40")))
+    _run(restarted_at(day, at("08:54:10")))
+
+    rows = (market_dir / "TX-20261109.csv").read_text(encoding="utf-8").splitlines()[1:]
+    trades = [r.split(",")[0][11:19] for r in rows if r.split(",")[1]]
+    assert trades == [f"08:{m:02d}:{s:02d}" for m in range(45, 57) for s in (0, 30)] + ["08:57:00"]
+
+
+# --- 交易商品與口數以部位檔為準（規格第 43、48 條）---
+
+
+def test_after_a_restart_the_lots_and_product_on_file_carry_on_even_if_the_settings_changed():
+    """自動下單打開、交易小台：08:50、08:51 各進一口，08:51:40 當掉。使用者趁這時把設定改成
+    微台，08:52:50 盤中程式被重啟。今天已經有小台的部位：照樣看小台的行情、下小台的單，
+    累計接在原來的 2 口後面（加碼上限也是）；新設定從下一個交易日起才生效。"""
+    day = rally("08:45", 10) + [trade(at("08:55:00"), 45200)]
+    first, _, _ = _run(until(day, at("08:51:40")),
+                       config=_config(auto_order_enabled=True, product=MTX_CODE))
+    assert [o.contract.order_code for o in first.orders] == ["MTX11", "MTX11"]
+
+    second, sent, _ = _run(restarted_at(day, at("08:52:50")),
+                           config=_config(auto_order_enabled=True, product=TMF_CODE,
+                                          max_position=3))
+    assert second.streamed == [MTX_CODE]
+    assert [o.contract.order_code for o in second.orders] == ["MTX11"]
+    assert [m.splitlines()[0::2] for m in sent] == [
+        ["PTS 做多：買進小台 1 口 @ 45190", "累計：多單 3 口，均價 45166.67"]]
+    assert _position()["product"] == MTX_CODE
+
+
+# --- 等待中的突破進場不恢復（規格第 48 條）---
+
+
+def test_a_breakout_waiting_before_the_crash_is_not_restored():
+    """10:00 那根筆差從 500 跳到 1600，10:01:00 設下突破進場（觸發價 45180）；10:01:05 當掉，
+    10:01:20 就重啟了。等待中的突破進場只在記憶體裡，重啟後不恢復：10:02:30 大台碰到 45180，
+    不進場。10:00 那根重啟前就判斷過了，重啟後不再判斷，所以也不會把同一筆突破進場又設一次。"""
+    day = (rally("08:45", 5) + rally("08:50", 70, open_=45150, step=0, bichai=500)
+           + minute("10:00", 45150, 45180, bichai=1600)
+           + minute("10:01", 45170, 45175, bichai=1600)
+           + minute("10:02", 45175, 45180, bichai=1600)
+           + [trade(at("10:03:00"), 45185)])
+    on = _config(auto_order_enabled=True)
+    first, _, _ = _run(until(day, at("10:01:05")), config=on)
+    assert len(first.orders) == 1             # 08:50 條件 1
+
+    second, sent, _ = _run(restarted_at(day, at("10:01:20")), config=on)
+    assert second.orders == []
+    assert sent == []
+
+
+# --- 原始行情檔的最後一行只寫了一半 ---
+
+
+def test_a_raw_market_line_cut_off_by_the_crash_is_skipped_and_new_lines_start_fresh(market_dir):
+    """當掉那一刻最後一行只寫了一半。重啟後讀不懂的那一行略過，其餘照樣讀回；新的行情另起
+    一行寫，不黏在半行後面（黏上去的話，兩行一起讀不懂）。"""
+    day = rally("08:45", 12, bichai=1000, bichai_step=10) + [trade(at("08:57:00"), 45230)]
+    _run(until(day, at("08:50:40")))
+    path = market_dir / "TX-20261109.csv"
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        fh.write("2026-11-09T08:50:4")
+
+    _, _, outcome = _run(restarted_at(day, at("08:54:10")))
+
+    assert _bichai(outcome)[:5] == [("08:45", 1000), ("08:46", 1010), ("08:47", 1020),
+                                    ("08:48", 1030), ("08:49", 1040)]
+    lines = path.read_text(encoding="utf-8").splitlines()
+    cut = lines.index("2026-11-09T08:50:4")
+    assert lines[cut + 1] == "2026-11-09T08:51:00.000,45160,,"

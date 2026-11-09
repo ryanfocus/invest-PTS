@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from broker import DAY_TRADE_CODES, MTX_CODE, TMF_CODE, TX_CODE
 import position_file
@@ -136,6 +136,32 @@ def fill_not_on_file(*, at: datetime, product: str, direction: str, lots: int, p
         f"原因：{reason}\n"
         f"出場程式和盤中程式都只認部位檔，不知道這 {lots} 口：請到券商 APP 確認帳戶，"
         f"自行平掉這 {lots} 口。盤中程式今天不再進場。\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def quote_outage(*, at: datetime, trade_at: datetime | None, counts_at: datetime | None,
+                 outage: timedelta) -> str:
+    """盤中報價中斷（規格第 38、53 條）。
+
+    兩路各寫最後一次收到的時刻：哪一路斷了，使用者查原因時才有方向。今天還沒收到大台的成交，
+    可能只是臨時休市（颱風假）——程式到 13:20 之前分不出來，所以講明那樣的話不必處理，
+    免得使用者在休市日被叫起來查電腦。
+
+    斷線之後群益會不會自己把報價接回來，還沒實機確認過（盤中程式不自己重新連線）。所以也講
+    退路：先關掉、再重新執行——重啟會從部位檔與原始行情記錄接著做。「先關掉」要講：兩個盤中
+    程式同時跑，同一分鐘就會進兩次場。
+    """
+    trade_text = "今天還沒有" if trade_at is None else f"{trade_at:%H:%M:%S}"
+    counts_text = "今天還沒有" if counts_at is None else f"{counts_at:%H:%M:%S}"
+    day_off = "今天如果臨時休市（例如颱風假），不必處理。\n" if trade_at is None else ""
+    return (
+        f"【要你處理】PTS 盤中報價中斷超過 {int(outage.total_seconds() // 60)} 分鐘\n"
+        f"最後收到的大台成交：{trade_text}；累計成交筆數：{counts_text}\n"
+        "報價恢復之前不會進場；恢復之後盤中程式自己接著判斷，不另外通知。已經有的部位照常了結。\n"
+        f"{day_off}"
+        "請檢查這台電腦的網路與群益的報價連線。網路正常、報價卻一直沒有回來的話，"
+        "先關掉盤中程式再重新執行：它會從部位檔與原始行情記錄接著做。\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 
@@ -301,6 +327,52 @@ def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,
         "不要再執行出場程式：它只認部位檔，會把已經平掉的口數再平一次，開出反向新倉。\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
+
+
+def intraday_not_running(*, at: datetime, stopped_at: datetime | None = None) -> str:
+    """出場程式發現盤中程式今天沒有跑（規格第 38、54 條），或跑到 `stopped_at` 就停了
+    （當掉之後排程沒有把它重啟）。
+
+    平常沒有例行訊息，這一則是使用者唯一會發現的管道。講清楚兩件事：今天少了什麼（進場的
+    判斷），以及出場不受影響——不講的話，使用者會以為部位沒人平。要做的事是排除原因，
+    所以指出去哪裡看。
+    """
+    after_hours = _EXIT_GOES_ON
+    log = _intraday_log(at)
+    deadline = _BEFORE_NEXT_OPEN
+    if stopped_at is None:
+        return (
+            "【要你處理】PTS 盤中程式今天沒有跑\n"
+            f"今天沒有判斷進場，也沒有記錄原始行情。{after_hours}\n"
+            f"請檢查工作排程器裡盤中程式的排程，以及 {log}，{deadline}\n"
+            f"{at:%Y/%m/%d %H:%M:%S}"
+        )
+    return (
+        f"【要你處理】PTS 盤中程式今天 {stopped_at:%H:%M} 之後就沒有再跑\n"
+        f"{stopped_at:%H:%M} 之後沒有判斷進場：盤中程式停了，排程沒有把它重啟，或重啟之後又停了。"
+        f"{after_hours}\n"
+        f"請看 {log} 最後幾行找原因，並檢查工作排程器裡盤中程式的排程，{deadline}\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def heartbeat_unreadable(*, at: datetime, reason: str) -> str:
+    """出場程式讀不懂心跳記錄：不知道盤中程式今天有沒有跑完，照實講，請人去看 log。"""
+    return (
+        "【要你處理】PTS 心跳記錄讀不懂，不知道盤中程式今天有沒有跑完\n"
+        f"原因：{reason}\n"
+        f"{_EXIT_GOES_ON}\n"
+        f"請看 {_intraday_log(at)} 確認盤中程式今天有沒有跑完，{_BEFORE_NEXT_OPEN}\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+_EXIT_GOES_ON = "出場程式照常處理部位檔裡的部位。"
+_BEFORE_NEXT_OPEN = "下一個交易日 08:40 之前排除。"
+
+
+def _intraday_log(at: datetime) -> str:
+    return f"logs/intraday-{at:%Y%m%d}.log"
 
 
 def exit_crashed(*, at: datetime, reason: str, closed: bool = False) -> str:

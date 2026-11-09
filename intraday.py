@@ -29,6 +29,16 @@
 （規格第 48 條）之後看到它，照樣不進場、不再告警。只放在記憶體的話，被拒的單會在重啟後
 再送一次、再告警一次；「不確定」或成交寫不進部位檔時，重啟後部位檔看不出今天出過事。
 
+## 可靠度（ticket 09）
+
+  * **心跳記錄**（`_Pulse`、`heartbeat`）：每分鐘寫一次，13:20 收工時寫「收工了」。13:25 的
+    出場程式靠它發現盤中程式今天沒跑、或半路停了（規格第 54 條）。
+  * **報價中斷**（`_QuoteWatch`，規格第 53 條）：中斷期間本來就不會進場（K 棒要等成交才結束，
+    盯價只看即時成交）；中間斷過、缺了成交的那一根也不判斷；連續 3 分鐘發一則告警。
+  * **盤中重啟**（`_Restored`，規格第 48 條）：部位、停止進場記錄照舊從檔案讀；今天已經過去的
+    1 分 K 與每根的筆差從原始行情檔讀回，群益回補的成交裡重啟前就處理過的不再處理。
+    當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
+
 ## 突破進場的盯價
 
 條件 3、4 在 09:45 之後不立刻進場，策略判斷回答的是「設定突破進場」（`strategy.Breakout`）。
@@ -68,10 +78,12 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 import calendar_tw
+import heartbeat
 import indicators
 import messages
 import paths
 import position_file
+import raw_market
 import settings
 import strategy
 from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
@@ -88,7 +100,15 @@ SESSION_END = strategy.ENTRY_CUTOFF
 # 成交最多可以比本機時鐘晚多久，還算是即時收到的。要大過本機時鐘和交易所的誤差
 # （一兩秒，久沒對時可能更多）加上成交時間只到秒、時鐘每秒才一個；要小過重啟所需的時間
 # （排程最快一分鐘後重啟，再加上登入），回補的分鐘才不會被當成即時的再判斷一次。
+# 重啟得比這還快時，重啟前判斷過的那一根靠原始行情檔認出來（`_Restored.covers`）。
 _MAX_LAG = timedelta(seconds=30)
+
+# 連續這麼久沒有即時的大台報價，就發 Discord（規格第 53 條）。
+_OUTAGE_ALERT = timedelta(minutes=3)
+
+# 大台日盤每秒都有好幾筆成交。相鄰兩筆隔得比這還久，中間就是報價斷了，不是沒有人交易：
+# 那一根 K 棒缺了成交（收盤價、高低點都可能不對），不拿它判斷。
+_TRADE_GAP = timedelta(seconds=30)
 
 # 往前找幾個交易日的 1 分 K 當暖身與昨收。日曆認得國定假日，認不得颱風假這類臨時休市
 # （那天查不到 K 棒），所以查不到就再往前一天。
@@ -143,6 +163,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         logger.info("%s 不是交易日，不登入", today)
         return SessionOutcome(Ending.NOT_A_TRADING_DAY)
 
+    pulse = _Pulse(today)
     # 當天已經有部位（盤中重啟）：交易商品、合約、口數一律以部位檔為準，不看設定檔
     # （規格第 43 條）。改設定最快下一個交易日才生效，進場和出場就不會是不同的商品。
     try:
@@ -152,6 +173,8 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         # 均價、加碼上限甚至商品都會錯。這一天不進場；檔案原封不動，留給人工處理。
         logger.error("部位檔讀不懂，今天不進場：%s", exc)
         _send(config, notify, messages.position_file_unreadable(day=today, reason=str(exc)))
+        # 這是盤中程式自己下的結論，不是當掉：出場程式不必再講一次「盤中程式沒有跑」
+        pulse.finish(None)
         return SessionOutcome(Ending.POSITION_FILE_UNREADABLE)
     product = config.product if record is None else record.product
     if record is not None and product != config.product:
@@ -170,12 +193,19 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                        _load_settlement_day(broker, today), orders,
                        today=today, product=product, record=record)
     end_at = datetime.combine(today, SESSION_END)
-    state = indicators.BarState()
-    bars: list[indicators.ClosedBar] = []
+    # 盤中重啟：今天稍早收到的行情在原始行情檔裡，K 棒與筆差從那裡接著組（見 `_Restored`）
+    restored = _Restored(raw_market.read(today))
+    state = restored.state
+    bars: list[indicators.ClosedBar] = list(restored.bars)
     raw = RawMarketWriter(today)
-    confirmed = False               # 收到今天日盤的成交了
+    watch = _QuoteWatch(today)
+    confirmed = restored.confirmed  # 收到今天日盤的成交了（重啟前那一輪收到的也算）
+    if confirmed:
+        raw.confirm()
     other_day: date | None = None   # 收過哪一個別的交易日的大台成交
     local_now: datetime | None = None   # 最新的本機時鐘（見模組說明「時間」）
+    last_trade = restored.last_trade    # 上一筆今天日盤的大台成交（交易所時間）
+    gappy: datetime | None = None       # 中間報價斷過、缺了成交的那一根（起始分鐘）
 
     def _live(t: datetime) -> bool:
         """時間 `t` 的成交是不是即時收到的（見模組說明「時間」）。"""
@@ -184,6 +214,12 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     def _close(closed: indicators.ClosedBar | None, now: datetime) -> None:
         if closed is None:
             return
+        if closed.bar.start == restored.unfinished and closed.bichai is not None:
+            # 重啟前那一輪當掉時，這一根還沒結束：結束那一刻的筆數沒有記到。手上的是當掉前的值，
+            # 拿它和重啟後的值相減，就是把當機前後的累積算成一根的筆差跳增（ticket 09）。
+            logger.info("1 分 K %s 在上一輪當掉時還沒結束，結束時的筆差不知道",
+                        f"{closed.bar.start:%H:%M}")
+            closed = replace(closed, bichai=None)
         bars.append(closed)
         _log_bar(closed, trading.rsi(bars))
         if local_now is None:
@@ -193,6 +229,10 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         elif not _live(now):
             logger.info("1 分 K %s 結束於 %s，本機已經 %s（回補的舊成交或報價延遲），不判斷",
                         f"{closed.bar.start:%H:%M}", f"{now:%H:%M:%S}", f"{local_now:%H:%M:%S}")
+        elif closed.bar.start == gappy:
+            # 報價中斷期間不進場（規格第 53 條）：這一根的收盤價、高低點來自中斷之前，
+            # 拿它判斷就是在中斷期間的資料上進場。
+            logger.info("1 分 K %s 中間報價斷過、缺了成交，不判斷", f"{closed.bar.start:%H:%M}")
         else:
             trading.on_bar(bars, now)
 
@@ -204,6 +244,8 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 if isinstance(event, TxTrade):
                     other_day = event.time.date()
                 continue
+            if isinstance(event, TxTrade) and restored.covers(event):
+                continue    # 重啟前那一輪就收過、記過、組進 K 棒了
             if isinstance(event, Clock):
                 local_now = event.time
             if event.time >= end_at:
@@ -215,7 +257,13 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                     logger.warning("到 %s 都沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
                                    f"{SESSION_END:%H:%M}", other_day)
                     ending = Ending.QUOTES_FROM_ANOTHER_DAY
+                pulse.finish(event.time)
                 break
+            if isinstance(event, Clock):
+                pulse.beat(event.time)
+                outage = watch.check(event.time)
+                if outage is not None:
+                    _send(config, notify, outage)
             if isinstance(event, TxTrade):
                 if not confirmed and indicators.in_day_session(event.time):
                     confirmed = True
@@ -226,14 +274,25 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                     # ProductTrade；等後者才更新現價的話，下面的判斷與盯價都會成交在**前一筆**，
                     # 同一個商品就出現「觸發在 45180、成交在 45175」這種不可能的結果。
                     trading.product_price = event.price
+                if indicators.in_day_session(event.time):
+                    if (last_trade is not None and event.time - last_trade > _TRADE_GAP
+                            and state.forming is not None):
+                        gappy = state.forming.start
+                        logger.warning("大台成交從 %s 到 %s 之間斷了，%s 那根缺了成交",
+                                       f"{last_trade:%H:%M:%S}", f"{event.time:%H:%M:%S}",
+                                       f"{gappy:%H:%M}")
+                    last_trade = event.time if last_trade is None else max(last_trade,
+                                                                           event.time)
                 state, closed = indicators.add_trade(state, event)
                 _close(closed, event.time)
                 # 先判斷、再盯價：讓 K 棒結束的這一筆，已經是下一根的第一筆成交，
                 # 剛設下的突破進場也要看它（回測裡它就是下一根的開盤價）。
                 if _live(event.time):
+                    watch.trade_at = event.time
                     trading.on_tx_trade(event)
             elif isinstance(event, TxTradeCounts):
                 raw.counts(event)
+                watch.counts_at = event.time
                 state = indicators.add_counts(state, event)
             elif isinstance(event, ProductTrade):
                 trading.product_price = event.price
@@ -242,6 +301,66 @@ def run(broker: Broker, config: settings.Config, *, today: date,
 
     logger.info("盤中程式結束：%s，今天共 %d 根 1 分 K", ending.value, len(bars))
     return SessionOutcome(ending, tuple(bars))
+
+
+class _Restored:
+    """盤中重啟（規格第 48 條）：今天稍早那一輪收到的行情，從原始行情檔讀回來。
+
+    兩件事靠它：
+
+      * **補回今天已經過去的 1 分 K，連同每根結束時的筆差。** 群益重啟後回補的只有成交，筆差
+        沒有歷史回補，只能從 PTS 自己的原始行情記錄讀回：照檔案順序重播一次 `indicators`，得到的
+        就是當時的 K 棒與筆差。這些 K 棒當時判斷過了，這裡不再判斷。
+      * **認出群益回補的成交裡，哪些重啟前就處理過**（`covers`）。不認的話，它們會再記進原始
+        行情檔一次；更糟的是，當掉前一刻剛結束的那一根，會被回補的同一筆成交再結束一次——
+        重啟得快（30 秒內）時那筆還算即時，同一分鐘就判斷兩次、送兩次單。
+
+    當機期間的成交，原始行情檔裡沒有：照群益回補的組 K 棒。它們結束時不是即時的，不判斷。
+    筆差不會被拿去算當機前後的差距：程式不在的那幾分鐘沒有收到累計筆數，筆差是不知道
+    （`indicators._bichai_at_close`）；當掉時還沒結束的那一根（`unfinished`）手上倒是有筆數，
+    卻是當掉之前的，也當成不知道（`run()` 的 `_close`）。等待中的突破進場只在記憶體裡，
+    不恢復（規格第 48 條）。
+    """
+
+    def __init__(self, events: list[TxTrade | TxTradeCounts]):
+        state = indicators.BarState()
+        bars: list[indicators.ClosedBar] = []
+        for event in events:
+            if isinstance(event, TxTrade):
+                state, closed = indicators.add_trade(state, event)
+                if closed is not None:
+                    bars.append(closed)
+            else:
+                state = indicators.add_counts(state, event)
+        self.state = state
+        self.bars = tuple(bars)
+        # 當掉時還沒結束的那一根（起始分鐘）。它結束那一刻的筆數沒有記到，筆差是不知道。
+        self.unfinished = state.forming.start if state.forming is not None else None
+        trades = [e.time for e in events if isinstance(e, TxTrade)]
+        in_session = [t for t in trades if indicators.in_day_session(t)]
+        # 原始行情檔要收到今天日盤的成交才會建（`RawMarketWriter.confirm`）
+        self.confirmed = bool(in_session)
+        self.last_trade = max(in_session) if in_session else None
+        self._last = max(trades) if trades else None
+        self._left = trades.count(self._last)        # 同一秒可能有好幾筆
+        if events:
+            logger.info("今天稍早跑過：從原始行情檔讀回 %d 個事件、%d 根 1 分 K，最後一筆成交 %s",
+                        len(events), len(bars), self._last)
+
+    def covers(self, trade: TxTrade) -> bool:
+        """這一筆今天的成交，重啟前那一輪是不是就收過了。
+
+        群益照成交的順序回補，所以比檔裡最後一筆還早的都收過；和最後一筆同一秒的，檔裡有幾筆
+        就略過幾筆（成交時間只到秒）。第一輪自己遇過報價中斷、中間缺了一段的話，回補的會把
+        那一段補齊——這裡照樣略過：那幾分鐘當時就沒有 K 棒，現在也不該冒出來。
+        """
+        if self._last is None or trade.time > self._last:
+            return False
+        if trade.time == self._last:
+            if not self._left:
+                return False
+            self._left -= 1
+        return True
 
 
 def _log_bar(closed: indicators.ClosedBar, rsi: float | None) -> None:
@@ -693,6 +812,97 @@ class _Trading:
 
     def _send(self, text: str) -> None:
         _send(self._config, self._notify, text)
+
+
+# ── 報價中斷 ─────────────────────────────────────────────────────────────
+
+
+class _QuoteWatch:
+    """報價中斷偵測：日盤期間連續 3 分鐘沒有即時的大台報價，就發一則告警（規格第 53 條）。
+
+    看兩路：大台的即時成交（K 棒與盯價用）與累計成交筆數（筆差用）。少了任何一路，判斷就缺
+    一條腿，所以從**比較早斷的那一路**算起。群益 broker 斷線時時鐘事件照樣每秒來（它是訊息
+    幫浦自己產生的），所以中斷看得出來；整個程式卡住的話連時鐘都沒有，那是心跳記錄的事。
+
+    中斷期間本來就不會進場：K 棒要等成交才結束，突破進場也只看即時的成交。這裡只負責講。
+
+    從什麼時候開始算：日盤 08:45 開盤，或這一輪盤中程式收到第一個時鐘事件（晚啟動、重啟），
+    兩者取晚的——重啟之前的空白是心跳記錄要講的事，不是這裡。
+
+    ⚠️ 開盤後都沒有今天的成交，可能是臨時休市（颱風假），也可能是開盤時報價斷了：13:20 之前
+       兩者看起來一模一樣（`run()` 的說明）。照樣告警，訊息裡講清楚臨時休市的話不必處理：
+       不講的話，真的斷線時一整天沒人知道。
+
+    一次中斷只發一則。兩路都恢復之後再斷，是新的一次。
+    """
+
+    def __init__(self, today: date):
+        self._open = datetime.combine(today, indicators.DAY_SESSION_OPEN)
+        self._end = datetime.combine(today, SESSION_END)
+        self._started: datetime | None = None
+        self.trade_at: datetime | None = None       # 最後一筆即時收到的大台成交
+        self.counts_at: datetime | None = None      # 最後一次累計成交筆數
+        self._alerted_at: datetime | None = None
+
+    def check(self, now: datetime) -> str | None:
+        """本機時鐘走到 `now`：該告警就回傳訊息。"""
+        if self._started is None:
+            self._started = now
+        if self._alerted_at is not None:
+            if (self.trade_at is not None and self.counts_at is not None
+                    and min(self.trade_at, self.counts_at) > self._alerted_at):
+                self._alerted_at = None             # 兩路都恢復了，這一次中斷結束
+            else:
+                return None
+        if not self._open <= now < self._end:
+            return None
+        since = max(self._open, self._started)
+        if self.trade_at is not None and self.counts_at is not None:
+            since = max(since, min(self.trade_at, self.counts_at))
+        if now - since < _OUTAGE_ALERT:
+            return None
+        self._alerted_at = now
+        logger.error("大台報價中斷超過 %d 分鐘：最後的即時成交 %s，最後的累計成交筆數 %s",
+                     _OUTAGE_ALERT.seconds // 60, self.trade_at, self.counts_at)
+        return messages.quote_outage(at=now, trade_at=self.trade_at, counts_at=self.counts_at,
+                                     outage=_OUTAGE_ALERT)
+
+
+# ── 心跳記錄 ─────────────────────────────────────────────────────────────
+
+
+class _Pulse:
+    """心跳記錄（規格第 54 條）：每分鐘寫一次「今天、現在還活著」，自己走到結局時寫「收工了」。
+
+    「現在」是本機時鐘事件的時間，和盤中程式其他地方一樣不讀系統時鐘（見模組說明「時間」）。
+    第一次寫在第一個時鐘事件：登入、訂閱失敗而中止的那一輪不寫，出場程式看到的就還是
+    前一輪（或沒有），講的是「盤中程式沒有跑」或「幾點之後沒有再跑」——都是事實。
+
+    寫不進去只記 log、不往外拋：代價是 13:25 多一則「沒有跑」的告警；為它讓盤中程式中止的話，
+    連進場都沒了。
+    """
+
+    def __init__(self, today: date):
+        self._today = today
+        self._minute: datetime | None = None
+
+    def beat(self, now: datetime) -> None:
+        minute = now.replace(second=0, microsecond=0)
+        if minute != self._minute:
+            self._minute = minute
+            self._write(now, finished=False)
+
+    def finish(self, now: datetime | None) -> None:
+        """盤中程式自己下了結論（13:20 收工、臨時休市、部位檔讀不懂）。`now` 是 None 代表
+        那時還沒有任何事件（還沒登入就結束了）。"""
+        self._write(now, finished=True)
+
+    def _write(self, now: datetime | None, *, finished: bool) -> None:
+        try:
+            heartbeat.write(heartbeat.Heartbeat(self._today, now, finished))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("心跳記錄寫不進 %s（%s: %s）：出場程式會以為盤中程式沒有跑",
+                         heartbeat.path(), type(exc).__name__, exc)
 
 
 # ── 停止進場記錄 ─────────────────────────────────────────────────────────

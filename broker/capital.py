@@ -73,6 +73,12 @@ _SKCENTER_CLSID = "{AC30BAB5-194A-4515-A8D3-6260749F8577}"
 # 報價主機的連線狀態代碼：收到它才代表商品資料下載完成
 _STOCKS_READY = 3003
 
+# 報價連線斷了的代碼（文件 4-4-a、6 代碼表）。斷了之後成交與筆數都不會再來，時鐘照樣每秒
+# 一個：盤中程式靠它發現報價中斷並告警（規格第 53 條）。這裡只記 log——斷線之後群益會不會
+# 自己重連、要不要由程式重新訂閱，文件沒寫，待實機觀察（ticket 09 Comments）。
+_QUOTE_DROPPED = {3002: "斷線", 3021: "網路異常", 3022: "Solace 底層錯誤",
+                  3033: "Solace Session down"}
+
 # 商品清單的市場別：0 上市、1 上櫃、2 期貨、3 選擇權
 _MARKET_FUTURES = 2
 
@@ -226,6 +232,10 @@ class _QuoteEvents:
     def OnConnection(self, nKind, nCode):
         if nKind == _STOCKS_READY:
             self.stocks_ready = True
+        elif nKind in _QUOTE_DROPPED:
+            # 不在這裡呼叫群益的函式查訊息（文件 4-4-a 備註：事件裡不要做連線相關的動作）
+            logger.warning("報價連線中斷：代碼 %s（%s），nCode %s", nKind, _QUOTE_DROPPED[nKind],
+                           nCode)
 
     def OnNotifyCommodityListWithTypeNo(self, sMarketNo, bstrCommodityData):
         # 清單很長（實測 46 萬字元），會分多次送來，全部接完再一起解析

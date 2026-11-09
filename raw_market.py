@@ -18,18 +18,21 @@
     （群益的筆數事件不帶時間）。
   * **沒有任何帳號資訊**，所以不在 30 天清除範圍內，長期保留（`paths.market_data_dir`）。
 
-同一天重新啟動時接在原檔後面寫（ticket 09）。
+同一天重新啟動時接在原檔後面寫，重啟前的部分由 `read` 讀回（ticket 09）。
 """
 
 from __future__ import annotations
 
 import csv
+import logging
 import os
-from datetime import date
+from datetime import date, datetime
 from typing import IO
 
 import paths
 from broker import TxTrade, TxTradeCounts
+
+logger = logging.getLogger(__name__)
 
 HEADER = ("time", "price", "buy_count", "sell_count")
 
@@ -37,6 +40,40 @@ HEADER = ("time", "price", "buy_count", "sell_count")
 def path_for(day: date) -> str:
     """那個交易日的原始行情檔。"""
     return os.path.join(paths.market_data_dir(), f"TX-{day:%Y%m%d}.csv")
+
+
+def read(day: date) -> list[TxTrade | TxTradeCounts]:
+    """那個交易日已經記下的行情事件，依檔案裡的順序（也就是當時收到的順序）。沒有檔是空的。
+
+    讀不懂的行略過、記 log。最可能的是當掉那一刻只寫了一半的最後一行。原始行情是資料，
+    不是部位：少一筆的代價是重啟後那一根的高低點或筆差差一點，不值得讓盤中程式起不來。
+    """
+    path = path_for(day)
+    if not os.path.exists(path):
+        return []
+    events: list[TxTrade | TxTradeCounts] = []
+    unreadable = 0
+    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
+        for row in csv.reader(fh):
+            if tuple(row) == HEADER:
+                continue
+            try:
+                events.append(_event(row))
+            except (ValueError, IndexError):
+                unreadable += 1
+    if unreadable:
+        logger.warning("%s 有 %d 行讀不懂（當掉時寫了一半？），略過", path, unreadable)
+    return events
+
+
+def _event(row: list[str]) -> TxTrade | TxTradeCounts:
+    time_text, price, buy, sell = row          # 欄數不對是 ValueError
+    t = datetime.fromisoformat(time_text)
+    if price and not buy and not sell:
+        return TxTrade(t, float(price))
+    if buy and sell and not price:
+        return TxTradeCounts(t, buy_count=int(buy), sell_count=int(sell))
+    raise ValueError(f"既不是成交也不是筆數：{row!r}")
 
 
 class RawMarketWriter:
@@ -68,10 +105,15 @@ class RawMarketWriter:
         path = path_for(self._day)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+        cut_off = not is_new and not _ends_with_newline(path)
         self._fh = open(path, "a", encoding="utf-8", newline="", buffering=1)
         self._csv = csv.writer(self._fh, lineterminator="\n")
         if is_new:
             self._csv.writerow(HEADER)
+        if cut_off:
+            # 上一輪當掉時最後一行只寫了一半：另起一行，否則重啟後的第一筆會黏在它後面，
+            # 兩筆一起讀不懂
+            self._fh.write("\n")
         self._csv.writerows(self._pending)
         self._pending = None
 
@@ -87,6 +129,12 @@ class RawMarketWriter:
             self._pending.append(row)
         elif self._csv is not None:
             self._csv.writerow(row)
+
+
+def _ends_with_newline(path: str) -> bool:
+    with open(path, "rb") as fh:
+        fh.seek(-1, os.SEEK_END)
+        return fh.read(1) == b"\n"
 
 
 def _time(event: TxTrade | TxTradeCounts) -> str:

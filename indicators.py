@@ -10,7 +10,7 @@ RSI 也在這裡：期數由策略判斷給（策略常數只出現在那一處�
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Sequence
 
 from broker import MinuteBar, TxTrade, TxTradeCounts
@@ -19,13 +19,20 @@ from broker import MinuteBar, TxTrade, TxTradeCounts
 DAY_SESSION_OPEN = time(8, 45)
 DAY_SESSION_CLOSE = time(13, 45)
 
+_MINUTE = timedelta(minutes=1)
+
+# K 棒結束時拿來當筆差的累計筆數，最晚可以是那一分鐘結束後多久收到的。讓 K 棒結束的是下一分鐘
+# 的第一筆成交，累計筆數可能比它先到一點；晚得比這還多，就是那根很晚才結束（重啟後回補的
+# 舊成交），手上的筆數已經是好幾分鐘之後的累計了。
+_COUNTS_AFTER_BAR = timedelta(seconds=30)
+
 
 @dataclass(frozen=True)
 class ClosedBar:
     """一根結束了的 1 分 K，以及**它結束那一刻**的筆差（成交賣出筆數 − 成交買進筆數）。
 
-    `bichai` 是 None 代表那時還沒收到任何累計筆數——是「不知道」，不是 0。
-    筆差 0 是「買賣筆數相等」，一個會被拿去判斷的值。
+    `bichai` 是 None 代表不知道——是「不知道」，不是 0。筆差 0 是「買賣筆數相等」，
+    一個會被拿去判斷的值。不知道的情況見 `_bichai_at_close`。
     """
 
     bar: MinuteBar
@@ -74,7 +81,7 @@ def add_trade(state: BarState, trade: TxTrade) -> tuple[BarState, ClosedBar | No
         return replace(state, forming=replace(
             forming, high=max(forming.high, price), low=min(forming.low, price),
             close=price)), None
-    closed = ClosedBar(forming, _bichai(state.counts)) if forming is not None else None
+    closed = ClosedBar(forming, _bichai_at_close(state)) if forming is not None else None
     return replace(state, forming=MinuteBar(minute, price, price, price, price)), closed
 
 
@@ -82,12 +89,33 @@ def close_forming(state: BarState) -> tuple[BarState, ClosedBar | None]:
     """不等下一筆成交，直接結束正在組的那一根（13:20 收工時用）。"""
     if state.forming is None:
         return state, None
-    return replace(state, forming=None), ClosedBar(state.forming, _bichai(state.counts))
+    return replace(state, forming=None), ClosedBar(state.forming, _bichai_at_close(state))
 
 
-def _bichai(counts: TxTradeCounts | None) -> int | None:
-    """筆差 = 成交賣出筆數 − 成交買進筆數（GLOSSARY）。正值解讀為大戶在買。"""
-    return None if counts is None else counts.sell_count - counts.buy_count
+def _bichai_at_close(state: BarState) -> int | None:
+    """正在組的那一根結束這一刻的筆差 = 最新的成交賣出筆數 − 成交買進筆數（GLOSSARY）。
+    正值解讀為大戶在買。
+
+    **手上最新的累計筆數不是在這一根的時間裡收到的，筆差就是不知道**（None）：
+    要在這一根開始之後、結束後 `_COUNTS_AFTER_BAR` 之內收到。
+
+      * 太早：當機、報價中斷時，手上的是中斷**之前**的值。中斷之後那一根拿它和恢復後的值
+        相減，幾分鐘的累積就變成一根的「筆差跳增」，把中斷前後的差距誤判成「突然大量買進」
+        （ticket 09）。
+      * 太晚：晚啟動、重啟後群益回補的舊成交，K 棒結束得很晚，手上的是**之後**好幾分鐘的值。
+
+    這一條只看事件自己的時間，不看程式在不在、成交是不是即時的：重啟時把原始行情檔照順序
+    重播一次，得到的就是當時的筆差（群益的筆差沒有歷史回補，只能從那裡讀回）。
+    累計筆數的時間是本機收到的時刻，K 棒的分界是交易所時間，兩者差個一兩秒無妨。
+
+    ⚠️ 前提是群益一分鐘裡至少推一次累計筆數。推送頻率還沒實機確認（ticket 03）；要是比一分鐘
+       還稀，很多 K 棒的筆差都會是不知道，條件就很少成立——log 裡每根 K 棒的「筆差 未知」
+       看得出來。
+    """
+    counts, bar = state.counts, state.forming
+    if counts is None or not bar.start <= counts.time < bar.start + _MINUTE + _COUNTS_AFTER_BAR:
+        return None
+    return counts.sell_count - counts.buy_count
 
 
 # ── RSI ─────────────────────────────────────────────────────────────────

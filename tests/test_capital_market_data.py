@@ -236,3 +236,23 @@ def test_a_tick_whose_time_cannot_be_read_is_skipped_and_the_stream_goes_on(capl
     trades = [(e.time, e.price) for e in _market(_broker(skcom).events(TMF_CODE))]
     assert trades == [(datetime(2026, 11, 9, 8, 45, 1), 45010.0)]
     assert "看不懂" in caplog.text
+
+
+# --- 報價連線中斷（ticket 09）---
+
+
+@pytest.mark.parametrize("code, meaning", [(3002, "斷線"), (3021, "網路異常"),
+                                           (3022, "Solace 底層錯誤"),
+                                           (3033, "Solace Session down")])
+def test_a_quote_connection_that_drops_is_logged_and_the_clock_keeps_coming(caplog, code, meaning):
+    """群益用 `OnConnection` 的代碼告知報價連線斷了（文件 4-4-a、6 代碼表）。之後成交與筆數都
+    不會再來，但時鐘照樣每秒一個——盤中程式靠它發現報價中斷、3 分鐘後告警（test_quote_outage）。
+    log 寫下群益講的代碼與意思，查原因時才知道是網路、還是群益那邊。"""
+    skcom = FakeSkcom(market=[_tick(TX_INDEX, 20261109, 84500, 4500000),
+                              ("OnConnection", (code, 0))])
+    now = _Ticking(datetime(2026, 11, 9, 8, 45, 0), timedelta(seconds=1))
+    stream = _broker(skcom, now=now).events(TMF_CODE)
+    assert [type(e).__name__ for e in islice(stream, 6)] == [
+        "Clock", "TxTrade", "Clock", "Clock", "Clock", "Clock"]
+    assert any(r.levelname == "WARNING" and f"代碼 {code}" in r.getMessage()
+               and meaning in r.getMessage() for r in caplog.records)
