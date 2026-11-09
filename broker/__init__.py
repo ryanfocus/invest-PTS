@@ -19,6 +19,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date
+
 # 報價代碼（近月連續、日盤）。PTS 的指標一律看大台；交易商品三選一。
 #
 # ⚠️ **必須帶 `AM` 後綴**。群益對同一商品提供兩套代碼，不帶後綴的是全盤（含夜盤），
@@ -36,3 +39,154 @@ PRODUCT_NAMES = {"TX": TX_CODE, "MTX": MTX_CODE, "TMF": TMF_CODE}
 # PTS 只送市價 IOC、只在日盤交易，所以每一筆委託都受它限制；超過會被退單，
 # 而退單訊息看不出是這個原因。要送更多口就拆成多筆（出場程式，規格第 33 條）。
 MARKET_ORDER_LOT_CAP = 10
+
+
+# ── 例外 ──────────────────────────────────────────────────────────────
+
+
+class BrokerError(Exception):
+    """broker 層的錯誤基底。"""
+
+
+class LoginFailed(BrokerError):
+    """登入失敗。重試無用，需要人介入（密碼、憑證、聲明書、元件沒註冊等）。"""
+
+
+class ProductListUnavailable(BrokerError):
+    """商品清單查不到、或缺少要用的商品。重試可能有幫助。"""
+
+
+# 委託失敗只分兩類，界線是「單有沒有送出去」（規格第 41、50、51 條）。
+# 這是整個系統最貴的一條分界線：
+#
+#   OrderFailed  → 確定沒有部位 → 當天停止進場、告警「委託沒有送出去」
+#   FillUnknown  → **可能已經成交** → 部位記為「不確定」、出場程式不自動平倉、
+#                  告警「委託送出去了，但…」
+#
+# 分不清楚的時候一律是 FillUnknown。把它說成 OrderFailed 的話，上層不會寫部位檔，
+# 出場程式以為今天沒進場——部位直接過夜，而那是這個策略唯一不能接受的結果。
+
+
+class OrderFailed(BrokerError):
+    """委託沒有送出去（被拒、合約已過期、元件初始化失敗、憑證問題…）。**確定沒有部位。**
+
+    訊息會進 Discord（規格第 51 條），所以寫給人看：原因要講得出來，
+    而且**不可以帶未遮罩的帳號**。
+    """
+
+
+class FillUnknown(BrokerError):
+    """**委託已經送出，但不知道成交幾口。** 回報沒回來、認不出是哪一筆、送出後元件出錯。
+
+    `order_seq` 讓使用者能在券商 APP 直接查到那一筆，出場程式也拿它做兩段查詢
+    （規格第 50 條）；`known_filled` 是目前已知**至少**成交了幾口。
+    序號可能是空字串：送出成功卻沒拿到序號時，連查都沒辦法查。
+    """
+
+    def __init__(self, message: str, *, order_seq: str = "", known_filled: int = 0):
+        super().__init__(message)
+        self.order_seq = order_seq
+        self.known_filled = known_filled
+
+
+# ── 合約 ──────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ContractInfo:
+    """近月合約，來自**商品清單查詢**。
+
+    ⚠️ 刻意不由日期推算。「每月第三個週三」在最後交易日遇假日順延時會失準，
+    而結算週的停用範圍（規格第 23、24 條）與「過期合約絕不送單」都依賴它。
+    """
+
+    code: str                  # 報價代碼（近月連續，如 TX00AM）
+    last_trading_day: date     # 結算日
+    # 下單代碼（指名月份，如 TX08）。**與報價代碼是兩回事**：三個商品的格式互不相同
+    # （TX08／MTX08／TM2608），只能從商品清單讀出來，不可以自己組字串。
+    order_code: str
+
+    @property
+    def contract_month(self) -> str:
+        """契約年月（`yyyymm`）。最後交易日必定落在契約月份內。"""
+        return self.last_trading_day.strftime("%Y%m")
+
+    def has_expired(self, day: date) -> bool:
+        """最後交易日是不是已經過了。**結算日當天不算過期**——那天 13:30 才停止交易。
+
+        存在的理由是下單代碼的形式（`MTX08`，商品＋月份兩碼）：群益在該月已過期時
+        會**自動改送隔年同月且不報錯**（官方文件 SendFutureOrderCLR 備註），
+        於是 9 月送 `MTX08` 成交的會是隔年 8 月的合約——完全不同的東西，而且悄無聲息。
+        """
+        return self.last_trading_day < day
+
+
+# ── 委託 ──────────────────────────────────────────────────────────────
+
+# 委託買賣別。刻意不用群益的 0/1：那兩個數字在程式碼裡看不出誰是誰，
+# 而寫反的後果是開出完全相反的部位。轉成群益格式的工作留在 broker.capital_wire。
+BUY = "BUY"
+SELL = "SELL"
+
+# 標當沖的商品（規格第 28 條）。大台、小台標當沖，保證金減半才放得下 20 口，
+# 並由券商 13:30 強平；**微台不能標**，改由出場程式 13:25 平倉（ADR-0002）。
+DAY_TRADE_CODES = frozenset({TX_CODE, MTX_CODE})
+
+
+@dataclass(frozen=True)
+class OrderRequest:
+    """一筆市價 IOC 委託。進場、出場都用它；倉別一律「自動」（見 capital_wire）。
+
+    `trading_day` 是送單當天的交易日，用來擋過期合約。由呼叫端傳入而不是 broker
+    自己讀時鐘：盤中程式的「現在」一律取自事件（規格「時間」一節）。
+    """
+
+    contract: ContractInfo
+    side: str               # BUY / SELL
+    lots: int
+    trading_day: date
+
+    def __post_init__(self) -> None:
+        """這幾種錯誤是呼叫端寫錯了，不是市場狀況，所以在建立委託時就擋下。"""
+        if self.side not in (BUY, SELL):
+            raise ValueError(f"買賣別必須是 BUY 或 SELL，目前是 {self.side!r}")
+        if not 1 <= self.lots <= MARKET_ORDER_LOT_CAP:
+            raise ValueError(
+                f"每筆委託必須是 1～{MARKET_ORDER_LOT_CAP} 口，目前是 {self.lots}。"
+                "期交所限制每筆市價委託最多 10 口，要送更多就拆成多筆。"
+            )
+        if not self.contract.order_code:
+            raise ValueError(f"{self.contract.code} 沒有下單代碼，無法送出委託")
+
+    @property
+    def day_trade(self) -> bool:
+        """這筆要不要標當沖。由商品決定，呼叫端不必（也不能）自己選。"""
+        return self.contract.code in DAY_TRADE_CODES
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    """委託的結局：**實際**成交的口數與價格（規格第 29 條）。
+
+    市價 IOC 可能只成交一部分、甚至 0 口（當下沒有對手價）——那不是錯誤，
+    是正常結局，記下實際口數就好。
+    """
+
+    order_seq: str              # 群益的 13 碼委託序號
+    filled_lots: int
+    avg_price: float | None     # 成交均價（依口數加權）；0 口時是 None
+
+
+def ensure_sendable(request: OrderRequest) -> None:
+    """送單前的最後一道檢查。兩個 broker 都在送出之前呼叫它，規則因此只有一份。
+
+    過期合約**絕不送單**：理由見 `ContractInfo.has_expired`。這是「確定沒送出去」，
+    所以是 OrderFailed——上層照「委託沒有送出去」處理，當天停止進場並告警。
+    """
+    contract = request.contract
+    if contract.has_expired(request.trading_day):
+        raise OrderFailed(
+            f"{contract.order_code} 的最後交易日 {contract.last_trading_day:%Y/%m/%d} 已過，"
+            f"今天是 {request.trading_day:%Y/%m/%d}，不送單。"
+            "群益會把過期月份自動改送隔年同月，送出去就是另一個合約。"
+        )

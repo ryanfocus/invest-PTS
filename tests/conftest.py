@@ -23,3 +23,21 @@ def logs_never_touch_the_real_directory(tmp_path_factory, monkeypatch):
     logs = tmp_path_factory.mktemp("logs")
     monkeypatch.setattr(paths, "logs_dir", lambda: str(logs))
     return logs
+
+
+class _RealComForbidden:
+    def __init__(self, *args, **kwargs):
+        raise AssertionError(
+            "測試試圖建立真的群益 COM 元件。測試絕不連真實券商——"
+            "請用 CapitalBroker(com=FakeSkcom(...)) 或 FakeBroker。"
+        )
+
+
+@pytest.fixture(autouse=True)
+def never_touch_the_real_broker(monkeypatch):
+    """**測試絕不連真實券商。** 這台機器裝著群益元件與憑證，忘了換掉 COM 的測試
+    會真的登入——而 `CapitalBroker` 是唯一會送出真單的程式。在這裡把那條路堵死，
+    忘了的那一天會是一個看得懂的失敗，而不是一次真的登入。"""
+    import broker.capital
+
+    monkeypatch.setattr(broker.capital, "_RealCom", _RealComForbidden)
