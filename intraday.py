@@ -177,6 +177,11 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                     confirmed = True
                     raw.confirm()
                 raw.trade(event)
+                if config.product == TX_CODE:
+                    # 交易大台時，這一筆就是交易商品的成交。群益對同一筆先送 TxTrade、再送
+                    # ProductTrade；等後者才更新現價的話，下面的判斷與盯價都會成交在**前一筆**，
+                    # 同一個商品就出現「觸發在 45180、成交在 45175」這種不可能的結果。
+                    trading.product_price = event.price
                 state, closed = indicators.add_trade(state, event)
                 _close(closed, event.time)
                 # 先判斷、再盯價：讓 K 棒結束的這一筆，已經是下一根的第一筆成交，

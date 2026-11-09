@@ -359,10 +359,11 @@ def _with_extremes(s: Situation, index: int, *, high: float | None = None,
 
 
 def test_the_breakout_looks_at_exactly_the_last_5_bars():
-    """第 6 根之前的高點再高也不算；最近 5 根裡的最高點不一定是最後一根。"""
-    s = _with_extremes(_with_extremes(_chase_long("09:40"), 0, high=45999), 2, high=45170)
+    """09:40–09:45 六根。倒數第 6 根（09:40）的高點再高也不算；最高點落在倒數第 5 根
+    （09:41）也要算到——只看 4 根的話會拿到最後一根的 45160。"""
+    s = _with_extremes(_with_extremes(_chase_long("09:40"), 0, high=45999), 1, high=45170)
     assert strategy.decide(s) == Breakout(LONG, Condition.CHASE_LONG, 45170, 1)
-    s = _with_extremes(_with_extremes(_chase_short("09:40"), 0, low=44001), 2, low=44830)
+    s = _with_extremes(_with_extremes(_chase_short("09:40"), 0, low=44001), 1, low=44830)
     assert strategy.decide(s) == Breakout(SHORT, Condition.CHASE_SHORT, 44830, 1)
 
 

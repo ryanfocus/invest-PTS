@@ -12,10 +12,10 @@ from datetime import date
 
 import pytest
 
-from broker import TMF_CODE, ProductListUnavailable
+from broker import TMF_CODE, TX_CODE, ProductListUnavailable
 from broker.fake import FakeBroker
 from day_script import (DAY, PREVIOUS_DAY, SETTLEMENT_DAY, at, calm_history, clock, contracts,
-                        minute, product_trade, rally, trade)
+                        minute, product_trade, rally, trade, trading_tx)
 from recording import RecordingNotifier
 import intraday
 import settings
@@ -129,6 +129,36 @@ def test_condition_4_waits_for_the_price_to_touch_the_low_of_the_last_5_bars():
     assert broker.orders == []
 
 
+def test_trading_tx_fills_at_the_very_trade_that_triggered_the_entry():
+    """交易大台時，大台的成交就是交易商品的成交：群益對同一筆先送大台成交、再送交易商品成交。
+    進場要成交在**觸發的那一筆**，不是它前一筆——否則同一個商品會出現「觸發在 45180、
+    成交在 45175」這種不可能的結果，模擬週核對的均價也一路偏向有利的一方。
+
+    08:50:00 那筆 45155 讓 08:49 那根結束、條件 1 成立：成交在 45155（前一筆是 45150）。
+    08:50 起筆差 500、什麼都不成立；10:00 那根筆差 500 → 1600、最高 45180，10:01 設突破進場，
+    觸發價 45180。10:02:30 那筆 45180 碰到觸發價：成交在 45180（前一筆是 45175）。
+    均價 (45155 + 45180) ÷ 2 = 45167.5。"""
+    events = trading_tx(rally("08:45", 5)
+                        + minute("08:50", 45155, 45150, bichai=500)
+                        + rally("08:51", 69, open_=45150, step=0, bichai=500)
+                        + minute("10:00", 45150, 45180, bichai=1600)
+                        + minute("10:01", 45170, 45175, bichai=1600)
+                        + minute("10:02", 45175, 45180, bichai=1600)
+                        + [trade(at("10:03:00"), 45185)])
+    broker, sent = _run(events, config=_config(product=TX_CODE))
+    assert sent == [
+        "【模擬】PTS 做多：買進大台 1 口 @ 45155\n"
+        "觸發：條件 1（早盤做多）\n"
+        "累計：多單 1 口，均價 45155\n"
+        "2026/11/09 08:50:00",
+        "【模擬】PTS 做多：買進大台 1 口 @ 45180\n"
+        "觸發：條件 3（追多加碼），突破進場（觸發價 45180）\n"
+        "累計：多單 2 口，均價 45167.5\n"
+        "2026/11/09 10:02:30",
+    ]
+    assert broker.orders == []
+
+
 def test_a_trade_delivered_late_does_not_break_out():
     """10:01 設下觸發價 45180。10:02:20 那筆 45185 的成交晚了 40 秒才送到（本機已經 10:03:00）：
     價格那時就碰到了，但現在的價格已經不是那個價，拿它進場和回測不是同一件事
@@ -217,6 +247,29 @@ def test_a_strong_day_adds_all_the_way_to_the_cap():
         "累計：多單 60 口，均價 45445",
         "2026/11/09 09:49:00",
     ]
+    assert broker.orders == []
+
+
+def test_a_breakout_fills_only_what_was_left_under_the_cap_when_it_was_set():
+    """每次進 3 口、加碼上限 20。08:50–08:55 條件 1 連續成立六次，進到 18 口（成交在
+    08:49–08:54 那幾根的收盤價 45150、45160、…、45200）；之後筆差 500，什麼都不成立。
+    10:00 那根筆差 500 → 1600、最高 45230，10:01 設突破進場：只剩 2 口的空間，所以是 2 口
+    （規格第 25 條）。10:02:30 碰到 45230，成交在交易商品最新的 45225——進 2 口、累計剛好
+    20 口，不是照每次 3 口進到 21 口。
+    均價 (3 × (45150 + 45160 + … + 45200) + 2 × 45225) ÷ 20 = (813150 + 90450) ÷ 20 = 45180。"""
+    events = (rally("08:45", 10)
+              + rally("08:55", 65, open_=45200, step=0, bichai=500)
+              + minute("10:00", 45200, 45230, bichai=1600)
+              + minute("10:01", 45220, 45225, bichai=1600)
+              + minute("10:02", 45225, 45230, bichai=1600)
+              + [trade(at("10:03:00"), 45235)])
+    broker, sent = _run(events, config=_config(lots_per_entry=3, max_position=20))
+    assert _times(sent) == ["08:50:00", "08:51:00", "08:52:00", "08:53:00", "08:54:00",
+                            "08:55:00", "10:02:30"]
+    assert sent[-1] == ("【模擬】PTS 做多：買進微台 2 口 @ 45225\n"
+                        "觸發：條件 3（追多加碼），突破進場（觸發價 45230）\n"
+                        "累計：多單 20 口，均價 45180\n"
+                        "2026/11/09 10:02:30")
     assert broker.orders == []
 
 

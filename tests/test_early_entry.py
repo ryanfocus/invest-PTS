@@ -12,7 +12,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from broker import (MTX_CODE, TMF_CODE, TX_CODE, Clock, MinuteBar, ProductTrade,
+from broker import (MTX_CODE, TMF_CODE, Clock, MinuteBar, ProductTrade,
                     QuoteUnavailable)
 from broker.fake import FakeBroker
 from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, counts,
@@ -178,11 +178,13 @@ def test_simulated_entries_leave_no_file_in_the_program_directory(tmp_path, monk
 # --- 指標一律看大台（規格第 8 條）---
 
 
-@pytest.mark.parametrize("product, name", [(TX_CODE, "大台"), (MTX_CODE, "小台"),
-                                           (TMF_CODE, "微台")])
+@pytest.mark.parametrize("product, name", [(MTX_CODE, "小台"), (TMF_CODE, "微台")])
 def test_the_trading_product_does_not_change_when_it_enters(product, name):
-    """交易商品的成交價和大台差很多，判斷照樣只看大台：三種商品在同樣的時刻進場，
-    只有訊息裡的商品名稱和成交價（交易商品自己的價格）不同。"""
+    """交易商品的成交價和大台差很多，判斷照樣只看大台：兩種商品在同樣的時刻進場，
+    只有訊息裡的商品名稱和成交價（交易商品自己的價格）不同。
+
+    交易大台時不會有「和大台不像的交易商品成交」——大台的成交就是交易商品的成交，
+    那種情形見 test_chase_entry 的 test_trading_tx_fills_at_the_very_trade_that_triggered_the_entry。"""
     events = []
     for event in rally("08:45", 6) + [trade(at("08:51:00"), 45160)]:
         if isinstance(event, ProductTrade):

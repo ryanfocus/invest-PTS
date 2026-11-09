@@ -129,6 +129,20 @@ def rally(start: str, n: int, *, open_: float = 45100, step: float = 10, bichai:
     return events
 
 
+def trading_tx(events: list) -> list:
+    """交易商品就是大台時 broker 送來的樣子：大台的每一筆成交同時也是交易商品的成交，
+    群益先送 TxTrade、緊接著送一筆同時同價的 ProductTrade（broker/capital.py 的逐筆成交）。
+    原劇本裡另外寫的交易商品成交全部拿掉——大台不會有不屬於大台成交的「交易商品成交」。"""
+    out: list = []
+    for event in events:
+        if isinstance(event, ProductTrade):
+            continue
+        out.append(event)
+        if isinstance(event, TxTrade):
+            out.append(ProductTrade(event.time, event.price))
+    return out
+
+
 def replayed(events: list) -> list:
     """群益第一次訂閱時回補的當天成交：只有成交（大台與交易商品），帶的是交易所當時的時間；
     沒有時鐘，也沒有累計筆數（筆數沒有歷史，只有現在的累計值）。晚啟動或重啟時，
