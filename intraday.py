@@ -4,9 +4,14 @@
 
     python intraday.py
 
-每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。目前只有模擬模式（ticket 04、05）：
-條件成立就在交易商品當下的價格模擬成交一次，發一則標示「模擬」的訊息，
-**完全不呼叫下單 API**。真實下單（ticket 06）之後接在同樣的地方（`_Trading._simulate`）。
+每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。條件成立時：
+
+  * 自動下單打開：送出市價 IOC → 把實際成交寫進部位檔 → 發一則成交訊息（ticket 06）。
+    委託失敗的處理（ticket 07）完成之前，`main()` 拒絕在自動下單打開時啟動。
+  * 自動下單關閉（模擬模式）：在交易商品當下的價格模擬成交，發一則標示「模擬」的訊息，
+    **完全不呼叫下單 API**、不寫部位檔（ticket 04）。
+
+立刻進場與突破進場被觸發走的是同一條路（`_Trading._execute`），開關只在那裡分岔。
 
 ## 突破進場的盯價
 
@@ -42,7 +47,7 @@ import enum
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Callable
 
@@ -50,9 +55,11 @@ import calendar_tw
 import indicators
 import messages
 import paths
+import position_file
 import settings
 import strategy
-from broker import TX_CODE, Broker, BrokerError, Clock, ProductTrade, TxTrade, TxTradeCounts
+from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
+                    OrderRequest, ProductTrade, TxTrade, TxTradeCounts)
 from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
@@ -75,6 +82,8 @@ class Ending(enum.Enum):
     """盤中程式為什麼結束。寫進 log，給人看的。"""
 
     NOT_A_TRADING_DAY = "非交易日，沒有登入"
+    # 今天的部位檔存在卻讀不懂：已經發了 Discord，沒有登入、不進場。
+    POSITION_FILE_UNREADABLE = "部位檔讀不懂，今天不進場"
     # 到 13:20 都沒有今天日盤的成交，收過的卻是別的交易日的（臨時休市，規格第 10 條）。
     # 結論為什麼要等到 13:20，見 `run()` 裡的說明。
     QUOTES_FROM_ANOTHER_DAY = "報價屬於前一個交易日，不判斷"
@@ -113,18 +122,36 @@ def run(broker: Broker, config: settings.Config, *, today: date,
        看起來就和臨時休市一模一樣。拿它收工的話，一次開盤時的斷線就賠掉一整天，
        而且程式正常結束，排程的失敗重啟也不會接手。等的代價是零（見第一點）。
     """
-    if config.auto_order_enabled:
-        # ticket 06 接上真實下單時拿掉。在那之前照樣跑的話，使用者會以為條件成立時真的下了單。
-        raise NotImplementedError(
-            "自動下單（order.auto_enabled: true）還沒有實作，目前只能跑模擬模式。"
-            "把 config/settings.yaml 的 auto_enabled 改回 false")
     if not calendar_tw.is_trading_day(today):
         logger.info("%s 不是交易日，不登入", today)
         return SessionOutcome(Ending.NOT_A_TRADING_DAY)
 
+    # 當天已經有部位（盤中重啟）：交易商品、合約、口數一律以部位檔為準，不看設定檔
+    # （規格第 43 條）。改設定最快下一個交易日才生效，進場和出場就不會是不同的商品。
+    try:
+        record = position_file.read(today)
+    except position_file.Unreadable as exc:
+        # 讀不懂的檔可能記著今天已經成交的口數：當成「沒有部位」照常進場的話，口數、
+        # 均價、加碼上限甚至商品都會錯。這一天不進場；檔案原封不動，留給人工處理。
+        logger.error("部位檔讀不懂，今天不進場：%s", exc)
+        _send(config, notify, messages.position_file_unreadable(day=today, reason=str(exc)))
+        return SessionOutcome(Ending.POSITION_FILE_UNREADABLE)
+    product = config.product if record is None else record.product
+    if record is not None and product != config.product:
+        logger.warning("設定檔的交易商品是 %s，但今天已經有 %s 的部位，今天照部位檔交易 %s",
+                       config.product, product, product)
+
     broker.login()
+    orders = None
+    if config.auto_order_enabled:
+        # 近月合約（結算日當天就是當天到期的那個，規格第 9 條）在開盤前查好：查不到是
+        # ProductListUnavailable，盤中程式在 08:40 就中止，而不是等到條件成立才發現。
+        # 已經有部位時照部位檔的合約下單，和出場程式平的是同一個。
+        contract = broker.get_contracts()[product] if record is None else record.contract
+        orders = _Orders(broker, today, contract, record)
     trading = _Trading(config, notify, _load_history(broker, today),
-                       _load_settlement_day(broker, today))
+                       _load_settlement_day(broker, today), orders,
+                       product=product, record=record)
     end_at = datetime.combine(today, SESSION_END)
     state = indicators.BarState()
     bars: list[indicators.ClosedBar] = []
@@ -154,7 +181,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
 
     ending = Ending.STREAM_ENDED
     try:
-        for event in broker.events(config.product):
+        for event in broker.events(product):
             if isinstance(event, (TxTrade, ProductTrade)) and event.time.date() != today:
                 # 不屬於今天的成交：不組 K 棒、不記、也不拿它的時間當「現在」
                 if isinstance(event, TxTrade):
@@ -177,7 +204,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                     confirmed = True
                     raw.confirm()
                 raw.trade(event)
-                if config.product == TX_CODE:
+                if product == TX_CODE:
                     # 交易大台時，這一筆就是交易商品的成交。群益對同一筆先送 TxTrade、再送
                     # ProductTrade；等後者才更新現價的話，下面的判斷與盯價都會成交在**前一筆**，
                     # 同一個商品就出現「觸發在 45180、成交在 45175」這種不可能的結果。
@@ -278,24 +305,105 @@ def _load_settlement_day(broker: Broker, today: date) -> date | None:
     return day
 
 
-# ── 判斷之後：模擬成交與通知 ──────────────────────────────────────────────
+# ── 判斷之後：進場與通知 ──────────────────────────────────────────────────
+
+_ENTRY_SIDE = {strategy.LONG: BUY, strategy.SHORT: SELL}
+
+
+class _FillNotOnFile(Exception):
+    """單已經成交，部位檔卻寫不進去。`record` 是含這一筆的**真實**部位，`on_file` 是檔裡
+    還留著的那一份（還沒有檔就是 None）。"""
+
+    def __init__(self, fill: position_file.Fill, record: position_file.PositionRecord,
+                 on_file: position_file.PositionRecord | None, cause: Exception):
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.fill = fill
+        self.record = record
+        self.on_file = on_file
+
+
+class _Orders:
+    """真實下單：送出市價 IOC → 寫部位檔。只有自動下單打開時才存在。
+
+    `record` 是今天的部位檔內容（還沒有成交時是 None），每次成交後整份重寫：
+    出場程式照它平倉，所以它必須永遠是**全部**的成交，不只是最新一筆。
+    """
+
+    def __init__(self, broker: Broker, today: date, contract: ContractInfo,
+                 record: position_file.PositionRecord | None):
+        self._broker = broker
+        self._today = today
+        self._contract = contract
+        self.record = record
+
+    def enter(self, direction: str, lots: int) -> position_file.Fill | None:
+        """送出進場單，回傳**實際**成交（規格第 29 條）。0 口（當下沒有對手價）是 None。
+
+        委託失敗（`OrderFailed`／`FillUnknown`）目前原樣往外拋，盤中程式中止。
+        「當天停止進場、記成不確定、告警」是 ticket 07 的事，接在這裡。
+
+        成交了卻寫不進部位檔是 `_FillNotOnFile`；`self.record` 維持檔裡那一份。
+        """
+        result = self._broker.place_order(OrderRequest(
+            contract=self._contract, side=_ENTRY_SIDE[direction], lots=lots,
+            trading_day=self._today))
+        if not result.filled_lots:
+            logger.warning("委託 %s 沒有成交（市價 IOC 當下沒有對手價），部位不變",
+                           result.order_seq)
+            return None
+        fill = position_file.Fill(result.order_seq, result.filled_lots, result.avg_price)
+        record = self.record or position_file.PositionRecord(
+            trading_day=self._today, product=self._contract.code,
+            order_code=self._contract.order_code,
+            contract_month=self._contract.contract_month, direction=direction,
+            last_trading_day=self._contract.last_trading_day,
+            status=position_file.CONFIRMED, entries=())
+        record = replace(record, entries=record.entries + (fill,))
+        # ⚠️ 成交之後的**下一件事**就是寫檔（規格第 52 條）：發通知、記 log 都排在後面。
+        #    中間任何一步出事（Discord 掛了、程式被關掉），出場程式仍然知道這幾口。
+        try:
+            position_file.write(record)
+        except Exception as exc:  # noqa: BLE001
+            # 不管為什麼寫不進去（檔案被防毒鎖住、磁碟滿、權限），結果都一樣：帳上有、
+            # 檔裡沒有。讓它當成一般例外冒出去的話，程式帶著 traceback 結束，一則告警都
+            # 沒有，13:25 出場程式照舊檔平倉（沒有檔就什麼都不平）。
+            raise _FillNotOnFile(fill, record, self.record, exc) from exc
+        self.record = record
+        return fill
+
+
+def _held(record: position_file.PositionRecord | None) -> strategy.Position | None:
+    """部位檔記載的部位，換成策略判斷看的樣子。還沒有任何成交就是沒有部位。"""
+    if record is None or not record.entered_lots:
+        return None
+    return strategy.Position(record.direction, record.entered_lots, record.avg_price)
 
 
 class _Trading:
     """每根 K 棒結束時問策略，條件成立就進場、累計部位、發通知；盯等待中的突破進場。
 
-    目前只有模擬模式（ticket 04）：成交價是交易商品**當下的價格**（最新一筆成交），
-    部位只留在記憶體裡——**不寫部位檔**（規格第 42 條）。出場程式看的是部位檔，
-    模擬的口數不能讓它以為今天有部位。
+    自動下單關閉時是模擬模式（規格第 42 條）：成交價是交易商品**當下的價格**（最新一筆
+    成交），部位只留在記憶體裡——**不寫部位檔**。出場程式看的是部位檔，模擬的口數不能
+    讓它以為今天有部位。打開時才有 `orders`，那是唯一會呼叫下單函式的路徑。
     """
 
     def __init__(self, config: settings.Config, notify: Callable[[str], bool],
-                 history: _History | None, settlement_day: date | None):
+                 history: _History | None, settlement_day: date | None,
+                 orders: _Orders | None, *, product: str,
+                 record: position_file.PositionRecord | None):
         self._config = config
         self._notify = notify
         self._history = history
         self._settlement_day = settlement_day
-        self.position: strategy.Position | None = None
+        self._orders = orders
+        self._product = product
+        self.position = _held(record)
+        # 當天不再進場。部位不確定時，帳上的口數不知道，部位不虧、加碼上限都算不了
+        # （規格第 50 條）；成交寫不進部位檔時也打開（`_not_on_file`）。ticket 07 在
+        # 委託被拒、成交不確定時也會把它打開。
+        self._stopped = record is not None and record.status == position_file.UNCERTAIN
+        if self._stopped:
+            logger.warning("部位檔記著一筆不確定的委託（%s），今天不再進場", record.uncertain)
         # 交易商品的現價：部位不虧用它，模擬也成交在它
         self.product_price: float | None = None
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
@@ -308,7 +416,7 @@ class _Trading:
 
     def on_bar(self, today: list[indicators.ClosedBar], now: datetime) -> None:
         """一根 K 棒剛結束（`now` 是讓它結束的那個事件的時間）。"""
-        if self._history is None:
+        if self._history is None or self._stopped:
             return
         first = today[0].bar
         # 開盤價是 08:45 那根的開盤價。今天第一根不是 08:45（開盤時報價斷了），
@@ -336,17 +444,25 @@ class _Trading:
                         "向上" if decision.direction == strategy.LONG else "向下",
                         decision.trigger, decision.lots)
         elif decision is not None:
-            self._simulate(decision, now)
+            self._execute(decision, now)
 
     def on_tx_trade(self, trade: TxTrade) -> None:
         """一筆即時收到的大台成交：盯等待中的突破進場（ADR-0001：由程式盯價）。"""
         breakout = self.breakout
-        if breakout is None or not breakout.touched_by(trade.price):
+        if breakout is None:
+            return
+        if self._stopped:
+            # 等待中時當天停止進場了（例如另一筆成交寫不進部位檔）：這一筆不再觸發。
+            logger.info("今天已經停止進場，取消等待中的突破進場（%s，觸發價 %g）",
+                        breakout.condition.value, breakout.trigger)
+            self.breakout = None
+            return
+        if not breakout.touched_by(trade.price):
             return
         self.breakout = None
         logger.info("大台成交 %g 碰到觸發價 %g，突破進場", trade.price, breakout.trigger)
-        self._simulate(strategy.Enter(breakout.direction, breakout.condition, breakout.lots),
-                       trade.time, trigger=breakout.trigger)
+        self._execute(strategy.Enter(breakout.direction, breakout.condition, breakout.lots),
+                      trade.time, trigger=breakout.trigger)
 
     def cancel_breakout(self) -> None:
         """13:20 進場截止：等待中的突破進場一併取消（規格第 26 條）。沒有進場，不發訊息。"""
@@ -356,8 +472,77 @@ class _Trading:
                         self.breakout.trigger)
             self.breakout = None
 
+    def _execute(self, decision: strategy.Enter, now: datetime, *,
+                 trigger: float | None = None) -> None:
+        """進場：自動下單打開就真的下單，關閉就模擬。立刻進場與突破進場被觸發都走這裡，
+        真實下單才不會只接到其中一種。`trigger` 是突破進場的觸發價（立刻進場是 None）。"""
+        if self._orders is None:
+            self._simulate(decision, now, trigger=trigger)
+        else:
+            self._enter(decision, now, trigger=trigger)
+
+    def _against_position(self, decision: strategy.Enter) -> bool:
+        """這次要進的方向和手上的部位相反：不進場（規格第 17 條，一天只做一個方向）。
+        真實下單與模擬的進場都先過這一關。
+
+        條件 1、2 只看開高／開低，不看手上部位的方向；正常情況下兩者一定一致，但盤中重啟時
+        昨收是重新查的（前一交易日的 1 分 K 這次查不到，就往前多退一天），開高／開低可能
+        整個翻過來。這時送出的反向單會被倉別「自動」當成平倉，部位檔卻記成同方向加碼：
+        出場程式照檔平倉，就開出反向的新倉帶過夜。
+        """
+        held = self.position
+        if held is None or held.direction == decision.direction:
+            return False
+        logger.error("%s 要%s，但今天的部位是 %s %d 口：一天只做一個方向，不進場"
+                     "（昨收或開盤價和建立部位時不一樣？）", decision.condition.value,
+                     decision.direction, held.direction, held.lots)
+        return True
+
+    def _enter(self, decision: strategy.Enter, now: datetime, *,
+               trigger: float | None = None) -> None:
+        if self._against_position(decision):
+            return
+        try:
+            fill = self._orders.enter(decision.direction, decision.lots)
+        except _FillNotOnFile as exc:
+            self._not_on_file(exc, now)
+            return
+        if fill is None:
+            return
+        record = self._orders.record
+        self.position = _held(record)
+        logger.info("進場成交：%s %s %d 口 @ %g（委託 %s），累計 %d 口，均價 %.2f",
+                    decision.condition.value, record.direction, fill.lots, fill.price,
+                    fill.order_seq, record.entered_lots, record.avg_price)
+        self._send(messages.entry(
+            at=now, product=record.product, direction=record.direction,
+            condition=decision.condition, lots=fill.lots, price=fill.price,
+            total_lots=record.entered_lots, avg_price=record.avg_price, simulated=False,
+            trigger=trigger))
+
+    def _not_on_file(self, exc: _FillNotOnFile, now: datetime) -> None:
+        """成交了、部位檔卻沒記到：告警（「部位還在」），今天不再進場。
+
+        不再進場，是因為從這一刻起部位檔和帳上對不上：再成交的口數寫進去，出場程式也只會
+        平檔裡那些，要人自己平的口數越滾越多；告警裡講好的「自行平掉這幾口」也不再準。
+        盤中程式照樣跑到收工，原始行情繼續記。
+        """
+        self._stopped = True
+        record, fill = exc.record, exc.fill
+        on_file = exc.on_file.entered_lots if exc.on_file is not None else 0
+        self.position = _held(record)
+        logger.error("成交 %s %d 口 @ %g（委託 %s）寫不進部位檔，帳上共 %d 口、檔裡 %d 口，"
+                     "今天不再進場：%s", record.direction, fill.lots, fill.price,
+                     fill.order_seq, record.entered_lots, on_file, exc)
+        self._send(messages.fill_not_on_file(
+            at=now, product=record.product, direction=record.direction, lots=fill.lots,
+            price=fill.price, order_seq=fill.order_seq, total_lots=record.entered_lots,
+            on_file_lots=on_file, reason=str(exc)))
+
     def _simulate(self, decision: strategy.Enter, now: datetime, *,
                   trigger: float | None = None) -> None:
+        if self._against_position(decision):
+            return
         price = self.product_price
         if price is None:
             logger.warning("%s 成立，但還沒有交易商品的成交價，這一分鐘不進場",
@@ -371,15 +556,20 @@ class _Trading:
                     decision.condition.value, decision.direction, decision.lots, price,
                     total, avg)
         self._send(messages.entry(
-            at=now, product=self._config.product, direction=decision.direction,
+            at=now, product=self._product, direction=decision.direction,
             condition=decision.condition, lots=decision.lots, price=price,
             total_lots=total, avg_price=avg, simulated=True, trigger=trigger))
 
     def _send(self, text: str) -> None:
-        if not self._config.discord_enabled:
-            logger.info("Discord 已關閉，不發送")
-            return
-        self._notify(text)
+        _send(self._config, self._notify, text)
+
+
+def _send(config: settings.Config, notify: Callable[[str], bool], text: str) -> None:
+    """發一則 Discord。開關只在這裡把關（規格第 45 條）。"""
+    if not config.discord_enabled:
+        logger.info("Discord 已關閉，不發送")
+        return
+    notify(text)
 
 
 def main() -> int:
@@ -396,12 +586,20 @@ def main() -> int:
     _setup_logging(today)
 
     config = settings.load()
+    if config.auto_order_enabled:
+        # ticket 07 接上委託失敗的處理時拿掉（連同 test_live_orders 裡對應的那條測試）。
+        # `run()` 已經會真的下單，但委託被拒、成交不確定目前只會讓程式帶著例外結束：
+        # 不確定的那一筆不會記成「不確定」、不告警，排程重啟後照缺了一筆的部位檔繼續進場；
+        # 被拒的單則每次重啟再送一次（規格第 50、51 條）。
+        logger.error("自動下單（order.auto_enabled: true）要等委託失敗的處理（ticket 07）完成"
+                     "才能打開，盤中程式不啟動。把 config/settings.yaml 的 auto_enabled 改回 false")
+        return 1
     secrets = settings.load_secrets(config)
     broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
     webhook = secrets.discord_webhook
     try:
         run(broker, config, today=today, notify=lambda text: discord.send(text, webhook))
-    except (BrokerError, NotImplementedError) as exc:
+    except BrokerError as exc:
         logger.error("盤中程式中止：%s", exc)
         return 1
     return 0

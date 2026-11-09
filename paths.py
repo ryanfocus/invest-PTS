@@ -54,6 +54,15 @@ def market_data_dir() -> str:
     return os.path.join(app_root(), "marketdata")
 
 
+def state_dir() -> str:
+    """部位檔（以及 ticket 09 的心跳記錄）：盤中程式與出場程式之間唯一的溝通管道。
+
+    ⚠️ **刻意不放在 `logs/` 底下。** `logs/` 每 30 天清一次；部位檔被清掉的那一刻，
+       出場程式就以為今天沒有部位。它不含帳號，只有委託序號、口數與價格。
+    """
+    return os.path.join(app_root(), "state")
+
+
 def capital_log_dir() -> str:
     """群益元件自己寫的 log（含身分證字號）。
 

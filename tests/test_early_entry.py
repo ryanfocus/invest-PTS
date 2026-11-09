@@ -288,14 +288,3 @@ def test_a_local_clock_a_few_seconds_off_the_exchange_still_enters(skew):
               for e in rally("08:45", 6) + [trade(at("08:51:00"), 45160)]]
     _, sent = _run(events)
     assert _times(sent) == ["08:50:00", "08:51:00"]
-
-
-def test_with_auto_order_switched_on_it_refuses_to_start_until_real_orders_exist():
-    """真實下單是 ticket 06。在那之前打開自動下單，程式若照樣跑，使用者會以為條件成立時
-    真的下了單（或者收到「模擬」訊息卻以為那是真的）。一啟動就講清楚，不登入、不送單。"""
-    broker = FakeBroker(events=rally("08:45", 6), login_error=AssertionError("不該登入"),
-                        minute_bars={PREVIOUS_DAY: calm_history()})
-    with pytest.raises(NotImplementedError, match="自動下單"):
-        intraday.run(broker, _config(auto_order_enabled=True), today=DAY,
-                     notify=RecordingNotifier())
-    assert broker.orders == []
