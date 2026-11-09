@@ -160,6 +160,27 @@ def test_a_full_fill_ends_without_waiting_for_a_cancel():
     assert summarize_fills(rows, "SEQ0000000001").is_settled(requested_lots=2)
 
 
+def test_a_fill_row_we_cannot_read_keeps_the_order_open_even_after_the_cancel():
+    """成交列帶著自己的序號，價格卻讀不出來：那一列的口數算不算數，我們不知道。
+
+    把它當成沒看到的話，後面的取消列會讓這筆委託看起來「確定結束、0 口」——
+    一個**有把握的錯誤答案**。部位檔少記一口，微台的出場程式就不會去平它，直接過夜。
+    invest-os 不看成交列的價格，所以那邊沒有這個洞；PTS 多了價格檢查，就要一起
+    承認看不懂。"""
+    rows = [_row("N", qty="3"), _row("D", qty="1", price="0.000000"), _row("C", qty="2")]
+    summary = summarize_fills(rows, "SEQ0000000001")
+    assert not summary.is_settled(requested_lots=3)
+
+
+def test_more_fills_than_were_ordered_is_never_a_settled_answer():
+    """委託 1 口、成交加總 2 口——不可能是真的（多半是同一列成交回報被補送了兩次）。
+    照 2 口寫進部位檔的話，出場就平 2 口，多的那口變成反向新倉。
+    invest-os 的成交查詢遇到超過委託量會拒絕；推播這條路要有同一道防線。"""
+    fill = _row("D", qty="1", price="45000")
+    summary = summarize_fills([_row("N", qty="1"), fill, fill], "SEQ0000000001")
+    assert not summary.is_settled(requested_lots=1)
+
+
 def test_fills_at_different_prices_are_averaged_by_lots():
     """一筆市價單可能吃到好幾檔價位。部位檔記的價格是這筆委託的成交均價。"""
     rows = [_row("D", qty="1", price="45000"), _row("D", qty="3", price="45004")]

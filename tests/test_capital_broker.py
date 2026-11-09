@@ -15,7 +15,7 @@ from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, FillUn
                     LoginFailed, OrderFailed, OrderRequest, ProductListUnavailable)
 from broker.capital import CapitalBroker
 from fake_skcom import (FakeSkcom, fills, full_fill, no_sequence, refused_at_send, rejected,
-                        silence)
+                        reply_row, silence)
 
 
 def _broker(skcom: FakeSkcom, **kwargs) -> CapitalBroker:
@@ -103,6 +103,19 @@ def test_an_unexpected_error_while_listing_products_is_product_list_unavailable(
     broker.login()
     with pytest.raises(ProductListUnavailable, match="RPC"):
         broker.get_contracts()
+
+
+def test_logging_in_and_listing_products_never_touch_the_order_side():
+    """**自動下單關閉時完全不呼叫下單 API**（規格第 42 條），唯讀檢查工具也靠這一點。
+    下單元件初始化、讀憑證、連回報主機都只能等到第一次送單才做。流程測試用的是
+    假 broker，看不到群益 broker 在登入時偷跑了這些——只有這裡抓得到。"""
+    skcom = FakeSkcom()
+    broker = _broker(skcom)
+    broker.login()
+    broker.get_contracts()
+    touched = [(lib, method) for lib, method, _ in skcom.calls
+               if lib in ("SKOrderLib", "SKReplyLib")]
+    assert touched == []
 
 
 # --- 委託欄位（規格第 27、28 條）---
@@ -275,6 +288,27 @@ def test_a_partial_fill_that_never_ends_carries_the_known_lots():
     assert exc.value.known_filled == 1
 
 
+def test_a_fill_we_cannot_read_is_fill_unknown_not_a_confident_zero():
+    """成交列是自己的（序號對得上），價格卻是 0。接著剩餘量取消——看起來像「沒成交」。
+    說成 0 口的話，部位檔少記一口，微台出場不會平它。看不懂就要說看不懂。"""
+    def on_send(order, seq):
+        return seq, 0, [reply_row("N", seq=seq, qty=3),
+                        reply_row("D", seq=seq, qty=1, price=0.0),
+                        reply_row("C", seq=seq, qty=2)]
+    with pytest.raises(FillUnknown, match="看不懂") as exc:
+        _place(FakeSkcom(on_send=on_send), _order(lots=3))
+    assert exc.value.order_seq
+
+
+def test_more_fills_than_were_ordered_is_fill_unknown():
+    """同一列成交回報到了兩次：委託 1 口，加總 2 口。這個數字寫進部位檔，
+    出場就照 2 口平倉。不可能的數字只能說不知道。"""
+    fills_twice = fills((1, 45000.0), (1, 45000.0))
+    with pytest.raises(FillUnknown, match="超過委託") as exc:
+        _place(FakeSkcom(on_send=fills_twice), _order(lots=1))
+    assert exc.value.known_filled <= 1, "說不通的口數不可以當成「至少成交」帶出去"
+
+
 @pytest.mark.parametrize("error", [
     OSError("COM 物件已失效"),
     RuntimeError("訊息幫浦異常"),
@@ -329,18 +363,61 @@ def test_a_reply_link_that_finishes_its_replay_is_trusted_whatever_code_it_conne
     assert _reply_problems(caplog) == []
 
 
+def test_the_code_the_reply_link_connects_with_is_logged(caplog):
+    """成功連線時的代碼文件沒寫，第一次實機就是靠這一行看出它是多少（ticket 01 Comments）。
+    也守著事件名稱：掛回 invest-os 的舊名 `OnConnect` 的話，這一行永遠不會出現。"""
+    caplog.set_level(logging.INFO, logger="broker.capital")
+    _place(FakeSkcom(reply_connection_code=3001), _order())
+    assert any("回報連線通知" in m and "3001" in m for m in caplog.messages)
+
+
 def test_a_reply_link_that_never_finishes_its_replay_is_reported(caplog):
     """收不到成交回報時，這一行是唯一告訴人「該往哪裡查」的東西。
-    不擋送單：出場時還有成交查詢可以補（規格第 50 條）。"""
+
+    這種情況**照樣送單**，和下面「確定斷線」不同：沒等到 `OnComplete` 是弱訊號——
+    沒有舊回報可補送時它還會不會來，實機還沒看過（2026-11-07 那次補送了 7 則）。
+    在這個假設上擋單，猜錯的話是每天都進不了場。"""
     skcom = FakeSkcom(reply_completes=False)
     _place(skcom, _order(), connect_timeout=0.2)
     assert any("OnComplete" in m for m in _reply_problems(caplog))
     assert len(skcom.sent) == 1
 
 
-def test_a_reply_link_that_drops_is_reported(caplog):
-    _place(FakeSkcom(reply_drop_code=3002), _order(), connect_timeout=0.2)
+def test_a_reply_link_known_to_be_down_stops_the_order_before_it_is_sent(caplog):
+    """**已經知道回報連線斷了，就不送。** 送出去一定收不到成交回報，結局必然是
+    「不知道成交」：本來確定沒有部位，換成可能有部位。進場單沒有成交查詢可以補
+    （規格第 50 條的兩段查詢只用在出場單），出場程式遇到不確定的部位不會自動平倉——
+    微台那一口要靠人手動處理才不會過夜。不送則是「委託沒有送出去」：確定沒有部位。"""
+    skcom = FakeSkcom(reply_drop_code=3002, on_send=silence())
+    with pytest.raises(OrderFailed, match="3002"):
+        _place(skcom, _order(), connect_timeout=0.2)
+    assert skcom.sent == []
     assert any("中斷" in m and "3002" in m for m in _reply_problems(caplog))
+
+
+def test_a_reply_link_that_drops_during_the_session_is_checked_before_every_order():
+    """盤中才斷線的話，第一筆送單前那次檢查早就過了。每一筆都要再看一次，
+    先試著重新連線，連不回來就不送。"""
+    skcom = FakeSkcom()
+    broker = _broker(skcom, connect_timeout=0.2)
+    broker.login()
+    broker.place_order(_order())
+    skcom.drop_reply_link(3002, reconnects=False)
+    with pytest.raises(OrderFailed, match="回報連線"):
+        broker.place_order(_order())
+    assert len(skcom.sent) == 1
+
+
+def test_a_reply_link_that_reconnects_lets_the_next_order_through():
+    """斷線不是永久的判決。出場程式對「沒送出去」的單每分鐘重試（規格第 34 條），
+    重新連上之後就該送得出去，否則重試永遠白做。"""
+    skcom = FakeSkcom()
+    broker = _broker(skcom, connect_timeout=0.2)
+    broker.login()
+    broker.place_order(_order())
+    skcom.drop_reply_link(3002, reconnects=True)
+    assert broker.place_order(_order()).filled_lots == 1
+    assert len(skcom.sent) == 2
 
 
 # --- 券商回覆的原始存檔 ---

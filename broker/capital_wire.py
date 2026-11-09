@@ -76,13 +76,43 @@ class FillSummary:
     matched_rows: int
     saw_cancel: bool = False
     reject_reason: str = ""
+    # 帶著這筆委託序號、卻解析不了的列數。不是 0 就代表彙整出來的口數可能少算。
+    unreadable_rows: int = 0
+
+    def doubt(self, requested_lots: int) -> str:
+        """這份彙整**說不通**的原因；說得通時是空字串。
+
+        兩種情況，答案都不會因為多等一下而變對：
+
+          * 有自己序號的列看不懂 → 那一列可能是成交，口數可能少算
+          * 成交加總超過委託口數 → 不可能是真的（多半是同一列被補送了兩次）。
+            invest-os 的成交查詢解析有同一道檢查；推播這條路原本沒有。
+
+        說不通的時候，任何「確定」的答案都可能是錯的，只能承認不知道成交。
+        """
+        if self.unreadable_rows:
+            return f"有 {self.unreadable_rows} 列帶著這筆委託序號的回報看不懂"
+        if self.filled_lots > requested_lots:
+            return f"回報加總成交 {self.filled_lots} 口，超過委託的 {requested_lots} 口"
+        return ""
+
+    def known_filled(self, requested_lots: int) -> int:
+        """可以當成「**至少**成交了幾口」帶出去的數字。
+
+        加總超過委託量時那個數字本身就是錯的，連下限都算不上，所以是 0；
+        只是有列看不懂時，看得懂的那幾列仍然成立。
+        """
+        return 0 if self.filled_lots > requested_lots else self.filled_lots
 
     def is_settled(self, requested_lots: int) -> bool:
         """這筆委託確定不會再有成交了嗎？
 
         三種確定的結局：被拒（沒有部位）、剩餘量已取消（成交多少就是多少）、
-        全部成交（沒有剩餘量可取消，等 C 只會等到逾時）。其他一律是「還沒結束」。
+        全部成交（沒有剩餘量可取消，等 C 只會等到逾時）。其他一律是「還沒結束」——
+        包括彙整本身說不通的時候（`doubt()`）：那時被拒、取消、成交口數都不可信。
         """
+        if self.doubt(requested_lots):
+            return False
         return self.rejected or self.saw_cancel or self.filled_lots >= requested_lots
 
 
@@ -92,12 +122,15 @@ _NO_REASON = "券商沒有附上原因"
 def summarize_fills(rows, seq: str) -> FillSummary:
     """彙整同一筆委託的回報，算出實際成交的口數與均價。
 
-    三條規則，都是不對稱的——因為代價不對稱：
+    四條規則，都是不對稱的——因為代價不對稱：
 
     1. **只要有成交就不算失敗。** 市價 IOC 的正常結局就是「成交一部分、剩下的取消」。
        把它當成失敗的話，已成交的部位就沒有人知道。
     2. **完全沒成交才談被拒。** 那時候確實沒有部位產生。
     3. **認不出是哪一筆就一列都不算。** 加總到別人的成交上，部位檔就記錯口數。
+    4. **認得出是自己的、卻看不懂內容，就記下來（`unreadable_rows`）。** 跳過它的話，
+       一列讀不出價格的成交加上後面的取消列，會彙整成「確定結束、0 口」。
+       invest-os 不檢查成交價所以沒有這個洞；PTS 檢查了，就必須一起承認看不懂。
 
     比對序號用**整列子字串搜尋**而不是特定欄位：成交列的 `[0]` 是空的，序號只在最後一欄
     （2026-08-17 真實資料）。
@@ -112,11 +145,15 @@ def summarize_fills(rows, seq: str) -> FillSummary:
     filled = 0
     cost = 0.0
     matched = 0
+    unreadable = 0
     reject_reason = ""
     saw_cancel = False
     for row in rows:
+        if seq not in row:
+            continue
         parsed = parse_reply_row(row)
-        if parsed is None or seq not in row:
+        if parsed is None:
+            unreadable += 1
             continue
         matched += 1
         if parsed.failed and not reject_reason:
@@ -135,6 +172,7 @@ def summarize_fills(rows, seq: str) -> FillSummary:
         matched_rows=matched,
         saw_cancel=saw_cancel,
         reject_reason=reject_reason if filled == 0 else "",
+        unreadable_rows=unreadable,
     )
 
 

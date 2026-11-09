@@ -4,7 +4,9 @@
 """
 
 import pytest
+import yaml
 
+import paths
 import settings
 
 
@@ -20,12 +22,32 @@ def test_the_shipped_config_has_auto_ordering_switched_off():
 # --- 缺鍵：啟動失敗並講明原因（規格第 47 條）---
 
 
+def _shipped_text_with_commented_out(*dotted_keys: str) -> dict:
+    """把真實設定檔裡這幾個鍵的那一行**註解掉**再解析——就是使用者實際會做的事。
+
+    ⚠️ 不可以用 dict 的 `del` 代替：那會留下空的 `{}`。yaml 裡一個區段的鍵全被註解掉時，
+       那個區段解析出來是 **None**（`discord:` 底下什麼都沒有），程式要面對的是這個形狀。
+    """
+    with open(paths.config_path(), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    wanted = {tuple(k.split(".", 1)) for k in dotted_keys}
+    section = ""
+    out = []
+    for line in lines:
+        if line[:1].isalpha():
+            section = line.split(":", 1)[0]
+        leaf = line.strip().split(":", 1)[0]
+        if line.startswith("  ") and (section, leaf) in wanted:
+            line = "# " + line
+            wanted.discard((section, leaf))
+        out.append(line)
+    assert not wanted, f"設定檔裡找不到 {wanted}，測試自己寫錯了"
+    return yaml.safe_load("\n".join(out))
+
+
 def _shipped_without(dotted_key: str) -> dict:
     """從真實設定檔拿掉一個鍵。從真實檔長出來，設定形狀改了不必回來改這裡。"""
-    raw = settings.read_raw()
-    section, _, leaf = dotted_key.partition(".")
-    del raw[section][leaf]
-    return raw
+    return _shipped_text_with_commented_out(dotted_key)
 
 
 @pytest.mark.parametrize("key", [
@@ -40,6 +62,16 @@ def test_a_missing_key_stops_startup_and_names_the_key(key):
     使用者要去改的是 yaml，`KeyError: 'order'` 讓他無從下手。"""
     with pytest.raises(settings.SettingsError, match=key.replace(".", r"\.")):
         settings.build(_shipped_without(key))
+
+
+def test_a_section_with_every_key_commented_out_names_a_key_in_it():
+    """`order:` 底下全部註解掉，yaml 給的是 `order: None`。錯誤訊息仍要講出
+    `order.` 底下缺的是哪一個，不可以是一個看不出鍵名的 TypeError。"""
+    raw = _shipped_text_with_commented_out(
+        "order.auto_enabled", "order.product", "order.lots_per_entry", "order.max_position")
+    assert raw["order"] is None, "前提：這正是 yaml 對空區段給的形狀"
+    with pytest.raises(settings.SettingsError, match=r"order\.\w+"):
+        settings.build(raw)
 
 
 def test_a_missing_section_also_names_the_key():

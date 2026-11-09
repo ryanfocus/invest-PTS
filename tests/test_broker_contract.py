@@ -94,6 +94,15 @@ def test_an_order_outside_one_to_ten_lots_cannot_even_be_written(lots):
         _order(lots=lots)
 
 
+@BOTH
+def test_ten_lots_is_the_cap_itself_and_is_sent_by_either_broker(make):
+    """10 口是上限本身，要送得出去。出場程式拆單時每筆就是 10 口（規格第 33 條）——
+    上界錯一格的話，13:25 的微台平倉會直接拋例外，部位就過夜了。"""
+    side = make()
+    assert side.broker.place_order(_order(lots=10)).filled_lots == 10
+    assert side.sent() == 1
+
+
 # --- 假 broker：記錄收到的委託 ---
 
 

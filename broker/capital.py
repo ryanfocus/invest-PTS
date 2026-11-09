@@ -155,12 +155,14 @@ class _ReplyEvents:
         logger.info("回報連線通知，代碼 %s", nErrorCode)
 
     def OnSolaceReplyDisconnect(self, bstrUserID, nErrorCode):
-        # 中途斷線與「從未連上」的後果一樣：收不到成交回報。
+        # 中途斷線與「從未連上」的後果一樣：收不到成交回報。送單前會看這個值（不送）。
         self.dropped = f"回報連線中斷，代碼 {nErrorCode}"
-        logger.error("%s。之後送出的委託將收不到成交回報", self.dropped)
+        logger.error("%s。連回來之前不送委託", self.dropped)
 
     def OnComplete(self, bstrUserID):
+        # 「連上而且補送完畢」——斷線之後元件自己重連成功的話，也是靠它知道。
         self.complete = True
+        self.dropped = ""
         logger.info("回報連線完成，過去的回報已補送完畢")
 
 
@@ -377,13 +379,30 @@ class CapitalBroker:
     # --- 下單 ---
 
     def _ensure_order_ready(self) -> None:
-        """初始化下單元件、讀憑證、連上回報、查過帳號。
+        """初始化下單元件、讀憑證、連上回報、查過帳號；之後每一筆都再確認回報連線還在。
 
         ⚠️ **刻意不在 `login()` 裡做。** 自動下單關閉時整條路徑都不該被走到
         （規格第 42 條：完全不呼叫下單 API）。
         """
-        if self._order_ready:
-            return
+        if not self._order_ready:
+            self._prepare_order_components()
+        else:
+            # 盤中斷線的通知可能還排在訊息幫浦裡，先收進來再判斷
+            self._com.pump()
+            if self._reply_events.dropped:
+                logger.warning("%s，送單前重新連線", self._reply_events.dropped)
+                self._connect_reply()
+        # ⚠️ **已經知道回報連線斷了就不送。** 送出去一定收不到成交回報，結局必然是
+        #    FillUnknown：把「確定沒有部位」換成「可能有部位」。進場單沒有成交查詢可以補
+        #    （規格第 50 條的兩段查詢只用在出場單），出場程式遇到不確定的部位也不自動平倉。
+        #    不送則是 OrderFailed：確定沒有部位，原因講得出來；出場程式的重試
+        #    （規格第 34 條）下一次會再走到上面的重新連線。
+        if self._reply_events.dropped:
+            raise OrderFailed(
+                f"{self._reply_events.dropped}，連不回來。"
+                "送出去會收不到成交回報，所以這筆委託沒有送出。")
+
+    def _prepare_order_components(self) -> None:
         code = self._order.SKOrderLib_Initialize()
         if code != 0:
             raise OrderFailed(f"下單元件初始化失敗，{self._message(code)}")
@@ -395,22 +414,7 @@ class CapitalBroker:
         if code != 0:
             raise OrderFailed(f"憑證讀取失敗，{self._message(code)}")
 
-        # 回報連線。沒有它就收不到 OnNewData，也就不知道成交幾口。
-        code = self._reply.SKReplyLib_ConnectByID(self._user_id)
-        if code != 0:
-            raise OrderFailed(f"回報連線失敗，{self._message(code)}")
-        # 回 0 只代表「請求已受理」。連線之後伺服器會先補送過去的回報（2026-11-07 實測：
-        # 7 則，含 OS 的委託），補完才送 OnComplete。補送的那些靠委託序號過濾掉。
-        #
-        # 等不到也**不擋送單**：出場時還有成交查詢可以補（規格第 50 條），擋下來反而是
-        # 用「今天確定不進場」去換「今天可能收不到回報」。但一定要記進 log——
-        # 等不到成交回報的那天，這一行是唯一告訴人「該往哪裡查」的東西。
-        events = self._reply_events
-        self._pump_until(lambda: events.complete or bool(events.dropped), self._connect_timeout)
-        if not events.complete and not events.dropped:
-            logger.warning("%.0f 秒內沒收到回報回補完成通知（OnComplete），"
-                           "回報連線可能異常，送出的委託可能收不到成交回報",
-                           self._connect_timeout)
+        self._connect_reply()
 
         # 群益要求下單前先查過帳號，即使用的是設定檔指定的那一個
         code = self._order.GetUserAccount()
@@ -418,6 +422,30 @@ class CapitalBroker:
             raise OrderFailed(f"取得帳號失敗，{self._message(code)}")
         self._pump_for(self._settle_seconds)
         self._order_ready = True
+
+    def _connect_reply(self) -> None:
+        """連上回報主機並等它補送完畢。沒有它就收不到 OnNewData，也就不知道成交幾口。
+
+        連線結果記在 `_reply_events`，由呼叫端判斷要不要送單。
+        """
+        events = self._reply_events
+        events.dropped, events.complete = "", False
+        code = self._reply.SKReplyLib_ConnectByID(self._user_id)
+        if code != 0:
+            events.dropped = f"回報連線失敗，{self._message(code)}"
+            raise OrderFailed(events.dropped)
+        # 回 0 只代表「請求已受理」。連線之後伺服器會先補送過去的回報（2026-11-07 實測：
+        # 7 則，含 OS 的委託），補完才送 OnComplete。補送的那些靠委託序號過濾掉。
+        #
+        # 等不到 OnComplete 時**照樣送單**，和確定斷線（dropped）不同：它是弱訊號——
+        # 沒有舊回報可補送時它還會不會來，實機還沒看過。在這個假設上擋單，猜錯就是
+        # 每天都進不了場。但一定要記進 log：等不到成交回報的那天，這一行是唯一告訴人
+        # 「該往哪裡查」的東西。
+        self._pump_until(lambda: events.complete or bool(events.dropped), self._connect_timeout)
+        if not events.complete and not events.dropped:
+            logger.warning("%.0f 秒內沒收到回報回補完成通知（OnComplete），"
+                           "回報連線可能異常，送出的委託可能收不到成交回報",
+                           self._connect_timeout)
 
     def place_order(self, request: OrderRequest) -> OrderResult:
         """送出市價 IOC 委託，等到它確定結束，回傳**實際**成交的口數與均價。
@@ -488,8 +516,18 @@ class CapitalBroker:
         def _summary():
             return summarize_fills(self._reply_events.rows[since:], seq)
 
-        self._pump_until(lambda: _summary().is_settled(requested_lots), self._fill_timeout)
+        def _done() -> bool:
+            # 說不通的彙整不會因為多等而變對，等到逾時只是晚 30 秒告訴人。
+            summary = _summary()
+            return bool(summary.doubt(requested_lots)) or summary.is_settled(requested_lots)
+
+        self._pump_until(_done, self._fill_timeout)
         summary = _summary()
+        doubt = summary.doubt(requested_lots)
+        if doubt:
+            raise FillUnknown(
+                f"委託 {seq} 的成交回報看不懂：{doubt}。請人工確認帳戶。",
+                order_seq=seq, known_filled=summary.known_filled(requested_lots))
         if not summary.is_settled(requested_lots):
             # 不知道結局。**這不等於沒有成交**——已知成交的部分也一併講出來，
             # 使用者去對帳時知道至少要看到幾口。

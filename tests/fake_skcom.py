@@ -116,6 +116,11 @@ class FakeSkcom:
     def first_call(self) -> tuple:
         return next(c for c in self.calls if c[0] != "comtypes")
 
+    def drop_reply_link(self, code: int, *, reconnects: bool) -> None:
+        """盤中回報連線中斷（下一次訊息幫浦時送達）。`reconnects`：之後重新連線會不會成功。"""
+        self.fire("SKReplyLib", "OnSolaceReplyDisconnect", "", code)
+        self.reply_drop_code = None if reconnects else code
+
     # --- 各函式的行為 ---
 
     def _SKCenterLib_SetLogPath(self, path):

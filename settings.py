@@ -52,15 +52,34 @@ class _Tracked:
         self._prefix = prefix
         self.seen = set() if seen is None else seen
 
-    def __getitem__(self, key: str):
+    def _get(self, key: str):
         full = f"{self._prefix}{key}"
         if not isinstance(self._data, dict) or key not in self._data:
             raise SettingsError(f"設定檔缺少 {full}")
-        value = self._data[key]
-        if isinstance(value, dict):
-            return _Tracked(value, prefix=f"{full}.", seen=self.seen)
+        return full, self._data[key]
+
+    def __getitem__(self, key: str):
+        """一個設定值（葉節點）。"""
+        full, value = self._get(key)
         self.seen.add(full)
         return value
+
+    def section(self, key: str) -> "_Tracked":
+        """一個區段（底下還有設定的那一層，例如 `discord`）。
+
+        ⚠️ 區段裡的鍵全被註解掉時，yaml 給的是 **None**，不是空的 mapping
+           （`discord:` 底下什麼都沒有）。當成空區段處理，接下來讀鍵時的錯誤訊息
+           才講得出完整鍵名 `discord.enabled`；否則使用者看到的是一個 TypeError。
+           分成兩個方法，是因為「這一層是區段還是值」只有呼叫端知道——
+           葉節點的 None 是使用者把值留空，要交給各自的檢查講清楚。
+        """
+        full, value = self._get(key)
+        if value is None:
+            value = {}
+        if not isinstance(value, dict):
+            raise SettingsError(
+                f"設定檔的 {full} 應該是一個區段（底下再分行列出各個設定），目前是 {value!r}")
+        return _Tracked(value, prefix=f"{full}.", seen=self.seen)
 
 
 def read_raw(path: str | None = None) -> dict:
@@ -74,7 +93,7 @@ def build(raw: dict) -> Config:
 
 
 def _build(raw: _Tracked) -> Config:
-    order = raw["order"]
+    order = raw.section("order")
     lots = _whole_number(order["lots_per_entry"], "order.lots_per_entry")
     if lots > MARKET_ORDER_LOT_CAP:
         raise SettingsError(
@@ -92,7 +111,7 @@ def _build(raw: _Tracked) -> Config:
         product=_product(order["product"]),
         lots_per_entry=lots,
         max_position=max_position,
-        discord_enabled=_switch(raw["discord"]["enabled"], "discord.enabled"),
+        discord_enabled=_switch(raw.section("discord")["enabled"], "discord.enabled"),
     )
 
 
