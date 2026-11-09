@@ -165,6 +165,12 @@ class PositionRecord:
                             order_code=self.order_code)
 
     @property
+    def settles_today(self) -> bool:
+        """這一天就是合約的最後交易日（結算日）：近月 13:30 就停止交易，還在的部位由交易所
+        以最後結算價現金了結。出場程式送單的期限、告警裡要人在幾點前平倉，都看這一個。"""
+        return self.last_trading_day == self.trading_day
+
+    @property
     def entered_lots(self) -> int:
         return sum(f.lots for f in self.entries)
 

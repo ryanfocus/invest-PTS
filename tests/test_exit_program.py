@@ -249,11 +249,24 @@ def test_a_position_file_that_cannot_be_read_sends_nothing_and_says_so(text):
     assert lines[1].startswith("原因：")
     assert lines[2:] == [
         "PTS 今天可能還有部位：請到券商 APP 確認帳戶。"
-        "微台要自行平掉（日盤 13:45 收盤）；大台、小台標了當沖，券商 13:30 會強平。",
+        "微台要自行平掉（日盤 13:45 收盤；今天如果是結算日，到期的近月 13:30 就停止交易，"
+        "之後由交易所以最後結算價現金了結）；大台、小台標了當沖，券商 13:30 會強平。",
         "2026/11/09 13:25:00",
     ]
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:
         assert fh.read() == text
+
+
+def test_a_position_file_that_cannot_be_read_after_the_close_points_to_the_night_session():
+    """13:50 才補跑、部位檔又讀不懂：日盤已經收盤，要人做的事是夜盤（規格第 55 條）。
+    讀不懂就不知道今天是不是結算日，兩種都講。"""
+    _damaged("")
+    broker, sent, _ = _run(at=_at("13:50"))
+    assert broker.orders == []
+    assert sent[0].splitlines()[2] == (
+        "PTS 今天可能還有部位：請到券商 APP 確認帳戶。"
+        "日盤 13:45 已經收盤，微台請在夜盤自行平掉（今天如果是結算日，到期的近月已經由交易所"
+        "以最後結算價現金了結，不必平）；大台、小台標了當沖，由券商 13:30 強平。")
 
 
 # --- 部位不確定：不送單，告警（規格第 50 條）---
@@ -293,6 +306,31 @@ def test_an_uncertain_exit_on_file_is_never_sent_again():
         "部位檔記到的部位（不含這一筆）：多單 3 口",
     ]
     assert _file() == content
+
+
+UNCERTAIN_DEADLINES = {
+    "一般日收盤後": (DAY, "13:50", "2026-11-18",
+                "請到券商 APP 確認帳戶，在夜盤自行平掉 PTS 的微台部位（日盤 13:45 已經收盤）。"),
+    "結算日 13:30 前": (date(2026, 11, 18), "13:25", "2026-11-18",
+                    "請到券商 APP 確認帳戶，在 13:30 前自行平掉 PTS 的微台部位：今天是結算日，"
+                    "近月 13:30 停止交易，之後還在的口數由交易所以最後結算價現金了結。"),
+    "結算日 13:30 後": (date(2026, 11, 18), "13:35", "2026-11-18",
+                    "今天是結算日，近月 13:30 已經停止交易，不能再平：PTS 還在的微台部位由交易所"
+                    "以最後結算價現金了結。結算後請到券商 APP 確認帳戶。"),
+}
+
+
+@pytest.mark.parametrize("day, hhmm, last_trading_day, todo", UNCERTAIN_DEADLINES.values(),
+                         ids=UNCERTAIN_DEADLINES.keys())
+def test_an_uncertain_micro_position_is_reported_with_the_deadline_that_applies(
+        day, hhmm, last_trading_day, todo):
+    """「不確定」時要人自己平微台，期限要講對（規格第 41、55 條）：13:45 之後補跑就是夜盤；
+    結算日的近月 13:30 就停止交易，13:30 之後已經不能平，由交易所了結。"""
+    _on_file(day, last_trading_day=last_trading_day, status="UNCERTAIN",
+             uncertain=_uncertain("ENTRY"))
+    broker, sent, _ = _run(at=_at(hhmm, day))
+    assert broker.orders == []
+    assert sent[0].splitlines()[3] == todo
 
 
 def test_an_uncertain_tx_position_is_reported_with_the_brokers_close_in_mind():
@@ -335,7 +373,10 @@ def test_an_exit_order_that_was_not_sent_is_retried_a_minute_later():
 
 def test_after_three_retries_the_lots_still_open_are_reported():
     """13:25 送出、13:26／13:27／13:28 重試三次，全部被拒：還剩 3 口。13:30 之前告警，
-    寫明還剩幾口、要送什麼單，以及最後一次被拒的原因。部位檔沒有任何出場。"""
+    寫明還剩幾口、要送什麼單，以及最後一次被拒的原因。部位檔沒有任何出場。
+
+    部位檔還是「3 口沒平」：使用者自己賣掉之後，出場程式只要再被執行一次（手動、排程補跑），
+    就照檔再賣 3 口，開出反向新倉過夜。告警要把這件事講出來。"""
     content = _on_file()
     broker, sent, time = _run(order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 4
@@ -344,6 +385,7 @@ def test_after_three_retries_the_lots_still_open_are_reported():
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口\n"
         "原因：委託沒有送出去，重試 3 次仍然失敗（最後一次：保證金不足）\n"
         "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。\n"
+        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 3 口再賣出一次，開出反向新倉。\n"
         "2026/11/09 13:28:00",
     ]
     assert _file() == content
@@ -373,6 +415,7 @@ def test_lots_still_open_after_partial_fills_and_three_retries_are_reported():
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 1 口\n"
         "原因：市價 IOC 沒有全部成交，重試 3 次仍有剩餘\n"
         "請自行賣出微台 1 口（TM2611），日盤 13:45 收盤。\n"
+        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 1 口再賣出一次，開出反向新倉。\n"
         "2026/11/09 13:28:00",
     ]
 
@@ -428,23 +471,52 @@ def test_on_the_settlement_day_the_micro_position_is_closed_before_1330():
     assert sent == []
 
 
+def test_on_the_settlement_day_the_alert_gives_1330_as_the_deadline():
+    """結算日 13:28 重試用完。近月 13:30 就停止交易：告警照一般日寫「日盤 13:45 收盤」的話，
+    使用者以為還有 17 分鐘，其實只剩 2 分鐘，13:30 之後 TM2611 就不能交易了。"""
+    _on_file(SETTLEMENT, last_trading_day="2026-11-18")
+    broker, sent, _ = _run(at=_at("13:25", SETTLEMENT),
+                           order_errors=[OrderFailed("保證金不足")] * 4)
+    assert len(broker.orders) == 4
+    assert sent[0].splitlines()[2] == (
+        "請在 13:30 前自行賣出微台 3 口（TM2611）：今天是結算日，近月 13:30 停止交易，"
+        "之後還在的口數由交易所以最後結算價現金了結。")
+
+
+_SETTLED_BY_EXCHANGE = (
+    "TM2611 今天結算，13:30 已經停止交易，不能再平：這 3 口由交易所以最後結算價現金了結，"
+    "不會留到明天。結算後請到券商 APP 確認帳戶裡已經沒有這 3 口。")
+
+
 def test_on_the_settlement_day_after_1330_the_exchange_settles_what_is_left():
-    """結算日 13:30 之後近月已經停止交易，送出去只會被拒；留著的口數由交易所以最後結算價
-    現金了結，不會過夜，也不需要人做什麼。不送單、不告警。"""
+    """結算日 13:30 之後近月已經停止交易，送出去只會被拒，所以不送。PTS 的微台還是沒有平掉
+    （規格第 34、38 條：最後仍有剩餘就告警）：講明還剩幾口、為什麼不必也不能自己平，
+    以及結算後要確認什麼——損益照最後結算價算，和回測有落差。部位檔原封不動。"""
     content = _on_file(SETTLEMENT, last_trading_day="2026-11-18")
-    broker, sent, _ = _run(at=_at("13:35", SETTLEMENT))
+    broker, sent, _ = _run(at=_at("13:35", SETTLEMENT),
+                           login_error=AssertionError("近月停止交易後不該登入"))
     assert broker.orders == []
-    assert sent == []
+    assert sent == [
+        "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口\n"
+        "原因：出場程式 13:35 才執行，今天結算的近月 13:30 已經停止交易，沒有送出平倉單\n"
+        f"{_SETTLED_BY_EXCHANGE}\n"
+        "2026/11/18 13:35:00",
+    ]
     assert _file(SETTLEMENT) == content
 
 
 def test_on_the_settlement_day_retries_stop_at_1330():
-    """13:29 第一次被拒，一分鐘後已經 13:30：近月停止交易，剩下的由交易所結算，不再重試。"""
+    """13:29 第一次被拒，一分鐘後已經 13:30：近月停止交易，不再重試。沒平掉的照樣告警——
+    同一個失敗，13:25 開始的話 13:28 會告警，晚兩分鐘開始就不講，是說不通的。"""
     _on_file(SETTLEMENT, last_trading_day="2026-11-18")
     broker, sent, _ = _run(at=_at("13:29", SETTLEMENT),
                            order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 1
-    assert sent == []
+    assert sent[0].splitlines()[1:4] == [
+        "原因：委託沒有送出去（最後一次：保證金不足），重試到近月 13:30 停止交易仍未完成",
+        _SETTLED_BY_EXCHANGE,
+        "2026/11/18 13:30:00",
+    ]
 
 
 # --- 出場單送出去但不知道成交：絕不重送，用委託序號查（規格第 50 條後半）---
@@ -493,6 +565,37 @@ def test_an_exit_order_not_confirmed_by_the_lookup_is_never_sent_again(answer, s
     assert (_file()["status"], _file()["exits"]) == ("UNCERTAIN", [])
     assert _file()["uncertain"] == {"stage": "EXIT", "order_seq": "2315610000001",
                                     "requested_lots": 3, "known_filled": known}
+
+
+class _Killed(BaseException):
+    """程式在這一刻被關掉（工作管理員、關機、排程逾時）。不是 Exception：程式裡沒有人接得住。"""
+
+
+class _KilledDuringLookup(FakeBroker):
+    """成交查詢至少要 5.5 秒（兩段之間要等）。程式就在查詢途中被關掉。"""
+
+    def query_fills(self, order_seq, trading_day, requested_lots):
+        self.queries.append((order_seq, trading_day, requested_lots))
+        raise _Killed()
+
+
+def test_killed_while_looking_up_an_exit_order_it_is_never_sent_again():
+    """平倉單不確定、正在查，程式被關掉，之後又被叫起來（手動或排程）。重跑時看到的必須是
+    「這筆出場單不確定」——要是部位檔還是「3 口沒平」，它會再送一筆賣 3 口，而前一筆很可能
+    已經成交，多賣的就是反向新倉（規格第 50 條）。所以「不確定」要在查詢**之前**就寫進檔。"""
+    _on_file()
+    first = _KilledDuringLookup(fill_price=45200.0, order_errors=[_SENT_BUT_UNKNOWN])
+    with pytest.raises(_Killed):
+        exit_program.run(first, _config(), notify=RecordingNotifier(),
+                         clock=lambda: _at("13:25"), sleep=lambda seconds: None)
+    assert len(first.orders) == 1
+
+    again, sent, _ = _run(at=_at("13:27"))
+    assert again.orders == []
+    assert sent[0].splitlines()[:2] == [
+        "【要你處理】PTS 委託送出去了，但不知道成交幾口，出場程式不再送單",
+        "不確定的委託：平倉賣出微台 3 口（委託序號 2315610000001），已知至少成交 0 口",
+    ]
 
 
 def test_an_exit_order_without_a_sequence_cannot_be_looked_up():
@@ -545,6 +648,7 @@ def test_with_auto_order_off_a_micro_position_on_file_is_reported_not_closed():
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口\n"
         "原因：自動下單已關閉（order.auto_enabled: false），出場程式不送單\n"
         "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。\n"
+        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 3 口再賣出一次，開出反向新倉。\n"
         "2026/11/09 13:25:00",
     ]
     assert _file() == content
@@ -619,22 +723,30 @@ def test_a_close_that_cannot_be_written_still_closes_everything_and_says_so(monk
     assert _file() == content
 
 
-def test_an_uncertain_exit_that_cannot_be_written_warns_against_running_again(monkeypatch):
+@pytest.mark.parametrize("answer, left", [(FillQuery(lots=None), "0～3"),
+                                          (FillQuery(lots=2, avg_price=45210.0), "0～1")],
+                         ids=["查不到", "查到成交 2 口"])
+def test_an_uncertain_exit_that_cannot_be_written_warns_against_running_again(
+        answer, left, monkeypatch):
     """最危險的一種：平倉單不確定、查不到，而「不確定」這件事也寫不進部位檔。檔裡看起來是
     「3 口還沒平」，再執行一次出場程式就會再送一筆——那筆很可能是反向新倉。兩則告警：
-    不確定那一筆，以及不要重跑。"""
+    不確定那一筆，以及不要重跑。
+
+    第二則是最新的那一則，不能把不確定的平倉講成「確定平倉 0 口、還剩 3 口」：那張單可能
+    已經全部成交，使用者照「還剩 3 口」去賣，就開出 3 口反向新倉。帳上剩幾口是一個範圍。"""
     _on_file()
 
     def denied(src, dst):
         raise PermissionError(13, "存取被拒")
     monkeypatch.setattr(os, "replace", denied)
-    broker, sent, _ = _run(order_errors=[_SENT_BUT_UNKNOWN], fill_queries=[FillQuery(lots=None)])
+    broker, sent, _ = _run(order_errors=[_SENT_BUT_UNKNOWN], fill_queries=[answer])
     assert len(broker.orders) == 1
     assert len(sent) == 2
     assert sent[0].startswith("【要你處理】PTS 委託送出去了，但不知道成交幾口")
     assert sent[1].splitlines()[:3] == [
         "【要你處理】PTS 部位檔沒記到出場程式這次的平倉",
-        "實際：平倉 0 口，還剩多單 3 口；部位檔記的是平倉 0 口",
+        "實際：確定的平倉 0 口，另有一筆平倉賣出微台 3 口不知道成交幾口，"
+        f"帳上還剩多單 {left} 口；部位檔記的是平倉 0 口",
         "部位檔也沒記到那筆不確定的平倉委託（委託序號 2315610000001）",
     ]
     assert _file()["status"] == "CONFIRMED"
@@ -668,3 +780,138 @@ def test_when_the_program_itself_breaks_main_still_raises_the_alarm(tmp_path, mo
     assert webhook == "https://discord.invalid/api/webhooks/1/x"
     assert text.splitlines()[:2] == ["【要你處理】PTS 出場程式意外中止",
                                      "原因：RuntimeError: 意料之外的錯誤"]
+
+
+CRASH_DEADLINES = {
+    "日盤收盤前": ("13:26", [
+        "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。微台要自行平掉（日盤 13:45 "
+        "收盤；今天如果是結算日，到期的近月 13:30 就停止交易，之後由交易所以最後結算價現金"
+        "了結）。大台、小台由券商 13:30 當沖強平。",
+        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把你平掉的口數再平一次，開出反向新倉。",
+    ]),
+    "日盤收盤後": ("13:50", [
+        "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。日盤 13:45 已經收盤，"
+        "微台請在夜盤自行平掉（今天如果是結算日，到期的近月已經由交易所以最後結算價現金"
+        "了結，不必平）。大台、小台由券商 13:30 當沖強平。",
+    ]),
+}
+
+
+@pytest.mark.parametrize("hhmm, todo", CRASH_DEADLINES.values(), ids=CRASH_DEADLINES.keys())
+def test_when_the_program_breaks_the_alarm_gives_the_deadline_that_applies(
+        hhmm, todo, tmp_path, monkeypatch):
+    """出場程式當掉時不知道部位檔裡是什麼，也就不知道今天是不是結算日：兩種期限都講；
+    13:45 之後才當掉，要人做的是夜盤（規格第 41、55 條）。收盤前還要講不要重跑：
+    使用者自己平掉之後再執行一次，它會照部位檔再平一次。"""
+    from notifiers import discord
+
+    _main_env(tmp_path, monkeypatch)
+    crashed_at = _at(hhmm)
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return crashed_at
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("意料之外的錯誤")
+    monkeypatch.setattr(exit_program, "run", broken)
+    monkeypatch.setattr(exit_program, "datetime", _Clock)
+    posted = []
+    monkeypatch.setattr(discord, "send", lambda text, webhook: posted.append(text))
+
+    assert exit_program.main() == 1
+    assert posted[0].splitlines()[2:] == [*todo, f"2026/11/09 {hhmm}:00"]
+
+
+def _main_env(tmp_path, monkeypatch, *, settings_text: str | None = None) -> None:
+    """`main()` 的外部環境：暫存的 `.env`（含 webhook）、設定檔（預設是版控裡那一份）、
+    不寫 log 檔。"""
+    import paths
+
+    env = tmp_path / ".env"
+    env.write_text("CAPITAL_USER_ID=A100000000\nCAPITAL_PASSWORD=pw\n"
+                   "CAPITAL_FUTURES_ACCOUNT=F0000000000\n"
+                   "DISCORD_WEBHOOK_URL=https://discord.invalid/api/webhooks/1/x\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(paths, "env_path", lambda: str(env))
+    if settings_text is not None:
+        config = tmp_path / "settings.yaml"
+        config.write_text(settings_text, encoding="utf-8")
+        monkeypatch.setattr(paths, "config_path", lambda: str(config))
+    monkeypatch.setattr(exit_program, "_setup_logging", lambda today: None)
+
+
+# --- 設定檔寫錯：出場程式不送單，但不能安靜（規格第 43、47 條）---
+
+
+def _settings(*, product="TMF", auto="true", discord="true") -> str:
+    return (f"order:\n  auto_enabled: {auto}\n  product: {product}\n  lots_per_entry: 1\n"
+            f"  max_position: 20\ndiscord:\n  enabled: {discord}\n")
+
+
+def _main_at_1325(monkeypatch) -> tuple[list[str], list[FakeBroker]]:
+    """`main()` 照常建立連線，`run()` 換成 13:25 的劇本（假 broker、假時鐘）。
+    回傳 (Discord 發出的訊息, 用到的假 broker)。"""
+    from notifiers import discord
+
+    real_run = exit_program.run
+    brokers = []
+
+    def scripted(broker, config, *, notify):
+        brokers.append(FakeBroker(fill_price=45200.0,
+                                  login_error=AssertionError("設定有錯不該登入")))
+        return real_run(brokers[-1], config, notify=notify, clock=lambda: _at("13:25"),
+                        sleep=lambda seconds: None)
+    monkeypatch.setattr(exit_program, "run", scripted)
+    posted = []
+    monkeypatch.setattr(discord, "send", lambda text, webhook: posted.append(text))
+    return posted, brokers
+
+
+BROKEN_SETTINGS = {
+    "商品打錯": (_settings(product="TMX"),
+             "order.product 必須是 TX、MTX、TMF 其中之一，目前是 'TMX'"),
+    "YAML 壞掉": (_settings() + "order: [\n", None),
+}
+
+
+@pytest.mark.parametrize("settings_text, error", BROKEN_SETTINGS.values(),
+                         ids=BROKEN_SETTINGS.keys())
+def test_settings_that_cannot_be_read_still_raise_the_alarm_for_the_micro_position(
+        settings_text, error, tmp_path, monkeypatch):
+    """使用者盤中改設定時打錯字（規格第 43 條預期盤中會改）。出場程式讀不懂設定，就不知道
+    自動下單是不是開著，一張單都不送（規格第 47 條：一啟動就擋下來）——但微台沒人平就過夜，
+    所以照樣讀部位檔，告警「部位還在」並講明原因。回 1，排程記錄留下痕跡。"""
+    _main_env(tmp_path, monkeypatch, settings_text=settings_text)
+    content = _on_file()
+    posted, brokers = _main_at_1325(monkeypatch)
+
+    assert exit_program.main() == 1
+    assert brokers[0].orders == []
+    lines = posted[0].splitlines()
+    assert lines[0] == "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口"
+    assert lines[1].startswith("原因：設定檔有錯，出場程式不送單：")
+    if error:
+        assert lines[1].endswith(error)
+    assert lines[2] == "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。"
+    assert _file() == content
+
+
+def test_settings_that_cannot_be_read_without_a_position_stay_quiet(tmp_path, monkeypatch):
+    """沒有部位的日子不發訊息（規格第 39 條）：設定錯了照樣回 1，留在排程記錄與 log。"""
+    _main_env(tmp_path, monkeypatch, settings_text=_settings(product="TMX"))
+    posted, brokers = _main_at_1325(monkeypatch)
+    assert exit_program.main() == 1
+    assert posted == []
+
+
+def test_settings_that_cannot_be_read_but_say_discord_is_off_send_nothing(tmp_path, monkeypatch):
+    """設定檔有錯，但 Discord 開關本身讀得到、寫的是 false：使用者明白關掉了，照樣不發
+    （規格第 45 條）。開關本身讀不到時才當成開著——那時不講，微台就安靜地過夜。"""
+    _main_env(tmp_path, monkeypatch, settings_text=_settings(product="TMX", discord="false"))
+    _on_file()
+    posted, brokers = _main_at_1325(monkeypatch)
+    assert exit_program.main() == 1
+    assert brokers[0].orders == []
+    assert posted == []

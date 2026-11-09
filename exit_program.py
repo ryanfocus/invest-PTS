@@ -16,7 +16,9 @@
     最後結算價了結（規格第 30、35 條）。
 
 任何不確定的情況都不猜，改發 Discord 請使用者處理：部位檔讀不懂、部位不確定、平倉單送出去
-卻不知道成交（查過券商紀錄仍無法確認全部成交）、重試完仍有剩餘、13:45 之後才補跑。
+卻不知道成交（查過券商紀錄仍無法確認全部成交）、重試完仍有剩餘、13:45 之後才補跑、
+結算日 13:30 近月停止交易時還有剩餘、設定檔有錯（`BrokenSettings`）。告警裡要人在幾點前
+做什麼，照的是出場程式自己停止送單的同一個期限（`_deadline`）。
 例行的平倉完成**不發訊息**（規格：只有「有入場」與「需要你動手」才發）。
 
 ## 時間
@@ -29,8 +31,8 @@
 ## 給排程（ticket 10）
 
 **不要設定失敗時自動重跑。** 告警之後使用者可能已經自己平掉剩下的口數；這時再跑一次，
-出場程式照部位檔把那幾口再平一次，就是反向新倉。`main()` 只有在程式本身出錯時回 1，
-告警過的結局也回 0。
+出場程式照部位檔把那幾口再平一次，就是反向新倉（「部位還在」的告警也叫人自己平掉之後
+不要再執行出場程式）。`main()` 只有在程式本身出錯、或設定有錯時回 1，告警過的結局也回 0。
 """
 
 from __future__ import annotations
@@ -81,7 +83,7 @@ class Ending(enum.Enum):
     ALREADY_CLOSED = "部位已經了結"
     LEFT_TO_BROKER = "大台、小台交給券商 13:30 當沖強平"
     CLOSED = "微台平倉完成"
-    SETTLED_BY_EXCHANGE = "結算日 13:30 之後，微台由交易所以最後結算價了結"
+    SETTLED_BY_EXCHANGE = "結算日 13:30 近月停止交易時微台還沒平完，由交易所以最後結算價了結，已告警"
     NOT_CLOSED = "微台平倉沒有完成，已告警"
     EXIT_UNCERTAIN = "平倉委託不確定，不再送單，已告警"
 
@@ -91,7 +93,23 @@ class ExitOutcome:
     ending: Ending
 
 
-def run(broker: Broker, config: settings.Config, *, notify: Callable[[str], bool],
+@dataclass(frozen=True)
+class BrokenSettings:
+    """設定檔（或 `.env`）有錯時，`main()` 交給 `run()` 的東西，代替 `settings.Config`。
+
+    使用者盤中改設定時打錯字（規格第 43 條預期盤中會改），出場程式不能就此不做事：
+    帳上的微台沒人平就過夜，而平常沒有例行訊息能讓人發現。可是設定讀不懂，就不知道自動
+    下單是不是開著——關掉就是不要程式碰下單 API（規格第 42 條）——所以一張單都不送、
+    不登入（規格第 47 條：一啟動就擋下來），其餘照常：讀部位檔，有微台就告警「部位還在」
+    並講明原因。`discord_enabled` 見 `_discord_switch_of_broken_settings`。
+    """
+
+    error: str
+    discord_enabled: bool
+
+
+def run(broker: Broker, config: settings.Config | BrokenSettings, *,
+        notify: Callable[[str], bool],
         clock: Callable[[], datetime] = datetime.now,
         sleep: Callable[[float], None] = time_module.sleep) -> ExitOutcome:
     """13:25 的出場。`notify` 送出一則 Discord（測試換成記錄器），開關在這裡把關。
@@ -116,7 +134,8 @@ def run(broker: Broker, config: settings.Config, *, notify: Callable[[str], bool
         # 讀不懂就不知道帳上有沒有部位、有幾口、是哪個商品：照猜的口數平，平多了就是反向
         # 新倉；當成沒有部位，微台就過夜。檔案原封不動，留給人工處理。
         logger.error("部位檔讀不懂，不送任何單：%s", exc)
-        say(messages.exit_position_file_unreadable(at=now, reason=str(exc)))
+        say(messages.exit_position_file_unreadable(
+            at=now, reason=str(exc), closed=now.time() >= _DAY_SESSION_CLOSE))
         return _end(Ending.POSITION_FILE_UNREADABLE)
     if record is None:
         return _end(Ending.NO_POSITION)
@@ -125,7 +144,7 @@ def run(broker: Broker, config: settings.Config, *, notify: Callable[[str], bool
         # 出場單不確定時更不能再送——它很可能已經成交了（規格第 50 條）。
         # 這一條排在商品前面：大台、小台雖然不送單，不確定一樣要講。
         logger.error("部位檔記著一筆不確定的委託（%s），不送任何單", record.uncertain)
-        say(messages.exit_uncertain(at=now, record=record))
+        say(messages.exit_uncertain(at=now, record=record, closed=now >= _deadline(record)))
         return _end(Ending.UNCERTAIN)
     if not record.open_lots:
         logger.info("部位檔的出場口數已經等於進場口數，部位已經了結")
@@ -146,6 +165,13 @@ def run(broker: Broker, config: settings.Config, *, notify: Callable[[str], bool
         say(messages.exit_not_on_file(at=clock(), record=ledger.record, on_file=ledger.on_file,
                                       reason=ledger.error))
     return _end(ending)
+
+
+def _deadline(record: position_file.PositionRecord) -> datetime:
+    """微台最後能送平倉單的時刻：日盤收盤；結算日是近月停止交易的 13:30。
+    出場程式過了它就不送單，告警也照它決定要人在日盤、夜盤處理，還是交給交易所了結。"""
+    close = _SETTLEMENT_CLOSE if record.settles_today else _DAY_SESSION_CLOSE
+    return datetime.combine(record.trading_day, close)
 
 
 class _Ledger:
@@ -183,8 +209,8 @@ class _ExitUncertain(Exception):
 class _MicroExit:
     """微台的平倉：拆單、重試、不確定時查券商紀錄（規格第 33、34、50 條）。"""
 
-    def __init__(self, broker: Broker, config: settings.Config, ledger: _Ledger, *, today: date,
-                 now: datetime, clock: Callable[[], datetime],
+    def __init__(self, broker: Broker, config: settings.Config | BrokenSettings, ledger: _Ledger,
+                 *, today: date, now: datetime, clock: Callable[[], datetime],
                  sleep: Callable[[float], None], say: Callable[[str], None]):
         self._broker = broker
         self._config = config
@@ -194,10 +220,8 @@ class _MicroExit:
         self._clock = clock
         self._sleep = sleep
         self._say = say
-        settlement_day = ledger.record.last_trading_day == today
-        self._settlement_day = settlement_day
-        self._deadline = datetime.combine(
-            today, _SETTLEMENT_CLOSE if settlement_day else _DAY_SESSION_CLOSE)
+        self._settlement_day = ledger.record.settles_today
+        self._deadline = _deadline(ledger.record)
 
     def run(self) -> Ending:
         """13:25 送出，沒有全部成交就每分鐘再送剩下的，最多重試 3 次。"""
@@ -216,9 +240,10 @@ class _MicroExit:
                 problem = self._send_round()
             except _ExitUncertain as exc:
                 record = self._ledger.record
+                at = self._clock()
                 logger.error("平倉委託不確定（%s），不再送任何單：%s", record.uncertain, exc.lookup)
-                self._say(messages.exit_uncertain(at=self._clock(), record=record,
-                                                  lookup=exc.lookup))
+                self._say(messages.exit_uncertain(at=at, record=record, lookup=exc.lookup,
+                                                  closed=at >= self._deadline))
                 return Ending.EXIT_UNCERTAIN
             rounds += 1
             if not self._ledger.record.open_lots:
@@ -228,23 +253,27 @@ class _MicroExit:
             return self._incomplete(
                 f"委託沒有送出去，重試 {_RETRIES} 次仍然失敗（最後一次：{problem}）" if problem
                 else f"市價 IOC 沒有全部成交，重試 {_RETRIES} 次仍有剩餘")
+        # 過了期限：日盤收盤（之後只能在夜盤平），或結算日近月停止交易（之後由交易所以最後
+        # 結算價現金了結，損益和回測有落差，規格第 35 條）。兩種都還剩口數，都要告警——
+        # 結算日的「交易所會了結」是期交所規則，PTS 還沒有實機樣本，靠人在結算後確認。
         if self._settlement_day:
-            # 近月已經停止交易，還在的口數由交易所以最後結算價現金了結：不會過夜，也沒有人
-            # 能再做什麼，所以不告警。損益會和回測有落差（規格第 35 條），記進 log。
-            logger.warning("結算日 %s 之後近月已停止交易，還剩 %d 口微台由交易所以最後結算價了結",
-                           f"{_SETTLEMENT_CLOSE:%H:%M}", self._ledger.record.open_lots)
-            return Ending.SETTLED_BY_EXCHANGE
+            close = f"近月 {_SETTLEMENT_CLOSE:%H:%M} 停止交易"
+            closed = f"今天結算的近月 {_SETTLEMENT_CLOSE:%H:%M} 已經停止交易"
+        else:
+            close = f"日盤 {_DAY_SESSION_CLOSE:%H:%M} 收盤"
+            closed = f"日盤 {_DAY_SESSION_CLOSE:%H:%M} 已經收盤"
         if rounds:
-            return self._incomplete(
-                (f"委託沒有送出去（最後一次：{problem}），" if problem
-                 else "市價 IOC 沒有全部成交，")
-                + f"重試到日盤 {_DAY_SESSION_CLOSE:%H:%M} 收盤仍未完成", night=True)
-        return self._incomplete(
-            f"出場程式 {self._started:%H:%M} 才執行，日盤 {_DAY_SESSION_CLOSE:%H:%M} 已經收盤，"
-            "沒有送出平倉單", night=True)
+            reason = ((f"委託沒有送出去（最後一次：{problem}），" if problem
+                       else "市價 IOC 沒有全部成交，") + f"重試到{close}仍未完成")
+        else:
+            reason = f"出場程式 {self._started:%H:%M} 才執行，{closed}，沒有送出平倉單"
+        self._incomplete(reason)
+        return Ending.SETTLED_BY_EXCHANGE if self._settlement_day else Ending.NOT_CLOSED
 
     def _blocked(self) -> str:
         """第一次送單之前：有理由完全不送的話，回傳原因（給人看）。"""
+        if isinstance(self._config, BrokenSettings):
+            return f"設定檔有錯，出場程式不送單：{self._config.error}"
         if not self._config.auto_order_enabled:
             # 模擬模式不寫部位檔，所以這是今天進場之後才被關掉的。關掉就是不要程式碰下單 API
             # （規格第 42 條）——連登入都不做。但微台沒人平就過夜，一定要講。
@@ -325,16 +354,22 @@ class _MicroExit:
             raise _ExitUncertain(f"查詢失敗：{found.failure}")
         raise _ExitUncertain("查不到這筆委託的成交")
 
-    def _incomplete(self, reason: str, *, night: bool = False) -> Ending:
-        """還有沒平的口數，而且出場程式不會再送了：告警「部位還在」，寫明還剩幾口。"""
+    def _incomplete(self, reason: str) -> Ending:
+        """還有沒平的口數，而且出場程式不會再送了：告警「部位還在」，寫明還剩幾口。
+
+        要人做什麼看的是**告警這一刻**過了期限沒有：還沒過就請他在期限前自己平；過了就是
+        夜盤（一般日）或交易所了結（結算日）。和出場程式自己停止送單用的是同一個期限。
+        """
         record = self._ledger.record
+        at = self._clock()
         logger.error("微台平倉沒有完成，還剩 %d 口：%s", record.open_lots, reason)
-        self._say(messages.exit_incomplete(at=self._clock(), record=record, reason=reason,
-                                           night=night))
+        self._say(messages.exit_incomplete(at=at, record=record, reason=reason,
+                                           closed=at >= self._deadline))
         return Ending.NOT_CLOSED
 
 
-def _send(config: settings.Config, notify: Callable[[str], bool], text: str) -> None:
+def _send(config: settings.Config | BrokenSettings, notify: Callable[[str], bool],
+          text: str) -> None:
     """發一則 Discord。出場程式裡開關只在這裡把關（規格第 45 條）。"""
     if not config.discord_enabled:
         logger.info("Discord 已關閉，不發送")
@@ -351,15 +386,32 @@ def main() -> int:
     """排程的進入點（ticket 10 建排程）。
 
     **這裡是唯一建立真實 broker 與 Discord 連線的地方**：`run()` 不知道自己拿到的是
-    真的還是假的。告警過的結局也回 0（理由見模組說明「給排程」）；回 1 只代表程式本身
-    出錯——那時也盡量發一則告警，因為微台可能就這樣過夜，而平常沒有例行訊息能讓人發現。
+    真的還是假的。告警過的結局也回 0（理由見模組說明「給排程」）；回 1 代表程式本身
+    出錯，或設定有錯——那時也盡量發一則告警，因為微台可能就這樣過夜，而平常沒有例行訊息
+    能讓人發現。
     """
     from broker.capital import CapitalBroker
     from notifiers import discord
 
     _setup_logging(date.today())
-    config = settings.load()
-    secrets = settings.load_secrets(config)
+    status = 0
+    try:
+        config: settings.Config | BrokenSettings = settings.load()
+        secrets = settings.load_secrets(config)
+    except Exception as exc:  # noqa: BLE001
+        # SettingsError、YAML 語法錯誤、檔案不見都一樣：這次的設定不能用（見 BrokenSettings）
+        error = (str(exc) if isinstance(exc, settings.SettingsError)
+                 else f"{type(exc).__name__}: {exc}")
+        error = " ".join(error.split())          # YAML 的錯誤訊息有好幾行，告警裡只佔一行
+        logger.error("設定有錯，出場程式不送單：%s", error)
+        config = BrokenSettings(error=error, discord_enabled=_discord_switch_of_broken_settings())
+        try:
+            secrets = settings.read_secrets()
+        except settings.SettingsError as missing:
+            logger.error("也讀不到 .env，連告警都發不出去：%s", missing)
+            return 1
+        status = 1
+    # 設定有錯時 broker 不會被用到（不登入），帳密可能是空的
     broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
     webhook = secrets.discord_webhook
     notify = lambda text: discord.send(text, webhook)        # noqa: E731
@@ -367,10 +419,22 @@ def main() -> int:
         run(broker, config, notify=notify)
     except Exception as exc:  # noqa: BLE001
         logger.exception("出場程式意外中止")
-        _send(config, notify, messages.exit_crashed(at=datetime.now(),
-                                                    reason=f"{type(exc).__name__}: {exc}"))
+        now = datetime.now()
+        _send(config, notify, messages.exit_crashed(
+            at=now, reason=f"{type(exc).__name__}: {exc}",
+            closed=now.time() >= _DAY_SESSION_CLOSE))
         return 1
-    return 0
+    return status
+
+
+def _discord_switch_of_broken_settings() -> bool:
+    """設定檔有錯時要不要發 Discord：開關本身讀得到、而且明白寫著 false，才不發（規格第 45 條，
+    使用者自己關掉的）。開關本身也讀不到（YAML 壞掉、鍵名打錯）就當成開著：不發的話，
+    微台就安靜地過夜。"""
+    try:
+        return settings.read_raw()["discord"]["enabled"] is not False
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _setup_logging(today: date) -> None:

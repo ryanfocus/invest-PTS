@@ -212,6 +212,26 @@ def load_secrets(config: Config | None, path: str | None = None) -> Secrets:
     缺的一次列完，不是修好一個才發現還有下一個。
     """
     path = path or paths.env_path()
+    secrets = read_secrets(path)
+
+    required = ["CAPITAL_USER_ID", "CAPITAL_PASSWORD"]
+    if config is not None and config.auto_order_enabled:
+        required.append("CAPITAL_FUTURES_ACCOUNT")
+    if config is not None and config.discord_enabled:
+        required.append("DISCORD_WEBHOOK_URL")
+    missing = [n for n in required if not getattr(secrets, SECRET_NAMES[n])]
+    if missing:
+        raise SettingsError(f"{path} 缺少：{'、'.join(missing)}")
+    return secrets
+
+
+def read_secrets(path: str | None = None) -> Secrets:
+    """`.env` 裡有寫的值，**不檢查缺什麼**（沒寫的是空字串）。檔案不在才拋 SettingsError。
+
+    只給一種情況直接用：設定檔有錯、不知道這次需要哪些值，出場程式仍要拿 webhook 告警。
+    其他地方一律用 `load_secrets`。
+    """
+    path = path or paths.env_path()
     try:
         with open(path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
@@ -226,14 +246,4 @@ def load_secrets(config: Config | None, path: str | None = None) -> Secrets:
         name = name.strip()
         if sep and name in SECRET_NAMES and not name.startswith("#"):
             values[SECRET_NAMES[name]] = value.strip()
-    secrets = Secrets(**values)
-
-    required = ["CAPITAL_USER_ID", "CAPITAL_PASSWORD"]
-    if config is not None and config.auto_order_enabled:
-        required.append("CAPITAL_FUTURES_ACCOUNT")
-    if config is not None and config.discord_enabled:
-        required.append("DISCORD_WEBHOOK_URL")
-    missing = [n for n in required if not getattr(secrets, SECRET_NAMES[n])]
-    if missing:
-        raise SettingsError(f"{path} 缺少：{'、'.join(missing)}")
-    return secrets
+    return Secrets(**values)
