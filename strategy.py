@@ -49,6 +49,11 @@ EARLY_END = time(9, 45)            # 到 09:45（含）；條件 3、4 在這之
 BREAKOUT_BARS = 5                  # 突破進場看最近 5 根 1 分 K 的最高點（空方為最低點）
 ENTRY_CUTOFF = time(13, 20)        # 進場截止：之後不再有任何新進場，盤中程式收工
 
+# 一次判斷直接讀到的最近幾根 1 分 K：突破進場的觸發價看最近 BREAKOUT_BARS 根的高低點，
+# RSI(5) 最近 5 次漲跌要 RSI_PERIOD + 1 根收盤價，紅K、筆差跳增看最後兩根。不是新的常數，
+# 是上面幾個推出來的。盤中流程拿它判斷「缺了成交的 K 棒還會不會被讀到」（報價中斷，規格第 53 條）。
+LOOKBACK_BARS = max(BREAKOUT_BARS, RSI_PERIOD + 1)
+
 LONG = "LONG"
 SHORT = "SHORT"
 

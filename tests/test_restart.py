@@ -13,9 +13,10 @@ import pytest
 
 from broker import MTX_CODE, TMF_CODE
 from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, contracts, counts, minute,
-                        rally, restarted_at, trade, until)
+from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, contracts, counts,
+                        minute, rally, restarted_at, trade, until)
 from recording import RecordingNotifier
+import exit_program
 import intraday
 import position_file
 import settings
@@ -88,6 +89,27 @@ def test_counts_that_piled_up_while_the_program_was_down_are_not_a_bichai_jump(r
         ("觸發：條件 3（追多加碼）", "2026/11/09 08:57:00")]
 
 
+def test_bars_with_trades_missing_before_the_crash_are_still_not_used_after_a_restart():
+    """強勢的早上，條件 1 每分鐘成立。大台成交在 08:50:00 之後斷了 70 秒，08:51:10 才接回來：
+    08:50、08:51 兩根缺了成交（見 test_quote_outage）。08:52:40 當掉，08:53:10 重啟。
+
+    重啟後手上只有原始行情檔，記憶體裡「哪幾根缺了成交」跟著當掉的那一輪一起沒了；從檔裡的
+    成交時間重新認出來，它們還在最近 6 根裡時照樣不判斷——和沒當掉的那一天一樣，08:58:00
+    才又進場（模擬模式，重啟前那一輪的模擬部位不留）。"""
+    morning = (rally("08:45", 5)
+               + [clock(at("08:50:00")), trade(at("08:50:00"), 45150),
+                  counts(at("08:50:20"), buy=20000, sell=21500)]
+               + [clock(at("08:51:00"))]
+               + [trade(at("08:51:10"), 45160), counts(at("08:51:20"), buy=20000, sell=21500),
+                  trade(at("08:51:30"), 45170)]
+               + rally("08:52", 7, open_=45180) + [trade(at("08:59:00"), 45260)])
+    _run(until(morning, at("08:52:40")))
+
+    _, sent, _ = _run(restarted_at(morning, at("08:53:10")))
+
+    assert [m.splitlines()[-1] for m in sent] == ["2026/11/09 08:58:00", "2026/11/09 08:59:00"]
+
+
 # --- 重啟得很快：當掉前一刻剛判斷過的那一根不再判斷一次 ---
 
 
@@ -131,6 +153,66 @@ def test_the_raw_market_file_keeps_each_trade_once_across_a_restart(market_dir):
     rows = (market_dir / "TX-20261109.csv").read_text(encoding="utf-8").splitlines()[1:]
     trades = [r.split(",")[0][11:19] for r in rows if r.split(",")[1]]
     assert trades == [f"08:{m:02d}:{s:02d}" for m in range(45, 57) for s in (0, 30)] + ["08:57:00"]
+
+
+# --- 送出委託、還沒記下成交就當掉（規格第 48、50 條）---
+
+
+class _Killed(BaseException):
+    """盤中程式被硬性中止（被關掉、COM 存取違規）：不是程式裡的例外處理接得住的那種。"""
+
+
+def test_an_order_left_waiting_for_its_fill_by_a_crash_is_uncertain_after_the_restart():
+    """自動下單打開、交易微台，08:50–08:53 每分鐘條件 1 都成立。08:50 送出進場單之後，在等
+    成交回報的那段時間（最長 30 秒）盤中程式被硬性中止，部位檔來不及寫；08:51:10 重啟。
+
+    那張單可能已經成交了，而盤中程式只認自己這一輪的委託序號（規格第 56 條），它的回報重啟後
+    不會再被認領。所以送單**之前**部位檔就要記下「送出去了、還不知道成交」：
+
+      * 重啟後今天不再進場：當成沒送過的話，同一個條件下一分鐘再送一次。告警由重啟後的這一輪
+        發——當掉的那一輪來不及發（規格第 50 條）。
+      * 13:25 出場程式看到「不確定」就不平倉、告警：照部位檔裡的口數平的話，多出來的那一口
+        沒人平，微台就過夜。"""
+    morning = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
+    on = _config(auto_order_enabled=True)
+    with pytest.raises(_Killed):
+        _run(until(morning, at("08:50:40")), config=on, order_errors=[_Killed()])
+
+    second, sent, _ = _run(restarted_at(morning, at("08:51:10")), config=on)
+
+    assert second.orders == []
+    assert sent == [
+        "【要你處理】PTS 委託送出去了，但不知道成交幾口\n"
+        "這次：買進微台 1 口（沒拿到委託序號）\n"
+        "原因：盤中程式送出這筆委託之後、記下成交之前就停了（當掉或被關掉），"
+        "重啟後收不到它的回報\n"
+        "部位檔已記為「不確定」：盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。\n"
+        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平：PTS 今天的微台部位要你自己在 "
+        "13:30 前平掉。\n"
+        "2026/11/09 08:51:10"]
+
+    exit_broker = FakeBroker(fill_price=45200.0)
+    notifier = RecordingNotifier()
+    exit_program.run(exit_broker, on, notify=notifier, clock=lambda: at("13:25:00"),
+                     sleep=lambda seconds: None)
+    assert exit_broker.orders == []
+    assert ("【要你處理】PTS 委託送出去了，但不知道成交幾口，出場程式不再送單"
+            in [m.splitlines()[0] for m in notifier.sent])
+
+
+def test_after_the_restart_that_reported_it_a_further_restart_stays_quiet():
+    """當掉留下的「不確定」，重啟後那一輪已經告警、寫下停止進場記錄。之後再重啟一次（又當掉、
+    或使用者手動重開）：照樣不進場，但不再告警——同一件事講一次就夠。"""
+    morning = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
+    on = _config(auto_order_enabled=True)
+    with pytest.raises(_Killed):
+        _run(until(morning, at("08:50:40")), config=on, order_errors=[_Killed()])
+    _run(until(restarted_at(morning, at("08:51:10")), at("08:51:40")), config=on)
+
+    third, sent, _ = _run(restarted_at(morning, at("08:52:10")), config=on)
+
+    assert third.orders == []
+    assert sent == []
 
 
 # --- 交易商品與口數以部位檔為準（規格第 43、48 條）---

@@ -68,12 +68,13 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
     """委託送出去了，但不知道成交幾口（規格第 41、50 條）：**可能有部位**。
 
     所有告警裡最需要人立刻動手的一則，所以講的是「去做什麼」：先看帳戶，再看誰會了結。
-    大台、小台標了當沖，券商 13:30 照樣強平。微台沒有當沖強平，要人平幾口取決於部位檔：
+    大台、小台標了當沖，券商 13:30 照樣強平。微台沒有當沖強平：部位檔記著「不確定」，出場程式
+    看到它就**整個**不平（規格第 50 條），連部位檔裡確認過的 `held_lots` 口也不平——要人平的是
+    兩者加起來。
 
-      * 已記成「不確定」（`file_error` 是 None）：出場程式看到它就**整個**不平（規格第 50 條），
-        連部位檔裡確認過的 `held_lots` 口也不平——要人平的是兩者加起來。
-      * 寫不進去：檔裡還是之前「已確認」的那一份，出場程式 13:25 照樣平那 `held_lots` 口，
-        要人平的**只有這一筆**。這時叫人全部平掉，出場程式再平一次就是反向新倉過夜。
+    部位檔在送單**之前**就記成「不確定」了（`intraday._Orders.enter`）。`file_error` 不是 None
+    代表之後要補上這一筆的委託序號與已知口數時寫不進去：檔裡還是「不確定」，只是少了序號，
+    出場程式照樣不平倉——序號在這則告警裡，對帳用它。
 
     `known_filled` 是已知**至少**成交的口數：對帳時至少要看到這麼多。
     """
@@ -81,19 +82,14 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
     holding = _HOLDING_TEXT[direction]
     seq = f"委託序號 {order_seq}" if order_seq else "沒拿到委託序號"
     known = f"，已知至少成交 {known_filled} 口" if known_filled else ""
-    if file_error is None:
-        on_file = "部位檔已記為「不確定」：盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。"
-    else:
-        on_file = (f"部位檔寫不進「不確定」（{file_error}），還是之前的樣子："
-                   "出場程式不知道這筆委託。盤中程式今天不再進場。")
+    missing = "" if file_error is None else f"（這筆的委託序號沒寫進去：{file_error}）"
+    on_file = (f"部位檔已記為「不確定」{missing}：盤中程式今天不再進場，"
+               "13:25 的出場程式也不會自動平倉。")
     if product in DAY_TRADE_CODES:
         who_closes = f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
-    elif file_error is None:
+    else:
         held = f"（部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的）" if held_lots else ""
         who_closes = f"{name}沒有當沖強平：PTS 今天的{name}部位{held}要你自己在 13:30 前平掉。"
-    else:
-        held = f"出場程式只會平部位檔裡的{holding} {held_lots} 口，" if held_lots else ""
-        who_closes = f"{name}沒有當沖強平：{held}這筆實際成交的要你自己在 13:30 前平掉。"
     return (
         "【要你處理】PTS 委託送出去了，但不知道成交幾口\n"
         f"這次：{_SIDE_TEXT[direction]}{name} {lots} 口（{seq}）{known}\n"
@@ -124,18 +120,26 @@ def fill_not_on_file(*, at: datetime, product: str, direction: str, lots: int, p
                      order_seq: str, total_lots: int, on_file_lots: int, reason: str) -> str:
     """成交了，部位檔卻寫不進去（規格第 38、41 條：「部位還在」）。盤中程式今天不再進場。
 
-    出場程式只照部位檔平倉，所以要人自己平的**只有沒記到的這幾口**——檔裡的口數照樣會被
-    平掉。兩個數字都寫出來：只說「請平倉」的話，使用者把全部平掉，出場程式 13:25 再平一次
-    檔裡的口數，就是反向新倉。
+    部位檔停在送單**之前**記下的「不確定」（`intraday._Orders.enter`）：出場程式看到它就整個
+    不平倉，連檔裡已確認的口數也不平（規格第 50 條）。所以微台要人自己平的是 PTS 今天**全部**的
+    口數，不只沒記到的這幾口——只叫人平這幾口的話，檔裡那幾口沒人平，帶著過夜。帳上與檔裡的
+    兩個數字都寫出來，對帳時才知道差在哪裡。大台、小台標了當沖，券商 13:30 照樣強平。
     """
+    name = _PRODUCT_TEXT[product]
+    if product in DAY_TRADE_CODES:
+        who_closes = f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
+    else:
+        who_closes = (f"{name}沒有當沖強平：PTS 今天的{name}部位共 {total_lots} 口"
+                      "要你自己在 13:30 前平掉。")
     return (
         "【要你處理】PTS 部位還在，部位檔卻沒記到這次成交\n"
-        f"這次：{_SIDE_TEXT[direction]}{_PRODUCT_TEXT[product]} {lots} 口 @ {_points(price)}"
+        f"這次：{_SIDE_TEXT[direction]}{name} {lots} 口 @ {_points(price)}"
         f"（委託序號 {order_seq}）\n"
-        f"帳上 PTS 共{_HOLDING_TEXT[direction]} {total_lots} 口，部位檔只記到 {on_file_lots} 口\n"
+        f"帳上 PTS 共{_HOLDING_TEXT[direction]} {total_lots} 口，部位檔只記到 {on_file_lots} 口，"
+        "而且停在送單前記下的「不確定」\n"
         f"原因：{reason}\n"
-        f"出場程式和盤中程式都只認部位檔，不知道這 {lots} 口：請到券商 APP 確認帳戶，"
-        f"自行平掉這 {lots} 口。盤中程式今天不再進場。\n"
+        "13:25 的出場程式看到「不確定」不會自動平倉，盤中程式今天不再進場。"
+        f"請到券商 APP 確認帳戶。{who_closes}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 

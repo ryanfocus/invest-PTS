@@ -21,7 +21,8 @@ from broker.fake import FakeBroker
 from day_script import (DAY, PREVIOUS_DAY, at, calm_history, rally, restarted_at, trade,
                         until)
 from recording import RecordingNotifier
-from test_live_orders import CONTRACTS, _config, _file, _locked, _on_file, _run
+from test_live_orders import (_MARKER, CONTRACTS, _config, _file, _locked_once_sent, _on_file,
+                              _run)
 import intraday
 import paths
 import position_file
@@ -194,36 +195,36 @@ def test_on_the_micro_the_alert_counts_the_confirmed_lots_the_user_must_also_clo
     assert _file()["status"] == "UNCERTAIN"
 
 
-def test_when_the_uncertain_state_cannot_be_written_the_alert_says_the_file_is_still_old(
+def test_when_the_order_seq_cannot_be_written_the_file_still_says_uncertain_from_before_sending(
         monkeypatch):
-    """不確定的那一筆要寫進部位檔時，檔案被鎖住。部位檔還是之前的樣子：已確認的微台
-    多單 2 口，狀態「已確認」——13:25 出場程式照樣會平那 2 口，只是不知道這一筆。所以這則
-    要人自己平的**只有這筆實際成交的**；叫人把 PTS 的微台部位全部平掉的話，出場程式再賣
-    2 口，就是空單 2 口帶過夜。今天照樣不再進場，盤中程式也不因此中止。"""
+    """不確定的那一筆要寫進部位檔時（委託序號、已知口數），檔案被鎖住。部位檔停在送單前記下的
+    「不確定」（已確認的微台多單 2 口，加上這一筆、還沒有序號）：13:25 出場程式照樣不會自動平倉，
+    所以這則要人自己平的是 PTS 今天**全部**的微台部位，和寫進去的時候一樣。委託序號告警裡有，
+    對帳用它。今天照樣不再進場，盤中程式也不因此中止。"""
     content = _on_file(product="TM0000AM", order_code="TM2611")
-    _locked(monkeypatch)
+    _locked_once_sent(monkeypatch)
     broker, sent = _run(_all_morning(), order_errors=[
         FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
 
     assert len(broker.orders) == 1
-    assert _file() == content
+    assert _file() == dict(content, status="UNCERTAIN", uncertain=_MARKER)
     assert len(sent) == 1
     assert sent[0].splitlines()[3:5] == [
-        "部位檔寫不進「不確定」（PermissionError: [Errno 13] 存取被拒），還是之前的樣子："
-        "出場程式不知道這筆委託。盤中程式今天不再進場。",
-        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平：出場程式只會平部位檔裡的"
-        "多單 2 口，這筆實際成交的要你自己在 13:30 前平掉。",
+        "部位檔已記為「不確定」（這筆的委託序號沒寫進去：PermissionError: [Errno 13] 存取被拒）："
+        "盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。",
+        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平：PTS 今天的微台部位"
+        "（部位檔已確認的多單 2 口，加上這筆實際成交的）要你自己在 13:30 前平掉。",
     ]
 
 
 def test_when_the_uncertain_state_cannot_be_written_a_restart_still_enters_nothing(
         monkeypatch):
-    """不確定的那一筆寫不進部位檔，檔裡還是已確認的 2 口；之後盤中程式重啟。光看部位檔，
-    今天什麼事都沒發生——但帳上可能已經多了這一筆、口數不知道，告警也說了今天不再進場。
-    重啟後照常加碼的話，部位不虧和加碼上限都在少算的口數上判斷。"""
+    """不確定的那一筆的委託序號寫不進部位檔，檔裡是已確認的 2 口與送單前記下的「不確定」；之後
+    盤中程式重啟。帳上可能已經多了這一筆、口數不知道，告警也說了今天不再進場：重啟後照常加碼
+    的話，部位不虧和加碼上限都在少算的口數上判斷。告警當時發過了，重啟不再發。"""
     content = _on_file(product="TM0000AM", order_code="TM2611")
     replace = os.replace
-    _locked(monkeypatch)
+    _locked_once_sent(monkeypatch)
     _run(until(_all_morning(), at("08:50:40")), order_errors=[
         FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
     # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
@@ -233,19 +234,21 @@ def test_when_the_uncertain_state_cannot_be_written_a_restart_still_enters_nothi
 
     assert broker.orders == []
     assert sent == []
-    assert _file() == content
+    assert _file() == dict(content, status="UNCERTAIN", uncertain=_MARKER)
 
 
-def test_when_the_first_order_is_uncertain_and_cannot_be_written_no_position_file_is_left(
+def test_when_the_first_order_is_uncertain_and_cannot_be_written_the_file_still_says_uncertain(
         monkeypatch):
-    """今天第一筆就不確定、又寫不進去：沒有部位檔，出場程式什麼都不會平。"""
-    _locked(monkeypatch)
+    """今天第一筆就不確定、序號又寫不進去：部位檔是送單前記下的「不確定」、還沒有成交。出場程式
+    看到它不平倉、會告警；這筆要人自己平。"""
+    _locked_once_sent(monkeypatch)
     outcome, sent = _run_outcome(_all_morning(), order_errors=[FillUnknown("回報斷了")])
 
     assert outcome.ending is intraday.Ending.STREAM_ENDED
-    assert not os.path.exists(position_file.path_for(DAY))
+    assert _file()["status"] == "UNCERTAIN"
+    assert _file()["entries"] == []
     assert sent[0].splitlines()[4] == ("請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平："
-                                       "這筆實際成交的要你自己在 13:30 前平掉。")
+                                       "PTS 今天的微台部位要你自己在 13:30 前平掉。")
 
 
 # --- 三種處境，三種固定的說法（規格第 41 條）---
@@ -264,7 +267,7 @@ def test_each_situation_is_told_by_its_own_fixed_wording_and_never_the_others(
     完全不同。所以每一則的標題帶著自己的說法，全文也不會出現另外兩種的說法。"""
     options = dict(SITUATIONS[phrase])
     if options.pop("locked", False):
-        _locked(monkeypatch)
+        _locked_once_sent(monkeypatch)
     _, sent = _run(_all_morning(), **options)
 
     assert len(sent) == 1

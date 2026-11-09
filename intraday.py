@@ -17,24 +17,32 @@
 分界線是「單有沒有送出去」（規格第 41、50、51 條）。不管哪一種，**今天都不再進場**，
 發一則告警，盤中程式照樣跑到 13:20（原始行情繼續記）：
 
-  * **委託沒有送出去**（`OrderFailed`：被拒、憑證、回報連線斷了）：確定沒有部位，部位檔
-    不動。不再進場是因為同一個原因下一分鐘還在，否則每分鐘都會再被拒、再告警一次。
+  * **委託沒有送出去**（`OrderFailed`：被拒、憑證、回報連線斷了，或送單前部位檔就寫不進去）：
+    確定沒有部位，部位檔維持送單前的樣子。不再進場是因為同一個原因下一分鐘還在，否則每分鐘
+    都會再被拒、再告警一次。
   * **委託送出去了，但不知道成交幾口**（`FillUnknown`，以及送單時任何其他意外——這裡分不出
-    單出去了沒有，分不清就是可能有部位）：部位檔改成「不確定」，出場程式看到就不自動平倉。
+    單出去了沒有，分不清就是可能有部位）：部位檔是「不確定」，出場程式看到就不自動平倉。
   * **部位還在**，部位檔卻沒記到（ticket 06 的 `_FillNotOnFile`）。
 
 三則告警用固定的說法開頭，使用者一眼分得出是哪一種（`messages`）。
 
+**每一筆進場單送出之前，部位檔先記成「不確定」**（`_Orders.enter`，ticket 09）：送出去之後、
+成交寫進部位檔之前盤中程式被硬性中止的話，重啟後的盤中程式與 13:25 的出場程式都看得到「今天
+有一筆送出去、不知道成交的單」。所以成交或「不確定」的細節寫不進去時，檔裡也不會是送單前那份
+「已確認」，出場程式不會照少算的口數平倉。
+
 「今天不再進場」寫成檔（停止進場記錄，`stop_path`），告警之前先寫：盤中程式當掉被重啟
 （規格第 48 條）之後看到它，照樣不進場、不再告警。只放在記憶體的話，被拒的單會在重啟後
-再送一次、再告警一次；「不確定」或成交寫不進部位檔時，重啟後部位檔看不出今天出過事。
+再送一次、再告警一次。部位檔記著「不確定」卻沒有停止進場記錄，就是送單的那一輪來不及告警：
+重啟後的這一輪替它告警（`_Trading.announce`）。
 
 ## 可靠度（ticket 09）
 
-  * **心跳記錄**（`_Pulse`、`heartbeat`）：每分鐘寫一次，13:20 收工時寫「收工了」。13:25 的
-    出場程式靠它發現盤中程式今天沒跑、或半路停了（規格第 54 條）。
+  * **心跳記錄**（`_Pulse`、`heartbeat`）：每分鐘寫一次，13:20 收工時寫「收工了」（這一輪在
+    13:20 之前活過才寫）。13:25 的出場程式靠它發現盤中程式今天沒跑、或半路停了（規格第 54 條）。
   * **報價中斷**（`_QuoteWatch`，規格第 53 條）：中斷期間本來就不會進場（K 棒要等成交才結束，
-    盯價只看即時成交）；中間斷過、缺了成交的那一根也不判斷；連續 3 分鐘發一則告警。
+    盯價只看即時成交）；斷線前後缺了成交的 K 棒還在一次判斷會讀到的最近幾根裡時也不判斷
+    （`_missing_bars`）；筆數停住過的筆差是不知道（`indicators._close`）；連續 3 分鐘發一則告警。
   * **盤中重啟**（`_Restored`，規格第 48 條）：部位、停止進場記錄照舊從檔案讀；今天已經過去的
     1 分 K 與每根的筆差從原始行情檔讀回，群益回補的成交裡重啟前就處理過的不再處理。
     當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
@@ -107,7 +115,7 @@ _MAX_LAG = timedelta(seconds=30)
 _OUTAGE_ALERT = timedelta(minutes=3)
 
 # 大台日盤每秒都有好幾筆成交。相鄰兩筆隔得比這還久，中間就是報價斷了，不是沒有人交易：
-# 那一根 K 棒缺了成交（收盤價、高低點都可能不對），不拿它判斷。
+# 斷掉的那一段碰到的 K 棒缺了成交（開高低收都可能不對），見 `_missing_bars`。
 _TRADE_GAP = timedelta(seconds=30)
 
 # 往前找幾個交易日的 1 分 K 當暖身與昨收。日曆認得國定假日，認不得颱風假這類臨時休市
@@ -174,7 +182,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         logger.error("部位檔讀不懂，今天不進場：%s", exc)
         _send(config, notify, messages.position_file_unreadable(day=today, reason=str(exc)))
         # 這是盤中程式自己下的結論，不是當掉：出場程式不必再講一次「盤中程式沒有跑」
-        pulse.finish(None)
+        pulse.gave_up()
         return SessionOutcome(Ending.POSITION_FILE_UNREADABLE)
     product = config.product if record is None else record.product
     if record is not None and product != config.product:
@@ -205,7 +213,8 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     other_day: date | None = None   # 收過哪一個別的交易日的大台成交
     local_now: datetime | None = None   # 最新的本機時鐘（見模組說明「時間」）
     last_trade = restored.last_trade    # 上一筆今天日盤的大台成交（交易所時間）
-    gappy: datetime | None = None       # 中間報價斷過、缺了成交的那一根（起始分鐘）
+    # 報價斷過、缺了成交的 K 棒（起始分鐘），重啟前那一輪遇到的也算
+    incomplete: set[datetime] = set(restored.incomplete)
 
     def _live(t: datetime) -> bool:
         """時間 `t` 的成交是不是即時收到的（見模組說明「時間」）。"""
@@ -229,10 +238,14 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         elif not _live(now):
             logger.info("1 分 K %s 結束於 %s，本機已經 %s（回補的舊成交或報價延遲），不判斷",
                         f"{closed.bar.start:%H:%M}", f"{now:%H:%M:%S}", f"{local_now:%H:%M:%S}")
-        elif closed.bar.start == gappy:
-            # 報價中斷期間不進場（規格第 53 條）：這一根的收盤價、高低點來自中斷之前，
-            # 拿它判斷就是在中斷期間的資料上進場。
-            logger.info("1 分 K %s 中間報價斷過、缺了成交，不判斷", f"{closed.bar.start:%H:%M}")
+        elif missing := [b.bar.start for b in bars[-strategy.LOOKBACK_BARS:]
+                         if b.bar.start in incomplete]:
+            # 報價中斷期間不進場（規格第 53 條）：缺了成交的 K 棒開高低收都不可靠。一次判斷
+            # 讀到的不只最後一根（紅K、筆差跳增看兩根，RSI、突破的觸發價看最近幾根），所以它
+            # 還在 `LOOKBACK_BARS` 裡就不判斷。再往前的只剩 RSI 的平滑還帶著一點，每根衰減 1/5。
+            logger.info("1 分 K %s 不判斷：最近 %d 根裡 %s 那根報價斷過、缺了成交",
+                        f"{closed.bar.start:%H:%M}", strategy.LOOKBACK_BARS,
+                        "、".join(f"{m:%H:%M}" for m in missing))
         else:
             trading.on_bar(bars, now)
 
@@ -246,6 +259,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 continue
             if isinstance(event, TxTrade) and restored.covers(event):
                 continue    # 重啟前那一輪就收過、記過、組進 K 棒了
+            trading.announce(event.time)
             if isinstance(event, Clock):
                 local_now = event.time
             if event.time >= end_at:
@@ -275,12 +289,13 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                     # 同一個商品就出現「觸發在 45180、成交在 45175」這種不可能的結果。
                     trading.product_price = event.price
                 if indicators.in_day_session(event.time):
-                    if (last_trade is not None and event.time - last_trade > _TRADE_GAP
-                            and state.forming is not None):
-                        gappy = state.forming.start
+                    missing = (set() if last_trade is None
+                               else _missing_bars(last_trade, event.time))
+                    if missing:
+                        incomplete |= missing
                         logger.warning("大台成交從 %s 到 %s 之間斷了，%s 那根缺了成交",
                                        f"{last_trade:%H:%M:%S}", f"{event.time:%H:%M:%S}",
-                                       f"{gappy:%H:%M}")
+                                       "、".join(f"{m:%H:%M}" for m in sorted(missing)))
                     last_trade = event.time if last_trade is None else max(last_trade,
                                                                            event.time)
                 state, closed = indicators.add_trade(state, event)
@@ -341,6 +356,13 @@ class _Restored:
         # 原始行情檔要收到今天日盤的成交才會建（`RawMarketWriter.confirm`）
         self.confirmed = bool(in_session)
         self.last_trade = max(in_session) if in_session else None
+        # 重啟前那一輪遇過的報價中斷：缺了成交的 K 棒還在最近幾根裡時，重啟後照樣不判斷
+        self.incomplete: set[datetime] = set()
+        previous = None
+        for t in in_session:
+            if previous is not None:
+                self.incomplete |= _missing_bars(previous, t)
+            previous = t if previous is None else max(previous, t)
         self._last = max(trades) if trades else None
         self._left = trades.count(self._last)        # 同一秒可能有好幾筆
         if events:
@@ -361,6 +383,21 @@ class _Restored:
                 return False
             self._left -= 1
         return True
+
+
+def _missing_bars(previous: datetime, t: datetime) -> set[datetime]:
+    """相鄰兩筆今天日盤的大台成交 `previous` → `t`：中間斷了的話，缺了成交的 K 棒（起始分鐘）。
+
+    斷掉的那一段碰到的每一分鐘都缺了成交。整分鐘都在斷線裡的根本沒有 K 棒；有 K 棒的是兩頭：
+    斷之前那一根少了後段（收盤價、高低點），接回來那一根少了前段——它的開盤價其實是斷線後
+    第一筆的價格，而紅K 就是拿開盤價比（規格第 6 條）。接回來那一筆正好在整分鐘上的話，
+    那一根什麼都沒少。
+    """
+    if t - previous <= _TRADE_GAP:
+        return set()
+    before = previous.replace(second=0, microsecond=0)
+    after = t.replace(second=0, microsecond=0)
+    return {before, after} if t > after else {before}
 
 
 def _log_bar(closed: indicators.ClosedBar, rsi: float | None) -> None:
@@ -447,8 +484,8 @@ _ENTRY_SIDE = {strategy.LONG: BUY, strategy.SHORT: SELL}
 
 
 class _FillNotOnFile(Exception):
-    """單已經成交，部位檔卻寫不進去。`record` 是含這一筆的**真實**部位，`on_file` 是檔裡
-    還留著的那一份（還沒有檔就是 None）。"""
+    """單已經成交，部位檔卻寫不進去。`record` 是含這一筆的**真實**部位，`on_file` 是送單前
+    那一份（還沒有檔就是 None）：檔裡是它的成交，加上送單前記下的「不確定」。"""
 
     def __init__(self, fill: position_file.Fill, record: position_file.PositionRecord,
                  on_file: position_file.PositionRecord | None, cause: Exception):
@@ -461,8 +498,8 @@ class _FillNotOnFile(Exception):
 class _Uncertain(Exception):
     """進場單送出去了，卻不知道成交幾口。訊息是不確定的原因。
 
-    `file_error` 是 None 代表部位檔已經記成「不確定」；否則是寫不進去的原因，
-    部位檔還是之前那一份（還沒有檔就是沒有）。
+    `file_error` 是 None 代表部位檔記下了這一筆的序號與已知口數；否則是寫不進去的原因，
+    部位檔還是送單前記下的「不確定」（少了序號）——出場程式照樣不自動平倉。
     """
 
     def __init__(self, *, order_seq: str, requested_lots: int, known_filled: int, reason: str,
@@ -491,18 +528,29 @@ class _Orders:
     def enter(self, direction: str, lots: int) -> position_file.Fill | None:
         """送出進場單，回傳**實際**成交（規格第 29 條）。0 口（當下沒有對手價）是 None。
 
+        **送單之前，部位檔先記成「不確定」**（`_mark_sending`）：送出去之後、成交寫進部位檔之前
+        （等成交回報最長 30 秒），盤中程式可能被硬性中止。那時沒有任何紀錄的話，重啟後這張單
+        等於沒送過——同一個條件再送一次；它的回報也不會再被認領（只認自己的委託序號，規格第 56 條），
+        13:25 出場程式照舊的口數平倉，多出來的那幾口過夜。先記成「不確定」，最壞的情況就是
+        規格第 50 條：當天不再進場，出場程式不自動平倉、告警。寫不進去就不送（`OrderFailed`）。
+        確定沒有部位的結局（被拒、0 口）再改回送單前的樣子。
+
         出事的時候拋三種例外之一，分界線是「單有沒有送出去、成交有沒有記到」：
 
-          * `OrderFailed`：委託沒有送出去，確定沒有部位。部位檔不動。
+          * `OrderFailed`：委託沒有送出去，確定沒有部位。部位檔改回送單前的樣子。
           * `_Uncertain`：送出去了，但不知道成交幾口（`FillUnknown`，或送單時任何其他意外）。
-            部位檔已經改成「不確定」——寫不進去的話，原因在 `file_error`。
-          * `_FillNotOnFile`：成交了卻寫不進部位檔；`self.record` 維持檔裡那一份。
+            部位檔記著這一筆的委託序號與已知口數——寫不進去的話（原因在 `file_error`），
+            還是送單前記下的「不確定」。
+          * `_FillNotOnFile`：成交了卻寫不進部位檔；檔裡還是送單前記下的「不確定」，
+            `self.record` 維持送單前那一份。
         """
         request = OrderRequest(contract=self._contract, side=_ENTRY_SIDE[direction], lots=lots,
                                trading_day=self._today)
+        self._mark_sending(direction, lots)
         try:
             result = self._broker.place_order(request)
         except OrderFailed:
+            self._unmark()
             raise
         except FillUnknown as exc:
             raise self._uncertain(direction, lots, exc.order_seq, exc.known_filled,
@@ -516,6 +564,7 @@ class _Orders:
         if not result.filled_lots:
             logger.warning("委託 %s 沒有成交（市價 IOC 當下沒有對手價），部位不變",
                            result.order_seq)
+            self._unmark()
             return None
         fill = position_file.Fill(result.order_seq, result.filled_lots, result.avg_price)
         record = self._current(direction)
@@ -531,6 +580,35 @@ class _Orders:
             raise _FillNotOnFile(fill, record, self.record, exc) from exc
         self.record = record
         return fill
+
+    def _mark_sending(self, direction: str, lots: int) -> None:
+        """送單前把部位檔記成「不確定」：這一筆還沒有序號、已知成交 0 口。寫不進去就不送。"""
+        marker = replace(self._current(direction), status=position_file.UNCERTAIN,
+                         uncertain=position_file.UncertainOrder(
+                             stage=position_file.ENTRY, order_seq="", requested_lots=lots,
+                             known_filled=0))
+        try:
+            position_file.write(marker)
+        except Exception as exc:  # noqa: BLE001
+            # 送出去之後當掉的話沒人知道帳上多了這筆：寧可這一次不送。部位檔還是之前那一份，
+            # 確定沒有部位——和被拒同一種處境，今天不再進場（下一分鐘多半也寫不進去）。
+            raise OrderFailed(f"送單前部位檔寫不進去，沒有送出委託"
+                              f"（{type(exc).__name__}: {exc}）") from exc
+
+    def _unmark(self) -> None:
+        """確定沒有多出部位（被拒、0 口）：部位檔改回送單前的樣子——今天第一筆的話，就是沒有檔。
+
+        改不回去的話，檔裡留著「不確定」：出場程式不會自動平倉、會告警，盤中程式重啟後也不再
+        進場。多打擾一次，但不會平錯。
+        """
+        try:
+            if self.record is None:
+                os.remove(position_file.path_for(self._today))
+            else:
+                position_file.write(self.record)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("部位檔改不回送單前的樣子，留著「不確定」（13:25 出場程式不會自動平倉）："
+                         "%s: %s", type(exc).__name__, exc)
 
     def _current(self, direction: str) -> position_file.PositionRecord:
         """今天的部位檔內容；還沒有檔的話，用這次要下單的合約與方向開一份空的。"""
@@ -561,8 +639,8 @@ class _Orders:
             position_file.write(record)
         except Exception as exc:  # noqa: BLE001
             # 寫不進去（檔案被鎖、磁碟滿），或 broker 給的數字組不成一筆記錄：部位檔還是
-            # 之前那一份，出場程式照它平倉。冒出 `run()` 的話程式帶著 traceback 結束，
-            # 一則告警都沒有；所以照樣告警，講清楚檔裡還是舊的。
+            # 送單前記下的「不確定」，只是少了序號。冒出 `run()` 的話程式帶著 traceback 結束，
+            # 一則告警都沒有；所以照樣告警，序號寫在告警裡。
             return uncertain(f"{type(exc).__name__}: {exc}")
         self.record = record
         return uncertain(None)
@@ -600,8 +678,13 @@ class _Trading:
         # （`_fill_unknown`）；委託被拒（`_not_sent`）、成交寫不進部位檔（`_not_on_file`）
         # 時也打開。打開時寫下停止進場記錄（`_stop`），重啟後照樣不進場。
         self._stopped = record is not None and record.status == position_file.UNCERTAIN
+        # 部位檔記著一筆不確定的進場單，卻沒有停止進場記錄：送出那筆委託的那一輪在告警之前就停了
+        # （送單前記下「不確定」之後被硬性中止，`_Orders.enter`）。這一輪替它告警（`announce`）。
+        self._unannounced: position_file.PositionRecord | None = None
         if self._stopped:
             logger.warning("部位檔記著一筆不確定的委託（%s），今天不再進場", record.uncertain)
+            if record.uncertain.stage == position_file.ENTRY and _read_stop(today) is None:
+                self._unannounced = record
         else:
             earlier = _read_stop(today)
             if earlier is not None:
@@ -611,6 +694,24 @@ class _Trading:
         self.product_price: float | None = None
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
         self.breakout: strategy.Breakout | None = None
+
+    def announce(self, now: datetime) -> None:
+        """重啟前那一輪送出進場單之後、告警之前就停了：替它發「委託送出去了，但…」的告警
+        （規格第 50 條），並寫下停止進場記錄——之後再重啟就不再講一次。`now` 是這一輪的
+        第一個事件（啟動時還沒有任何時間，見模組說明「時間」）。"""
+        record, self._unannounced = self._unannounced, None
+        if record is None:
+            return
+        u = record.uncertain
+        why = ("盤中程式送出這筆委託之後、記下成交之前就停了（當掉或被關掉），"
+               "重啟後收不到它的回報")
+        self._stop(now, f"委託 {u.order_seq or '（沒有序號）'} 送出去了，但不知道成交幾口：{why}")
+        logger.error("今天稍早送出的委託 %s（%d 口）不知道成交幾口，送出它的那一輪沒來得及告警",
+                     u.order_seq or "（沒有序號）", u.requested_lots)
+        self._send(messages.fill_unknown(
+            at=now, product=record.product, direction=record.direction, lots=u.requested_lots,
+            order_seq=u.order_seq, known_filled=u.known_filled, reason=why,
+            held_lots=record.entered_lots, file_error=None))
 
     def rsi(self, today: list[indicators.ClosedBar]) -> float | None:
         if self._history is None:
@@ -747,8 +848,7 @@ class _Trading:
         不再進場，是因為帳上的口數從這一刻起不知道：部位不虧、加碼上限都算不了
         （規格第 50 條）。盤中程式照樣跑到收工，原始行情繼續記。
 
-        「不確定」寫不進部位檔時，重啟後光看部位檔看不出今天出過事——停止進場記錄就是為了
-        這種時候。
+        停止進場記錄寫在告警之前：重啟後看到它，就知道這一則已經發過（`announce` 不再發）。
         """
         self._stop(now, f"委託 {exc.order_seq or '（沒有序號）'} 送出去了，"
                         f"但不知道成交幾口：{exc}")
@@ -758,7 +858,8 @@ class _Trading:
         if exc.file_error is None:
             logger.error("部位檔已記為不確定")
         else:
-            logger.error("部位檔寫不進「不確定」，還是之前的樣子：%s", exc.file_error)
+            logger.error("這筆的序號寫不進部位檔，檔裡是送單前記下的「不確定」：%s",
+                         exc.file_error)
         self._send(messages.fill_unknown(
             at=now, product=self._product, direction=decision.direction,
             lots=exc.requested_lots, order_seq=exc.order_seq, known_filled=exc.known_filled,
@@ -768,9 +869,9 @@ class _Trading:
     def _not_on_file(self, exc: _FillNotOnFile, now: datetime) -> None:
         """成交了、部位檔卻沒記到：告警（「部位還在」），今天不再進場。
 
-        不再進場，是因為從這一刻起部位檔和帳上對不上：再成交的口數寫進去，出場程式也只會
-        平檔裡那些，要人自己平的口數越滾越多；告警裡講好的「自行平掉這幾口」也不再準。
-        盤中程式照樣跑到收工，原始行情繼續記。重啟後部位檔裡沒有這一筆，所以靠停止進場記錄。
+        不再進場，是因為從這一刻起部位檔和帳上對不上：再成交下去，告警裡講好要人自己平的
+        口數就不再準。部位檔停在送單前記下的「不確定」，出場程式不會自動平倉。盤中程式照樣跑到
+        收工，原始行情繼續記。停止進場記錄寫在告警之前，重啟後就知道這一則已經發過。
         """
         record, fill = exc.record, exc.fill
         self._stop(now, f"成交 {fill.lots} 口（委託 {fill.order_seq}）寫不進部位檔：{exc}")
@@ -892,10 +993,24 @@ class _Pulse:
             self._minute = minute
             self._write(now, finished=False)
 
-    def finish(self, now: datetime | None) -> None:
-        """盤中程式自己下了結論（13:20 收工、臨時休市、部位檔讀不懂）。`now` 是 None 代表
-        那時還沒有任何事件（還沒登入就結束了）。"""
+    def finish(self, now: datetime) -> None:
+        """13:20 收工（臨時休市那天也是這時下結論）。
+
+        **這一輪在 13:20 之前活過，才寫「收工了」。** 排程補跑或失敗重啟時，一起來就過了進場
+        截止的那一輪什麼都沒判斷過：寫「收工了」的話，蓋掉的是前一輪留下的「幾點之後沒有再跑」
+        （或今天根本沒有心跳），一整個交易時段沒人判斷進場，出場程式卻什麼都不講（規格第 54 條）。
+        這時心跳記錄原封不動。
+        """
+        if self._minute is None:
+            logger.warning("這一輪 %s 才起來，已經過了進場截止，什麼都沒判斷：心跳記錄不寫「收工了」",
+                           f"{now:%H:%M:%S}")
+            return
         self._write(now, finished=True)
+
+    def gave_up(self) -> None:
+        """還沒登入就自己下了結論、今天不進場（部位檔讀不懂）。那時還沒有任何事件。
+        不是當掉：出場程式不必再講一次「盤中程式沒有跑」。"""
+        self._write(None, finished=True)
 
     def _write(self, now: datetime | None, *, finished: bool) -> None:
         try:

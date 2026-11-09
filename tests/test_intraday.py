@@ -140,7 +140,8 @@ def _bichai(outcome: intraday.SessionOutcome) -> list[tuple]:
 
 
 def test_each_bar_records_the_bichai_as_of_its_end():
-    """筆差 = 成交賣出筆數 − 成交買進筆數，取 K 棒結束那一刻最新的累計值（規格第 1、7 條）。"""
+    """筆差 = 成交賣出筆數 − 成交買進筆數，取 K 棒結束那一刻最新的累計值（規格第 1、7 條）。
+    每一根都取它結束前最後收到的那一次（這裡兩根都在 :50），之前收到的被蓋掉。"""
     outcome = _run(FakeBroker(events=[
         counts(at("08:44:50"), buy=100, sell=100),
         trade(at("08:45:00"), 45000),
@@ -148,7 +149,7 @@ def test_each_bar_records_the_bichai_as_of_its_end():
         trade(at("08:45:30"), 45010),
         counts(at("08:45:50"), buy=200, sell=420),
         trade(at("08:46:00"), 45020),
-        counts(at("08:46:20"), buy=260, sell=400),
+        counts(at("08:46:50"), buy=260, sell=400),
         trade(at("08:47:00"), 45000),
     ]))
     assert _bichai(outcome) == [("08:45", 220), ("08:46", 140)]

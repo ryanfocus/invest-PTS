@@ -10,7 +10,7 @@ from datetime import date, timedelta
 
 from broker import TMF_CODE, ContractInfo
 from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, counts, minute,
+from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, contracts, counts, minute,
                         product_trade, rally, trade)
 from recording import RecordingNotifier
 import intraday
@@ -27,7 +27,8 @@ def _config(**overrides) -> settings.Config:
 
 
 def _run(events, *, config=None, **broker_options) -> tuple[FakeBroker, list[str]]:
-    broker = FakeBroker(contracts=CONTRACTS, events=events,
+    broker_options.setdefault("contracts", CONTRACTS)
+    broker = FakeBroker(events=events,
                         minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
     notifier = RecordingNotifier()
     intraday.run(broker, config or _config(), today=DAY, notify=notifier)
@@ -58,16 +59,17 @@ def test_no_entries_while_quotes_are_down_and_one_alert_after_three_minutes():
 
       * 中斷期間沒有任何進場。
       * 連續中斷 3 分鐘（從兩路裡比較早斷的那一路算起，08:53:20）發一則告警，只發一次。
-      * 恢復之後照常判斷：08:55 那根的上一根是 08:50，不是上一分鐘，不判斷；08:56 那根
-        結束時（08:57:00）才又進場。"""
+      * 恢復之後照常判斷，只是要等資料完整：08:50 那根少了 08:50:30 之後的成交，它還在
+        最近 6 根裡時不判斷（見 test_bars_with_trades_missing_from_an_outage_are_not_used_to_enter）。
+        08:55 起的 6 根都是完整的，09:00 那根結束時（09:01:00）才又進場。"""
     events = (rally("08:45", 6) + _silence("08:50:40", "08:54:50")
-              + rally("08:55", 3, open_=45200) + [trade(at("08:58:00"), 45240)])
+              + rally("08:55", 7, open_=45200) + [trade(at("09:02:00"), 45280)])
     broker, sent = _run(events)
 
     assert [o.lots for o in broker.orders] == [1, 1, 1]
     assert [m.splitlines()[-1] for m in sent] == [
-        "2026/11/09 08:50:00", "2026/11/09 08:53:20", "2026/11/09 08:57:00",
-        "2026/11/09 08:58:00"]
+        "2026/11/09 08:50:00", "2026/11/09 08:53:20", "2026/11/09 09:01:00",
+        "2026/11/09 09:02:00"]
     assert sent[1] == (
         "【要你處理】PTS 盤中報價中斷超過 3 分鐘\n"
         "最後收到的大台成交：08:50:30；累計成交筆數：08:50:20\n"
@@ -145,10 +147,48 @@ def test_no_alert_outside_the_day_session():
     assert sent == []
 
 
-def test_a_bar_with_trades_missing_from_an_outage_is_not_judged():
-    """大台成交在 08:50:00 之後斷了 70 秒（筆數照常），08:51:10 才又有成交。08:50 那根只收到
-    第一筆：收盤價少了後面 50 秒，RSI 跟著錯——拿它判斷，就是在中斷期間的資料上進場。
-    所以那一根不判斷；08:51 那根是完整的，08:52 照常判斷、進場。"""
+def test_counts_that_stall_for_a_while_are_not_taken_for_a_bichai_jump():
+    """自動下單打開。08:50 條件 1 進場做多一口，之後大台橫盤（開盤價沒有比上一根高）。交易所
+    那邊筆差每分鐘穩定多 85——不到 100，不是筆差跳增。大台成交照常，累計成交筆數卻在
+    08:55:01 那次之後停了 79 秒，08:56:20 才又來（不到 3 分鐘，不告警）。
+
+    08:55 那根結束時手上的筆數是 08:55:01 的，08:56 那根是 08:56:20 的：兩者相減是 79 秒的
+    累積（112），不是一分鐘的。拿它當筆差跳增，08:57:00 條件 3 就送出一張追多的市價單——
+    把報價停住前後的差距誤判成「突然大量買進」（ticket 09）。
+
+    筆數恢復正常之後照常判斷：08:59 那根真的多了 100，09:00:00 條件 3 追多加碼。"""
+    def at_counts(t, bichai):
+        return counts(at(t), buy=20000, sell=20000 + bichai)
+
+    flat = []
+    for i, bichai in enumerate([1500, 1585, 1670, 1755, 1840]):       # 08:50–08:54，:20 的筆數
+        flat += minute(f"08:5{i}", 45140, 45140, bichai=bichai)
+    stalled = [clock(at("08:55:00")), trade(at("08:55:00"), 45140), at_counts("08:55:01", 1898),
+               trade(at("08:55:30"), 45140), product_trade(at("08:55:40"), 45140),
+               clock(at("08:56:00")), trade(at("08:56:00"), 45140), at_counts("08:56:20", 2010),
+               trade(at("08:56:30"), 45140), product_trade(at("08:56:40"), 45140)]
+    after = (minute("08:57", 45140, 45140, bichai=2095) + minute("08:58", 45140, 45140, bichai=2180)
+             + minute("08:59", 45140, 45140, bichai=2280) + [trade(at("09:00:00"), 45140)])
+    broker, sent = _run(rally("08:45", 5) + flat + stalled + after, contracts=contracts())
+
+    assert [(m.splitlines()[1], m.splitlines()[-1]) for m in sent] == [
+        ("觸發：條件 1（早盤做多）", "2026/11/09 08:50:00"),
+        ("觸發：條件 3（追多加碼）", "2026/11/09 09:00:00")]
+    assert [o.lots for o in broker.orders] == [1, 1]
+
+
+def test_bars_with_trades_missing_from_an_outage_are_not_used_to_enter():
+    """強勢的早上，條件 1 每分鐘成立。大台成交在 08:50:00 之後斷了 70 秒（筆數照常），
+    08:51:10 才又有成交。缺了成交的有兩根：
+
+      * 08:50 那根只收到第一筆，收盤價、高點少了後面 60 秒。
+      * 08:51 那根少了開頭 10 秒：開盤價其實是 08:51:10 那筆的價格。紅K 正是拿開盤價和
+        上一根比（規格第 6 條）。
+
+    拿它們判斷，就是在中斷期間的資料上進場（規格第 53 條）。一次判斷讀到的不只最後一根：
+    紅K 與筆差跳增看最後兩根，RSI(5) 看最近 6 根的收盤價，突破進場的觸發價看最近 5 根的
+    高低點。所以這兩根還在最近 6 根裡的時候都不判斷：08:52 起的 K 棒完整，到 08:57 那根
+    結束（08:58:00）最近 6 根才全是完整的，照常進場。"""
     def bar_counts(t):
         return counts(at(t), buy=20000, sell=21500)
 
@@ -157,7 +197,22 @@ def test_a_bar_with_trades_missing_from_an_outage_is_not_judged():
               + _silence("08:50:10", "08:51:10")
               + [trade(at("08:51:10"), 45160), bar_counts("08:51:20"),
                  trade(at("08:51:30"), 45170), product_trade(at("08:51:40"), 45170)]
-              + minute("08:52", 45180, 45190, bichai=1500) + [trade(at("08:53:00"), 45200)])
+              + rally("08:52", 7, open_=45180) + [trade(at("08:59:00"), 45260)])
     _, sent = _run(events, config=_config(auto_order_enabled=False))
     assert [m.splitlines()[-1] for m in sent] == [
-        "2026/11/09 08:50:00", "2026/11/09 08:52:00", "2026/11/09 08:53:00"]
+        "2026/11/09 08:50:00", "2026/11/09 08:58:00", "2026/11/09 08:59:00"]
+
+
+def test_a_gap_inside_one_minute_leaves_the_next_bar_whole():
+    """大台成交在 08:50:05 到 08:50:50 之間斷了 45 秒，同一分鐘裡就接回來：只有 08:50 那根缺了
+    成交，08:51 那根是完整的。等 08:50 那根離開最近 6 根（08:56 那根結束、08:57:00）才又進場——
+    不會因為一次分鐘內的中斷，多停一分鐘。"""
+    events = (rally("08:45", 5)
+              + [clock(at("08:50:00")), trade(at("08:50:00"), 45150),
+                 counts(at("08:50:20"), buy=20000, sell=21500)]
+              + _silence("08:50:05", "08:50:50")
+              + [trade(at("08:50:50"), 45160), product_trade(at("08:50:55"), 45160)]
+              + rally("08:51", 7, open_=45170) + [trade(at("08:58:00"), 45250)])
+    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    assert [m.splitlines()[-1] for m in sent] == [
+        "2026/11/09 08:50:00", "2026/11/09 08:57:00", "2026/11/09 08:58:00"]

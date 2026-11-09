@@ -187,6 +187,39 @@ def test_a_heartbeat_that_cannot_be_written_does_not_stop_the_intraday_program()
     assert [m.splitlines()[0] for m in sent] == ["【模擬】PTS 做多：買進微台 1 口 @ 45150"]
 
 
+def _denied(*args):
+    raise PermissionError(13, "存取被拒")
+
+
+WRITE_FAILURES = {
+    # Windows 上防毒或索引程式剛好開著正式檔時，置換那一步就是這樣失敗
+    "置換失敗": "replace",
+    # 內容寫了、還沒落到磁碟就出事（磁碟錯誤；斷電時也停在這附近）
+    "寫到一半": "fsync",
+}
+
+
+@pytest.mark.parametrize("step", WRITE_FAILURES.values(), ids=WRITE_FAILURES.keys())
+def test_a_heartbeat_write_that_fails_midway_leaves_the_previous_one_intact(step, monkeypatch):
+    """心跳記錄只有一個檔，每分鐘整個覆寫：寫壞的那一刻如果留下半個檔，出場程式讀到的就是
+    「讀不懂」，而不是事實。盤中程式 10:00 多停了；重啟後那一輪的心跳每一次都寫不成。
+    心跳記錄必須還是停之前那一份，出場程式照樣講得出停在幾點；資料夾裡也不留下寫到一半的
+    暫存檔（每分鐘一個，一天就是幾百個）。"""
+    _intraday(_morning_until("10:00:30"))
+    before = _heartbeat()
+
+    original = getattr(os, step)
+    monkeypatch.setattr(os, step, _denied)
+    _intraday([e for e in whole_morning() if at("10:05:00") <= e.time <= at("10:07:30")])
+    # 出場程式時已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
+    monkeypatch.setattr(os, step, original)
+
+    assert _heartbeat() == before
+    assert [n for n in os.listdir(paths.state_dir()) if n.endswith(".tmp")] == []
+    _, sent = _exit()
+    assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 盤中程式今天 10:00 之後就沒有再跑"]
+
+
 def _write_position_file(text: str) -> None:
     path = position_file.path_for(DAY)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -216,3 +249,25 @@ def test_when_the_intraday_program_stopped_partway_the_exit_program_says_when():
         "下一個交易日 08:40 之前排除。\n"
         "2026/11/09 13:25:00",
     ]
+
+
+# --- 13:20 之後才起來的那一輪不算「跑完了」---
+
+
+def test_a_restart_that_comes_up_only_after_1320_does_not_hide_that_the_morning_was_lost():
+    """09:00 多當掉，排程到 13:21 才把它重啟成功。那一輪一起來就過了進場截止，什麼都沒判斷：
+    寫「收工了」的話，蓋掉的正是「09:00 之後就沒有再跑」——一整個交易時段沒人判斷進場，
+    出場程式卻什麼都不講。"""
+    _intraday(_morning_until("09:00:30"))
+    _intraday([Clock(at("13:21:00"))])
+
+    _, sent = _exit()
+    assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 盤中程式今天 09:00 之後就沒有再跑"]
+
+
+def test_a_first_start_after_1320_is_reported_as_not_having_run_today():
+    """今天第一次啟動就已經 13:22（電腦晚開機、排程補跑）：它沒有判斷過任何一分鐘。"""
+    _intraday([Clock(at("13:22:00"))])
+
+    _, sent = _exit()
+    assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 盤中程式今天沒有跑"]

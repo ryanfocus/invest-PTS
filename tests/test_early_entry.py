@@ -262,11 +262,13 @@ def test_without_bars_of_the_previous_day_it_records_the_market_but_never_enters
 def test_a_late_start_judges_only_the_minutes_after_the_backfill():
     """08:51:50 才啟動。群益先回補 08:45 起的成交（交易所當時的時間），累計筆數只有現在的值。
     回補的 08:49、08:50 那兩根照樣組起來（開盤價、RSI 要用），但那兩分鐘早就過去了，
-    不在 08:51:50 的價格補進場；接上即時行情後，08:52:00 結束的 08:51 那根才判斷。"""
+    不在 08:51:50 的價格補進場；接上即時行情後，08:52:00 結束的 08:51 那根才判斷。
+    （累計筆數從訂閱那一刻起每 30 秒推一次。）"""
     events = ([clock(at("08:51:50"))]
               + [counts(at("08:51:50"), buy=20000, sell=21500)]
               + replayed(rally("08:45", 7))
               + rally("08:52", 1, open_=45170)
+              + [counts(at("08:52:50"), buy=20000, sell=21500)]
               + [trade(at("08:53:00"), 45190)])
     _, sent = _run(events)
     assert sent == [
