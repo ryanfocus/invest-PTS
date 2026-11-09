@@ -36,11 +36,12 @@ def product_trade(t: datetime, price: float) -> ProductTrade:
 
 
 def whole_morning(day: date = DAY) -> list:
-    """一個完整上午：08:40:00–13:20:00 每秒一個時鐘；08:45–13:19 每 10 秒一筆大台成交；
-    每 30 秒一次累計筆數。
+    """一個完整上午：08:40:00–13:20:00 每秒一個時鐘；08:45–13:19 每 10 秒一筆大台成交，
+    每筆之後 5 秒一筆交易商品的成交；每 30 秒一次累計筆數。
 
     價格寫成「45000 ＋ 開盤後第幾分鐘 ＋ 這一分鐘裡第幾筆」，所以任何一根 K 棒的
     開高低收都能心算：第 n 根（08:45 是第 0 根）是 (45000+n, 45005+n, 45000+n, 45005+n)。
+    交易商品的成交固定比同一分鐘的大台開盤價低 100 點，混進大台的 K 棒一眼就看得出來。
     第 k 次筆數是買 k、賣 2k。
     """
     events: list = []
@@ -53,6 +54,9 @@ def whole_morning(day: date = DAY) -> list:
         if open_at <= t < end_at and t.second % 10 == 0:
             minute_index = int((t - open_at).total_seconds()) // 60
             events.append(TxTrade(t, 45000.0 + minute_index + t.second // 10))
+        if open_at <= t < end_at and t.second % 10 == 5:
+            minute_index = int((t - open_at).total_seconds()) // 60
+            events.append(ProductTrade(t, 44900.0 + minute_index))
         if t < end_at and t.second % 30 == 0:
             k += 1
             events.append(TxTradeCounts(t, buy_count=k, sell_count=2 * k))

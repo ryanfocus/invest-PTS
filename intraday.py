@@ -18,8 +18,8 @@ ticket 02 只有最小路徑：**不判斷、不下單、不發訊息**。它的
 
   * **成交（TxTrade）帶的是交易所的時間**。K 棒的分界只看它：K 棒要和看盤軟體一致，
     而本機時鐘和交易所差個一兩秒，就會把每一分鐘最後幾秒的成交切到下一根。
-  * **時鐘（Clock）與累計筆數帶的是本機收到的時刻**。13:20 收工、報價交易日的判斷看它們，
-    因為那兩件事在沒有成交的時候也要發生。
+  * **時鐘（Clock）與累計筆數帶的是本機收到的時刻**。13:20 收工看它們，因為沒有成交的
+    時候也要收工（臨時休市那天正是一筆今天的成交都沒有）。
 """
 
 from __future__ import annotations
@@ -44,21 +44,13 @@ logger = logging.getLogger(__name__)
 # 照樣交出來；之後的事件不組 K 棒、也不寫進原始行情。
 SESSION_END = time(13, 20)
 
-# 報價交易日的判斷點：**08:45 那根 K 棒結束**時，還沒有今天日盤的成交，卻收過別的交易日
-# 的成交，就是報價屬於前一個交易日（臨時休市，規格第 10 條）。
-#
-# ⚠️ 不能一收到前一天的成交就下結論：一般交易日 08:40 訂閱時，回補的也可能是前一個
-#    交易日的成交（休市時回補最近一個日盤，2026-08-16 實測），今天的要到 08:45 才有。
-# ⚠️ 一筆都沒收到不算數：那是報價中斷（ticket 09），不是證據。拿它收工的話，開盤時一次
-#    斷線就賠掉一整天。
-# 等到 08:46 的代價是零：不屬於今天的成交本來就不組 K 棒，不會被拿去判斷。
-QUOTE_DAY_DEADLINE = time(8, 46)
-
 
 class Ending(enum.Enum):
     """盤中程式為什麼結束。寫進 log，給人看的。"""
 
     NOT_A_TRADING_DAY = "非交易日，沒有登入"
+    # 到 13:20 都沒有今天日盤的成交，收過的卻是別的交易日的（臨時休市，規格第 10 條）。
+    # 結論為什麼要等到 13:20，見 `run()` 裡的說明。
     QUOTES_FROM_ANOTHER_DAY = "報價屬於前一個交易日，不判斷"
     CUTOFF = "13:20 收工"
     # 真的群益串流不會自己結束；會走到這裡的只有假 broker 的劇本放完了。
@@ -79,6 +71,19 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
     原始行情會**先暫存、確認報價屬於今天之後才寫檔**：開盤前的累計筆數（08:40 起）
     要留著回答「從什麼時候開始累計」（ticket 03），但臨時休市那天一行都不能寫——
     那一天沒有屬於它的行情。
+
+    報價交易日（規格第 10 條）分兩半處理：
+
+      * **不屬於今天的成交，每一筆都直接略過**：不組 K 棒、不記、不拿它的時間當「現在」。
+        不拿前一天的價格下單，靠的是這一條，不是收工。
+      * **「今天臨時休市」的結論到 13:20 才下**：收到一筆今天日盤的成交就確認報價屬於今天；
+        到 13:20 都沒有、又收過別天的成交，才以 `QUOTES_FROM_ANOTHER_DAY` 結束。
+
+    ⚠️ 不能提早下結論。一般交易日 08:40 訂閱時，回補的常常就是前一個交易日的成交
+       （休市時回補最近一個日盤，2026-08-16 實測），所以「收過別天的、還沒有今天的」
+       在開盤前後是常態；這時報價再斷個一兩分鐘（規格第 53 條），或今天第一筆晚到，
+       看起來就和臨時休市一模一樣。拿它收工的話，一次開盤時的斷線就賠掉一整天，
+       而且程式正常結束，排程的失敗重啟也不會接手。等的代價是零（見第一點）。
     """
     if not calendar_tw.is_trading_day(today):
         logger.info("%s 不是交易日，不登入", today)
@@ -86,7 +91,6 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
 
     broker.login()
     end_at = datetime.combine(today, SESSION_END)
-    deadline = datetime.combine(today, QUOTE_DAY_DEADLINE)
     state = indicators.BarState()
     bars: list[indicators.ClosedBar] = []
     raw = RawMarketWriter(today)
@@ -110,11 +114,10 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
                 state, closed = indicators.close_forming(state)
                 _close(closed)
                 ending = Ending.CUTOFF
-                break
-            if not confirmed and other_day is not None and event.time >= deadline:
-                logger.warning("%s 還沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
-                               f"{QUOTE_DAY_DEADLINE:%H:%M}", other_day)
-                ending = Ending.QUOTES_FROM_ANOTHER_DAY
+                if not confirmed and other_day is not None:
+                    logger.warning("到 %s 都沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
+                                   f"{SESSION_END:%H:%M}", other_day)
+                    ending = Ending.QUOTES_FROM_ANOTHER_DAY
                 break
             if isinstance(event, TxTrade):
                 if not confirmed and indicators.in_day_session(event.time):

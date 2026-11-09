@@ -8,7 +8,7 @@ from datetime import date
 
 from broker import TMF_CODE
 from broker.fake import FakeBroker
-from day_script import at, clock, counts, trade, whole_morning
+from day_script import at, clock, counts, product_trade, trade, whole_morning
 import intraday
 import settings
 
@@ -108,6 +108,32 @@ def test_a_trade_from_a_minute_already_closed_does_not_reopen_it():
     ]
 
 
+def test_the_trading_products_trades_neither_make_bars_nor_are_recorded(market_dir):
+    """串流裡也有交易商品（預設是微台）的成交，價格和大台不同。1 分 K 和原始行情都只是
+    大台的（規格第 1、58 條）：混進來的話，開高低收、之後的 RSI 與條件判斷都不再是大台的，
+    要長期保留的原始行情也被污染。交易商品的現價只給「部位不虧」用（ticket 04）。"""
+    outcome = _run(FakeBroker(events=[
+        trade(at("08:45:00"), 45000),
+        product_trade(at("08:45:00"), 44990),
+        product_trade(at("08:45:30"), 45050),
+        trade(at("08:45:40"), 45010),
+        product_trade(at("08:46:00"), 44900),
+        trade(at("08:46:10"), 45020),
+        trade(at("08:47:00"), 45030),
+    ]))
+    assert _ohlc(outcome) == [
+        ("08:45", 45000, 45010, 45000, 45010),
+        ("08:46", 45020, 45020, 45020, 45020),
+    ]
+    assert _raw_lines(market_dir) == [
+        "time,price,buy_count,sell_count",
+        "2026-11-09T08:45:00.000,45000,,",
+        "2026-11-09T08:45:40.000,45010,,",
+        "2026-11-09T08:46:10.000,45020,,",
+        "2026-11-09T08:47:00.000,45030,,",
+    ]
+
+
 def _bichai(outcome: intraday.SessionOutcome) -> list[tuple]:
     return [(f"{b.bar.start:%H:%M}", b.bichai) for b in outcome.bars]
 
@@ -173,15 +199,20 @@ FRIDAY = date(2026, 11, 6)           # TRADING_DAY 的前一個交易日
 def test_quotes_from_the_previous_trading_day_end_the_session_without_bars_or_a_raw_file(
         market_dir):
     """臨時休市（颱風假）：日曆說今天要開盤，訂閱回補的卻是前一個交易日的成交，
-    之後再也沒有新的。08:45 那根結束時還沒有今天的成交，就不是今天的報價。"""
+    之後再也沒有新的。到 13:20 都沒有今天的成交，這一天就沒有屬於它的報價。
+
+    結論要到 13:20 才下：開盤時報價中斷的話，前面看起來一模一樣（見下一個測試）。
+    等的代價是零——別的交易日的成交本來就不組 K 棒、不會被拿去判斷。"""
     outcome = _run(FakeBroker(events=[
         clock(at("08:40:00")),
         trade(at("08:45:00", FRIDAY), 44000),
         trade(at("13:44:59", FRIDAY), 44100),
         counts(at("08:40:01"), buy=52000, sell=51000),
         clock(at("08:45:00")),
-        clock(at("08:45:59")),
         clock(at("08:46:00")),
+        clock(at("10:00:00")),
+        clock(at("13:19:59")),
+        clock(at("13:20:00")),
     ]))
     assert outcome.ending is intraday.Ending.QUOTES_FROM_ANOTHER_DAY
     assert outcome.bars == ()
@@ -208,6 +239,30 @@ def test_yesterdays_ticks_replayed_before_the_open_are_neither_traded_on_nor_rec
         "2026-11-09T08:40:01.000,,0,0",
         "2026-11-09T08:45:00.000,45000,,",
         "2026-11-09T08:46:00.000,45020,,",
+    ]
+
+
+def test_a_quote_outage_at_the_open_after_yesterdays_backfill_does_not_cost_the_day(market_dir):
+    """一般交易日 08:40 訂閱時回補前一個交易日的成交是常態；開盤時報價又斷了幾分鐘的話，
+    08:46 過了還是沒有今天的成交——到這裡為止，和臨時休市一模一樣。差別只在今天的成交
+    之後會不會來，所以不能在那時收工：今天的成交一到，照常組 K 棒、寫原始行情。"""
+    outcome = _run(FakeBroker(events=[
+        clock(at("08:40:00")),
+        trade(at("13:44:59", FRIDAY), 44100),
+        counts(at("08:40:01"), buy=0, sell=0),
+        clock(at("08:45:00")),
+        clock(at("08:46:00")),
+        clock(at("08:50:00")),
+        trade(at("08:50:10"), 45000),
+        trade(at("08:51:00"), 45020),
+        clock(at("08:51:01")),
+    ]))
+    assert _ohlc(outcome) == [("08:50", 45000, 45000, 45000, 45000)]
+    assert _raw_lines(market_dir) == [
+        "time,price,buy_count,sell_count",
+        "2026-11-09T08:40:01.000,,0,0",
+        "2026-11-09T08:50:10.000,45000,,",
+        "2026-11-09T08:51:00.000,45020,,",
     ]
 
 

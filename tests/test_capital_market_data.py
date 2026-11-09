@@ -93,6 +93,20 @@ def test_trial_match_ticks_before_the_open_are_not_trades():
     assert trades == [(datetime(2026, 11, 9, 8, 45, 0), 44985.0)]
 
 
+def test_ticks_from_another_trading_day_come_through_with_their_own_date():
+    """休市時訂閱，回補的是最近一個日盤的成交（2026-08-16 週日實測拿到週五的）；一般交易日
+    08:40 訂閱時也可能是。broker **不濾**，日期原樣放在事件的時間上：「報價屬於前一個
+    交易日」（規格第 10 條）要看到這個證據才判斷得出來。在這裡濾掉的話，颱風假那天
+    看起來只是一整天的報價中斷。本機時鐘是 2026-11-09（週一）。"""
+    skcom = FakeSkcom(market=[
+        _tick(TX_INDEX, 20261106, 134459, 4410000, history=True),
+        _tick(TMF_INDEX, 20261106, 134459, 4409000, history=True),
+    ])
+    events = _market(_broker(skcom).events(TMF_CODE))
+    assert events == [TxTrade(datetime(2026, 11, 6, 13, 44, 59), 44100.0),
+                      ProductTrade(datetime(2026, 11, 6, 13, 44, 59), 44090.0)]
+
+
 # --- 每秒一次的時鐘 ---
 
 
