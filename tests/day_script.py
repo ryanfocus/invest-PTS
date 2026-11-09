@@ -8,9 +8,19 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from broker import Clock, MinuteBar, ProductTrade, TxTrade, TxTradeCounts
+from broker import (MTX_CODE, TMF_CODE, TX_CODE, Clock, ContractInfo, MinuteBar, ProductTrade,
+                    TxTrade, TxTradeCounts)
 
 DAY = date(2026, 11, 9)              # 週一，一般交易日
+SETTLEMENT_DAY = date(2026, 11, 18)  # 2026 年 11 月的第三個週三：DAY 那一週不是結算週
+
+
+def contracts(last_trading_day: date = SETTLEMENT_DAY) -> dict[str, ContractInfo]:
+    """商品清單（`FakeBroker(contracts=...)` 用）：三個商品的近月，最後交易日相同。"""
+    month = f"{last_trading_day:%m}"
+    return {TX_CODE: ContractInfo(TX_CODE, last_trading_day, f"TX{month}"),
+            MTX_CODE: ContractInfo(MTX_CODE, last_trading_day, f"MTX{month}"),
+            TMF_CODE: ContractInfo(TMF_CODE, last_trading_day, f"TM{last_trading_day:%y%m}")}
 
 
 def at(hhmmss: str, day: date = DAY) -> datetime:
@@ -106,14 +116,16 @@ def minute(hhmm: str, open_: float, close: float, *, bichai: int | None = None,
 
 
 def rally(start: str, n: int, *, open_: float = 45100, step: float = 10, bichai: int = 1500,
-          day: date = DAY) -> list:
+          bichai_step: int = 0, day: date = DAY) -> list:
     """從 `start` 起連續 `n` 分鐘的強勢：每根開盤比上一根高 `step`（紅K）、收在開盤 + `step`、
-    筆差 `bichai`。交易商品成交在大台的收盤價。"""
+    筆差從 `bichai` 起每根多 `bichai_step`（給 100 就是每一根都筆差跳增）。
+    交易商品成交在大台的收盤價。"""
     t0 = datetime.combine(day, datetime.strptime(start, "%H:%M").time())
     events: list = []
     for i in range(n):
         o = open_ + i * step
-        events += minute(f"{t0 + timedelta(minutes=i):%H:%M}", o, o + step, bichai=bichai, day=day)
+        events += minute(f"{t0 + timedelta(minutes=i):%H:%M}", o, o + step,
+                         bichai=bichai + i * bichai_step, day=day)
     return events
 
 

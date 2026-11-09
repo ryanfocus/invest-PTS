@@ -4,10 +4,17 @@
 
     python intraday.py
 
-每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。目前只有條件 1、2 與模擬模式
-（ticket 04）：條件成立就在交易商品當下的價格模擬成交一次，發一則標示「模擬」的訊息，
-**完全不呼叫下單 API**。真實下單（ticket 06）、條件 3、4 與突破進場的盯價（ticket 05）
-之後接在同樣的地方。
+每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。目前只有模擬模式（ticket 04、05）：
+條件成立就在交易商品當下的價格模擬成交一次，發一則標示「模擬」的訊息，
+**完全不呼叫下單 API**。真實下單（ticket 06）之後接在同樣的地方（`_Trading._simulate`）。
+
+## 突破進場的盯價
+
+條件 3、4 在 09:45 之後不立刻進場，策略判斷回答的是「設定突破進場」（`strategy.Breakout`）。
+盯價的是這裡（ADR-0001）：等待中的那一筆留在記憶體裡，每一筆**即時收到的**大台成交都問
+它碰到觸發價了沒，碰到就對交易商品進場。同一筆成交如果剛好讓一根 K 棒結束，先判斷、再
+盯價——剛設下的突破進場也要看這一筆。13:20 收工時，等待中的那一筆一併取消（規格第 26 條）；
+它不寫進任何檔案，重啟後也不恢復（規格第 48 條）。
 
 ## 時間
 
@@ -45,7 +52,7 @@ import messages
 import paths
 import settings
 import strategy
-from broker import Broker, BrokerError, Clock, ProductTrade, TxTrade, TxTradeCounts
+from broker import TX_CODE, Broker, BrokerError, Clock, ProductTrade, TxTrade, TxTradeCounts
 from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
@@ -116,7 +123,8 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         return SessionOutcome(Ending.NOT_A_TRADING_DAY)
 
     broker.login()
-    trading = _Trading(config, notify, _load_history(broker, today))
+    trading = _Trading(config, notify, _load_history(broker, today),
+                       _load_settlement_day(broker, today))
     end_at = datetime.combine(today, SESSION_END)
     state = indicators.BarState()
     bars: list[indicators.ClosedBar] = []
@@ -124,6 +132,10 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     confirmed = False               # 收到今天日盤的成交了
     other_day: date | None = None   # 收過哪一個別的交易日的大台成交
     local_now: datetime | None = None   # 最新的本機時鐘（見模組說明「時間」）
+
+    def _live(t: datetime) -> bool:
+        """時間 `t` 的成交是不是即時收到的（見模組說明「時間」）。"""
+        return local_now is not None and local_now - t <= _MAX_LAG
 
     def _close(closed: indicators.ClosedBar | None, now: datetime) -> None:
         if closed is None:
@@ -134,7 +146,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
             # 真的 broker 第一個事件一定是時鐘；沒有的話分不出這根是不是回補的
             logger.warning("1 分 K %s 結束時還沒收到本機時鐘，分不出是不是回補的舊成交，不判斷",
                            f"{closed.bar.start:%H:%M}")
-        elif local_now - now > _MAX_LAG:
+        elif not _live(now):
             logger.info("1 分 K %s 結束於 %s，本機已經 %s（回補的舊成交或報價延遲），不判斷",
                         f"{closed.bar.start:%H:%M}", f"{now:%H:%M:%S}", f"{local_now:%H:%M:%S}")
         else:
@@ -154,6 +166,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 state, closed = indicators.close_forming(state)
                 _close(closed, event.time)
                 ending = Ending.CUTOFF
+                trading.cancel_breakout()
                 if not confirmed and other_day is not None:
                     logger.warning("到 %s 都沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
                                    f"{SESSION_END:%H:%M}", other_day)
@@ -166,6 +179,10 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 raw.trade(event)
                 state, closed = indicators.add_trade(state, event)
                 _close(closed, event.time)
+                # 先判斷、再盯價：讓 K 棒結束的這一筆，已經是下一根的第一筆成交，
+                # 剛設下的突破進場也要看它（回測裡它就是下一根的開盤價）。
+                if _live(event.time):
+                    trading.on_tx_trade(event)
             elif isinstance(event, TxTradeCounts):
                 raw.counts(event)
                 state = indicators.add_counts(state, event)
@@ -233,11 +250,34 @@ def _load_history(broker: Broker, today: date) -> _History | None:
     return None
 
 
+def _load_settlement_day(broker: Broker, today: date) -> date | None:
+    """近月合約的結算日：商品清單裡大台近月的最後交易日（規格第 24 條）。
+
+    看大台，因為結算週停用條件 3、4 是為了大台近月的筆差（GLOSSARY「結算週」）。
+    查不到就是 None：策略判斷因此停用條件 3、4（不知道是不是結算週，寧可少做），
+    條件 1、2 照常判斷、原始行情照記。
+    """
+    try:
+        contract = broker.get_contracts().get(TX_CODE)
+    except BrokerError as exc:
+        logger.error("查商品清單失敗，不知道今天是不是結算週，條件 3、4 今天停用：%s", exc)
+        return None
+    if contract is None:
+        logger.error("商品清單裡沒有大台近月，不知道今天是不是結算週，條件 3、4 今天停用")
+        return None
+    day = contract.last_trading_day
+    if strategy.in_settlement_week(today, day):
+        logger.info("近月 %s 的結算日是 %s，今天在結算週，條件 3、4 停用", contract.order_code, day)
+    else:
+        logger.info("近月 %s 的結算日是 %s", contract.order_code, day)
+    return day
+
+
 # ── 判斷之後：模擬成交與通知 ──────────────────────────────────────────────
 
 
 class _Trading:
-    """每根 K 棒結束時問策略，條件成立就進場、累計部位、發通知。
+    """每根 K 棒結束時問策略，條件成立就進場、累計部位、發通知；盯等待中的突破進場。
 
     目前只有模擬模式（ticket 04）：成交價是交易商品**當下的價格**（最新一筆成交），
     部位只留在記憶體裡——**不寫部位檔**（規格第 42 條）。出場程式看的是部位檔，
@@ -245,13 +285,16 @@ class _Trading:
     """
 
     def __init__(self, config: settings.Config, notify: Callable[[str], bool],
-                 history: _History | None):
+                 history: _History | None, settlement_day: date | None):
         self._config = config
         self._notify = notify
         self._history = history
+        self._settlement_day = settlement_day
         self.position: strategy.Position | None = None
         # 交易商品的現價：部位不虧用它，模擬也成交在它
         self.product_price: float | None = None
+        # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
+        self.breakout: strategy.Breakout | None = None
 
     def rsi(self, today: list[indicators.ClosedBar]) -> float | None:
         if self._history is None:
@@ -278,11 +321,38 @@ class _Trading:
             product_price=self.product_price,
             lots_per_entry=self._config.lots_per_entry,
             max_position=self._config.max_position,
+            breakout=self.breakout,
+            settlement_day=self._settlement_day,
         ))
-        if decision is not None:
+        if isinstance(decision, strategy.Breakout):
+            self.breakout = decision
+            logger.info("%s 成立，設定突破進場：大台%s碰到 %g 時進 %d 口",
+                        decision.condition.value,
+                        "向上" if decision.direction == strategy.LONG else "向下",
+                        decision.trigger, decision.lots)
+        elif decision is not None:
             self._simulate(decision, now)
 
-    def _simulate(self, decision: strategy.Enter, now: datetime) -> None:
+    def on_tx_trade(self, trade: TxTrade) -> None:
+        """一筆即時收到的大台成交：盯等待中的突破進場（ADR-0001：由程式盯價）。"""
+        breakout = self.breakout
+        if breakout is None or not breakout.touched_by(trade.price):
+            return
+        self.breakout = None
+        logger.info("大台成交 %g 碰到觸發價 %g，突破進場", trade.price, breakout.trigger)
+        self._simulate(strategy.Enter(breakout.direction, breakout.condition, breakout.lots),
+                       trade.time, trigger=breakout.trigger)
+
+    def cancel_breakout(self) -> None:
+        """13:20 進場截止：等待中的突破進場一併取消（規格第 26 條）。沒有進場，不發訊息。"""
+        if self.breakout is not None:
+            logger.info("%s 進場截止，取消等待中的突破進場（%s，觸發價 %g）",
+                        f"{SESSION_END:%H:%M}", self.breakout.condition.value,
+                        self.breakout.trigger)
+            self.breakout = None
+
+    def _simulate(self, decision: strategy.Enter, now: datetime, *,
+                  trigger: float | None = None) -> None:
         price = self.product_price
         if price is None:
             logger.warning("%s 成立，但還沒有交易商品的成交價，這一分鐘不進場",
@@ -298,7 +368,7 @@ class _Trading:
         self._send(messages.entry(
             at=now, product=self._config.product, direction=decision.direction,
             condition=decision.condition, lots=decision.lots, price=price,
-            total_lots=total, avg_price=avg, simulated=True))
+            total_lots=total, avg_price=avg, simulated=True, trigger=trigger))
 
     def _send(self, text: str) -> None:
         if not self._config.discord_enabled:

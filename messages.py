@@ -19,17 +19,20 @@ _HOLDING_TEXT = {strategy.LONG: "多單", strategy.SHORT: "空單"}
 
 
 def entry(*, at: datetime, product: str, direction: str, condition: strategy.Condition,
-          lots: int, price: float, total_lots: int, avg_price: float, simulated: bool) -> str:
+          lots: int, price: float, total_lots: int, avg_price: float, simulated: bool,
+          trigger: float | None = None) -> str:
     """一次進場成交（規格第 37 條）：方向、觸發條件、這次口數與成交價、累計口數與均價。
 
     每一則都帶累計：看最新的一則就知道目前的部位。模擬模式在最前面標「模擬」（規格第 42 條），
-    使用者不會把它當成真的成交。
+    使用者不會把它當成真的成交。突破進場另外寫出觸發價（`trigger`）：觸發價是大台的價格，
+    成交價是交易商品的，兩個數字擺在一起，使用者才對得出是碰到哪個價位才進場。
     """
     head = "【模擬】" if simulated else ""
+    how = "" if trigger is None else f"，突破進場（觸發價 {_points(trigger)}）"
     return (
         f"{head}PTS {_DIRECTION_TEXT[direction]}："
         f"{_SIDE_TEXT[direction]}{_PRODUCT_TEXT[product]} {lots} 口 @ {_points(price)}\n"
-        f"觸發：{condition.value}\n"
+        f"觸發：{condition.value}{how}\n"
         f"累計：{_HOLDING_TEXT[direction]} {total_lots} 口，均價 {_points(avg_price)}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )

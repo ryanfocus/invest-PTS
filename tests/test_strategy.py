@@ -9,26 +9,27 @@ RSI 恰好 70／30 的情境用 6 根收盤價（RSI(5) 的最少根數）手算
 """
 
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
 from broker import MinuteBar
 from indicators import ClosedBar
 import strategy
-from strategy import LONG, SHORT, Condition, Enter, Position, Situation
+from strategy import LONG, SHORT, Breakout, Condition, Enter, Position, Situation
 
-DAY = datetime(2026, 11, 9)
+DAY = datetime(2026, 11, 9)                 # 週一
 YESTERDAY_CLOSE = 45000.0
+SETTLEMENT_DAY = date(2026, 11, 18)         # 下週三：DAY 不在結算週
 
 
 def _bars(start: str, opens: list[float], closes: list[float], bichai: int | None) -> tuple:
-    """從 `start` 起每分鐘一根；最後一根結束時的筆差是 `bichai`，前面幾根不重要。"""
+    """從 `start` 起每分鐘一根，每一根結束時的筆差都是 `bichai`——沒有筆差跳增，
+    要測條件 3、4 的情境自己改最後一根。"""
     t0 = datetime.combine(DAY.date(), datetime.strptime(start, "%H:%M").time())
-    bars = [ClosedBar(MinuteBar(t0 + timedelta(minutes=i), o, max(o, c), min(o, c), c), 0)
-            for i, (o, c) in enumerate(zip(opens, closes))]
-    bars[-1] = replace(bars[-1], bichai=bichai)
-    return tuple(bars)
+    return tuple(ClosedBar(MinuteBar(t0 + timedelta(minutes=i), o, max(o, c), min(o, c), c),
+                           bichai)
+                 for i, (o, c) in enumerate(zip(opens, closes)))
 
 
 def _after(bars: tuple, seconds: int = 0) -> datetime:
@@ -42,7 +43,8 @@ def _long(start: str = "08:45", **overrides) -> Situation:
                  [45110, 45120, 45130, 45140, 45150, 45160], 1500)
     s = Situation(bars=bars, today_open=45100.0, yesterday_close=YESTERDAY_CLOSE,
                   now=_after(bars), position=None, product_price=45160.0,
-                  lots_per_entry=1, max_position=20)
+                  lots_per_entry=1, max_position=20, breakout=None,
+                  settlement_day=SETTLEMENT_DAY)
     return replace(s, **overrides)
 
 
@@ -52,7 +54,8 @@ def _short(start: str = "08:45", **overrides) -> Situation:
                  [44890, 44880, 44870, 44860, 44850, 44840], -1500)
     s = Situation(bars=bars, today_open=44900.0, yesterday_close=YESTERDAY_CLOSE,
                   now=_after(bars), position=None, product_price=44840.0,
-                  lots_per_entry=1, max_position=20)
+                  lots_per_entry=1, max_position=20, breakout=None,
+                  settlement_day=SETTLEMENT_DAY)
     return replace(s, **overrides)
 
 
@@ -250,3 +253,207 @@ def test_an_entry_is_cut_to_what_is_left_under_the_cap():
 
 def test_each_entry_is_the_configured_number_of_lots():
     assert strategy.decide(_long(lots_per_entry=3)) == Enter(LONG, Condition.EARLY_LONG, 3)
+
+
+# --- 條件 3、4：追價加碼（規格第 7、18、20、22 條）---
+
+
+def _with_bichai(s: Situation, previous: int | None, last: int | None) -> Situation:
+    """最後兩根結束時的筆差：上一根 `previous`、這一根 `last`。"""
+    bars = s.bars[:-2] + (replace(s.bars[-2], bichai=previous), replace(s.bars[-1], bichai=last))
+    return replace(s, bars=bars)
+
+
+def _chase_long(start: str = "08:45", **overrides) -> Situation:
+    """條件 3 成立、條件 1 不成立：持有 2 口多單而且在虧（均價 45200，現價 45160），
+    筆差 1500 → 1600，恰好跳增 100。"""
+    s = _with_bichai(_long(start, position=Position(LONG, 2, 45200.0)), 1500, 1600)
+    return replace(s, **overrides)
+
+
+def _chase_short(start: str = "08:45", **overrides) -> Situation:
+    """條件 4 成立、條件 2 不成立：持有 2 口空單而且在虧（均價 44800，現價 44840），
+    筆差 −1500 → −1600。"""
+    s = _with_bichai(_short(start, position=Position(SHORT, 2, 44800.0)), -1500, -1600)
+    return replace(s, **overrides)
+
+
+CHASE_LONG = Enter(LONG, Condition.CHASE_LONG, 1)
+CHASE_SHORT = Enter(SHORT, Condition.CHASE_SHORT, 1)
+
+
+def test_condition_3_adds_a_lot_even_while_the_position_is_losing():
+    assert strategy.decide(_chase_long()) == CHASE_LONG
+
+
+def test_condition_4_adds_a_lot_even_while_the_position_is_losing():
+    assert strategy.decide(_chase_short()) == CHASE_SHORT
+
+
+@pytest.mark.parametrize("previous, last, expected", [
+    (1500, 1599, None),           # 跳增 99
+    (1500, 1600, CHASE_LONG),     # 恰好 100
+    (900, 1000, None),            # 跳增 100，但筆差恰好 1000
+    (901, 1001, CHASE_LONG),
+    (None, 1600, None),           # 上一根的筆差不知道：算不出跳增，不是當成 0
+])
+def test_condition_3_needs_a_jump_of_at_least_100_and_bichai_above_1000(previous, last, expected):
+    assert strategy.decide(_with_bichai(_chase_long(), previous, last)) == expected
+
+
+@pytest.mark.parametrize("previous, last, expected", [
+    (-1500, -1599, None), (-1500, -1600, CHASE_SHORT), (-900, -1000, None),
+    (-901, -1001, CHASE_SHORT)])
+def test_condition_4_needs_a_drop_of_at_least_100_and_bichai_below_minus_1000(
+        previous, last, expected):
+    assert strategy.decide(_with_bichai(_chase_short(), previous, last)) == expected
+
+
+def test_condition_3_needs_a_long_position_already_held():
+    """沒有部位時條件 3 不成立（開盤價不知道，條件 1 也不成立）；持有空單時（在虧，
+    條件 1 也不成立），多方的筆差跳增不會讓它加碼做多。"""
+    assert strategy.decide(_chase_long(position=None, today_open=None)) is None
+    assert strategy.decide(_chase_long(position=Position(SHORT, 2, 45100.0))) is None
+
+
+def test_condition_4_needs_a_short_position_already_held():
+    assert strategy.decide(_chase_short(position=Position(LONG, 2, 44900.0))) is None
+
+
+@pytest.mark.parametrize("make, expected", [
+    (lambda: _with_bichai(_long(position=Position(LONG, 1, 45160.0)), 1500, 1600), ENTER_LONG),
+    (lambda: _with_bichai(_short(position=Position(SHORT, 1, 44840.0)), -1500, -1600),
+     ENTER_SHORT),
+], ids=["條件 1 和 3", "條件 2 和 4"])
+def test_when_two_conditions_hold_in_the_same_minute_only_one_lot_is_entered(make, expected):
+    """同一分鐘條件 1 和條件 3 都成立，只進一口（規格第 16 條）。觸發條件寫編號小的那個。"""
+    assert strategy.decide(make()) == expected
+
+
+def test_condition_3_adds_at_once_through_0945():
+    """09:44 那根在 09:45 判斷，仍然立刻加碼（09:45 含）。"""
+    assert strategy.decide(_chase_long("09:39")) == CHASE_LONG
+
+
+# --- 突破進場（規格第 19、20、21、25、26 條）---
+
+
+def test_after_0945_condition_3_sets_a_breakout_at_the_highest_high_of_the_last_5_bars():
+    """09:45 那根在 09:46 判斷：不再立刻加碼，改設突破進場。`_long` 每根的最高是收盤價，
+    最近 5 根（09:41–09:45）最高 45160。"""
+    assert strategy.decide(_chase_long("09:40")) == Breakout(LONG, Condition.CHASE_LONG, 45160, 1)
+
+
+def test_after_0945_condition_4_sets_a_breakout_at_the_lowest_low_of_the_last_5_bars():
+    assert strategy.decide(_chase_short("09:40")) == Breakout(SHORT, Condition.CHASE_SHORT,
+                                                              44840, 1)
+
+
+def _with_extremes(s: Situation, index: int, *, high: float | None = None,
+                   low: float | None = None) -> Situation:
+    bars = list(s.bars)
+    bar = bars[index].bar
+    bars[index] = replace(bars[index], bar=replace(bar, high=bar.high if high is None else high,
+                                                   low=bar.low if low is None else low))
+    return replace(s, bars=tuple(bars))
+
+
+def test_the_breakout_looks_at_exactly_the_last_5_bars():
+    """第 6 根之前的高點再高也不算；最近 5 根裡的最高點不一定是最後一根。"""
+    s = _with_extremes(_with_extremes(_chase_long("09:40"), 0, high=45999), 2, high=45170)
+    assert strategy.decide(s) == Breakout(LONG, Condition.CHASE_LONG, 45170, 1)
+    s = _with_extremes(_with_extremes(_chase_short("09:40"), 0, low=44001), 2, low=44830)
+    assert strategy.decide(s) == Breakout(SHORT, Condition.CHASE_SHORT, 44830, 1)
+
+
+@pytest.mark.parametrize("start, expected", [
+    ("13:13", Breakout(LONG, Condition.CHASE_LONG, 45160, 1)),   # 13:18 那根，13:19 判斷
+    ("13:14", None),                                              # 13:19 那根，13:20 判斷
+])
+def test_no_breakout_is_set_from_1320(start, expected):
+    """13:20 進場截止（規格第 26 條）：那時設下的突破進場也只會馬上被取消。"""
+    assert strategy.decide(_chase_long(start)) == expected
+
+
+def test_a_breakout_breaks_by_touching_the_trigger():
+    """「碰到」最高點就算，不必超過；空方碰到最低點。"""
+    long = Breakout(LONG, Condition.CHASE_LONG, 45160, 1)
+    short = Breakout(SHORT, Condition.CHASE_SHORT, 44840, 1)
+    assert [long.touched_by(p) for p in (45159, 45160, 45161)] == [False, True, True]
+    assert [short.touched_by(p) for p in (44841, 44840, 44839)] == [False, True, True]
+
+
+def test_a_jump_while_a_breakout_is_waiting_keeps_the_original_trigger():
+    """等待中又出現筆差跳增：不設新的（規格第 21 條）。原本那筆成交之後（等待中的沒了），
+    再出現筆差跳增就設新的。"""
+    waiting = Breakout(LONG, Condition.CHASE_LONG, 45130, 1)
+    s = _chase_long("09:40", position=Position(LONG, 3, 45200.0))
+    assert strategy.decide(replace(s, breakout=waiting)) is None
+    assert strategy.decide(s) == Breakout(LONG, Condition.CHASE_LONG, 45160, 1)
+
+
+@pytest.mark.parametrize("held, lots_per_entry, expected", [
+    (18, 3, Breakout(LONG, Condition.CHASE_LONG, 45160, 2)),
+    (20, 1, None),
+])
+def test_a_breakout_is_cut_to_what_is_left_under_the_cap(held, lots_per_entry, expected):
+    s = _chase_long("09:40", position=Position(LONG, held, 45200.0), lots_per_entry=lots_per_entry)
+    assert strategy.decide(s) == expected
+
+
+@pytest.mark.parametrize("waiting_lots, expected", [
+    (2, None), (1, Enter(LONG, Condition.EARLY_LONG, 1))])
+def test_the_cap_counts_a_waiting_breakout(waiting_lots, expected):
+    """加碼上限 20、已有 18 口：等待中的突破進場佔 2 口就滿了（規格第 25 條）。"""
+    waiting = Breakout(LONG, Condition.CHASE_LONG, 45300, waiting_lots)
+    s = _long(position=Position(LONG, 18, 45000.0), breakout=waiting)
+    assert strategy.decide(s) == expected
+
+
+# --- 結算週（規格第 23、24 條）---
+
+
+def _moved_to(s: Situation, day: date) -> Situation:
+    """同一個情境，搬到 `day` 那一天的同一時刻。"""
+    shift = datetime.combine(day, datetime.min.time()) - DAY
+    bars = tuple(replace(b, bar=replace(b.bar, start=b.bar.start + shift)) for b in s.bars)
+    return replace(s, bars=bars, now=s.now + shift)
+
+
+MON, WED, THU, FRI = date(2026, 11, 9), date(2026, 11, 11), date(2026, 11, 12), date(2026, 11, 13)
+LAST_FRI = date(2026, 11, 6)
+
+
+@pytest.mark.parametrize("today, settlement_day, enabled", [
+    (LAST_FRI, WED, True),        # 上週五：不在結算週
+    (MON, WED, False),            # 週一開始停用
+    (WED, WED, False),            # 結算日當天（含）
+    (THU, WED, True),             # 結算日之後
+    (MON, THU, False),            # 順延到週四：停用範圍跟著延長
+    (WED, THU, False),
+    (THU, THU, False),
+    (FRI, THU, True),
+], ids=["上週五", "週一", "週三結算日", "週三結算後的週四", "順延週四的週一", "順延週四的週三",
+        "順延的週四結算日", "順延週四後的週五"])
+def test_conditions_3_and_4_are_off_from_monday_through_the_settlement_day(
+        today, settlement_day, enabled):
+    """結算日取自商品清單的最後交易日（規格第 24 條），所以颱風假順延時不必自己推算。
+    條件 3 的立刻加碼、條件 3 的突破進場、條件 4 都一樣。"""
+    cases = [(_chase_long(), CHASE_LONG),
+             (_chase_long("09:40"), Breakout(LONG, Condition.CHASE_LONG, 45160, 1)),
+             (_chase_short(), CHASE_SHORT)]
+    for s, entered in cases:
+        s = replace(_moved_to(s, today), settlement_day=settlement_day)
+        assert strategy.decide(s) == (entered if enabled else None)
+
+
+def test_conditions_1_and_2_still_enter_in_the_settlement_week():
+    assert strategy.decide(_long(settlement_day=WED)) == ENTER_LONG
+    assert strategy.decide(_short(settlement_day=WED)) == ENTER_SHORT
+
+
+def test_without_the_settlement_day_conditions_3_and_4_are_off():
+    """商品清單查不到，就不知道今天是不是結算週。寧可少做：條件 3、4 停用。"""
+    assert strategy.decide(_chase_long(settlement_day=None)) is None
+    assert strategy.decide(_chase_short(settlement_day=None)) is None
+    assert strategy.decide(_long(settlement_day=None)) == ENTER_LONG
