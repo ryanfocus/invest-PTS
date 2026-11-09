@@ -20,7 +20,13 @@ COM 本身被包在 `_RealCom` 這個小介面後面（載入、建立元件、�
   6. 送單前要 `ReadCertByID`，少了它委託會被回 1038（2026-08-21 實機）。
   7. 回報連線的事件是 `OnSolaceReplyConnection`／`OnSolaceReplyDisconnect`。
      invest-os 掛的舊名 `OnConnect`／`OnDisconnect` 在 2.13.48 起已經移除，不會觸發——
-     那邊因此每天印「回報連線狀態未知」，盤中斷線也偵測不到。
+     那邊因此每天印「回報連線狀態未知」，盤中斷線也偵測不到。成功連線時的代碼文件沒寫，
+     所以「連上而且補送完畢」看的是 `OnComplete`。
+
+對外只會拋出 broker 定義的例外：登入是 `LoginFailed`、商品清單是
+`ProductListUnavailable`、送單只有兩類——`OrderFailed`（確定沒送出去）與
+`FillUnknown`（送出去但不知道成交）。元件自己拋的例外都會依發生在送出之前或之後
+轉成其中一類，上層不必猜。
 """
 
 from __future__ import annotations
@@ -28,13 +34,16 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Callable
+from datetime import date
+from typing import Callable, Iterator
 
 import paths
 from broker import (
     ContractInfo,
     FillUnknown,
     LoginFailed,
+    MarketEvent,
+    MinuteBar,
     OrderFailed,
     OrderRequest,
     OrderResult,
@@ -204,13 +213,22 @@ class CapitalBroker:
     # --- 內部：COM 生命週期 ---
 
     def _ensure_com(self) -> None:
-        """建立 COM 物件並註冊事件。刻意延遲到這裡，模組載入時不執行。"""
+        """建立 COM 物件並註冊事件。刻意延遲到這裡，模組載入時不執行。
+
+        失敗時把狀態還原：半套的元件留著的話，下一次重試會以為已經建好了。
+        """
         if self._center is not None:
             return
-        com = self._com if self._com is not None else _RealCom()
-        self._com = com
-        com.load()
+        if self._com is None:
+            self._com = _RealCom()
+        try:
+            self._build_com(self._com)
+        except BaseException:
+            self._center = None
+            raise
 
+    def _build_com(self, com) -> None:
+        com.load()
         center = com.create("SKCenterLib")
         self._center = center
         self._redirect_component_logs()
@@ -269,7 +287,14 @@ class CapitalBroker:
         報價主機的連線刻意不放在這裡：那是會暫時性失敗的東西，歸類成 LoginFailed
         會讓它跳過重試。它屬於 `get_contracts` 與事件串流的範圍。
         """
-        self._ensure_com()
+        try:
+            self._ensure_com()
+        except LoginFailed:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise LoginFailed(
+                f"群益元件無法載入（{type(exc).__name__}）：{exc}。"
+                "換版之後發生的話，刪掉 comtypes 產生的介面檔再試") from exc
         code = self._center.SKCenterLib_LoginSetQuote(self._user_id, self._password, "Y")
         if code != 0:
             raise LoginFailed(f"群益登入失敗，{self._message(code)}")
@@ -295,6 +320,15 @@ class CapitalBroker:
         """查商品清單，取出大台、小台、微台的近月下單代碼與最後交易日。"""
         if self._center is None:
             raise ProductListUnavailable("尚未登入")
+        try:
+            return self._query_contracts(wait)
+        except ProductListUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ProductListUnavailable(
+                f"查商品清單時元件發生錯誤（{type(exc).__name__}）：{exc}") from exc
+
+    def _query_contracts(self, wait: float) -> dict[str, ContractInfo]:
         self._ensure_quote_connection()
         self._quote_events.commodity_chunks.clear()
 
@@ -317,6 +351,28 @@ class CapitalBroker:
         if not self._pump_until(_parsed_ok, wait):
             raise ProductListUnavailable(f"{wait:.0f} 秒內未取得完整商品清單")
         return parsed
+
+    # --- 行情（ticket 02 起實作）---
+
+    def minute_bars(self, day: date) -> list[MinuteBar]:
+        """指定交易日的大台日盤 1 分 K。
+
+        ticket 02／04 實作：`SKQuoteLib_RequestKLineAMByDate(代碼, 0 分線, 1 新版格式,
+        1 AM 盤, 日期, 日期, 1)`，從 `OnNotifyKLineData` 收、等 `OnKLineComplete`。
+        新版格式的真實字串要先錄下來當 fixture（文件的例子本身就不一致），
+        K 棒時間標的是起點還是終點也要實機核對。見 notes/capital-api.md 第 3 節。
+        """
+        raise NotImplementedError("大台 1 分 K 歷史由 ticket 02／04 實作")
+
+    def events(self) -> Iterator[MarketEvent]:
+        """訂閱並產生行情事件。
+
+        ticket 02 實作：大台逐筆成交（`RequestTicks` → `OnNotifyTicksLONG`，濾掉試撮與
+        不是今天的回補）、累計成交筆數（`RequestFutureTradeInfo` →
+        `OnNotifyFutureTradeInfoLONG`）、交易商品成交價，以及在 `_pump_until` 的迴圈裡
+        用本機時鐘每跨過一個整秒產生一個 `Clock`。見 notes/capital-api.md 第 1、2、4 節。
+        """
+        raise NotImplementedError("行情事件串流由 ticket 02 實作")
 
     # --- 下單 ---
 
@@ -379,11 +435,17 @@ class CapitalBroker:
             raise OrderFailed("尚未登入")
         if not self._account:
             raise OrderFailed("未設定期貨帳號（.env 的 CAPITAL_FUTURES_ACCOUNT）")
-        self._ensure_order_ready()
-
-        order = self._com.new_future_order()
-        for field, value in build_future_order_fields(request, self._account).items():
-            setattr(order, field, value)
+        try:
+            self._ensure_order_ready()
+            order = self._com.new_future_order()
+            for field, value in build_future_order_fields(request, self._account).items():
+                setattr(order, field, value)
+        except OrderFailed:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # 還沒呼叫送單，任何意外都**確定**沒有送出去。
+            raise OrderFailed(
+                f"準備送單時元件發生錯誤（{type(exc).__name__}）：{exc}") from exc
 
         before = len(self._reply_events.rows)
         try:

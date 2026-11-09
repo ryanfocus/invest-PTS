@@ -16,7 +16,7 @@ FULL = (
     "\n"
     "CAPITAL_USER_ID=A100000000\n"
     "CAPITAL_PASSWORD=not-a-real-password\n"
-    "CAPITAL_FUTURES_ACCOUNT=F9990000000\n"
+    "CAPITAL_FUTURES_ACCOUNT=F0000000000000\n"
     "DISCORD_WEBHOOK_URL=https://discord.example/api/webhooks/1/token\n"
 )
 
@@ -38,7 +38,7 @@ def test_all_four_values_are_read(tmp_path):
     secrets = settings.load_secrets(_config(), path=_env(tmp_path, FULL))
     assert secrets.user_id == "A100000000"
     assert secrets.password == "not-a-real-password"
-    assert secrets.futures_account == "F9990000000"
+    assert secrets.futures_account == "F0000000000000"
     assert secrets.discord_webhook == "https://discord.example/api/webhooks/1/token"
 
 
@@ -60,7 +60,7 @@ def test_an_empty_value_counts_as_missing(tmp_path):
 
 def test_simulation_mode_does_not_need_a_futures_account(tmp_path):
     """模擬模式完全不碰下單 API，沒有期貨帳號也能跑——上線前就是這樣驗證的。"""
-    text = FULL.replace("CAPITAL_FUTURES_ACCOUNT=F9990000000\n", "")
+    text = FULL.replace("CAPITAL_FUTURES_ACCOUNT=F0000000000000\n", "")
     secrets = settings.load_secrets(_config(auto_order_enabled=False), path=_env(tmp_path, text))
     assert secrets.futures_account == ""
 

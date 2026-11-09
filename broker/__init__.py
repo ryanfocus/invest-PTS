@@ -20,7 +20,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from typing import Iterator, Protocol, Union, runtime_checkable
 
 # 報價代碼（近月連續、日盤）。PTS 的指標一律看大台；交易商品三選一。
 #
@@ -190,3 +191,98 @@ def ensure_sendable(request: OrderRequest) -> None:
             f"今天是 {request.trading_day:%Y/%m/%d}，不送單。"
             "群益會把過期月份自動改送隔年同月，送出去就是另一個合約。"
         )
+
+
+# ── 行情：事件串流與 1 分 K（ticket 02 起實作在群益 broker 上）──────────────
+#
+# 盤中程式的「現在」一律取自事件上的時間，不讀系統時鐘（規格「時間」一節）。
+# 所以每一個事件都帶 `time`，由 broker 蓋上：
+#
+#   * 群益沒有每秒一次的事件（`OnTimer` 每分鐘一次），`Clock` 由 broker 在訊息幫浦
+#     迴圈裡用本機時鐘產生。
+#   * 筆差的來源 `OnNotifyFutureTradeInfoLONG` 沒有日期也沒有時間，`TxTradeCounts`
+#     的時間是 broker 收到它的時刻。
+#   * 成交價來自逐筆成交（`OnNotifyTicksLONG`），要濾掉試撮（`nSimulate=1`）與
+#     不是今天的回補（`nDate`）。
+#
+# 細節與出處見 scratchpad 的 notes/capital-api.md 第 1–4 節。
+
+
+@dataclass(frozen=True)
+class Clock:
+    """每秒一次的時鐘。沒有成交的時候，13:20 截止、報價中斷偵測也要有時間可看。"""
+
+    time: datetime
+
+
+@dataclass(frozen=True)
+class TxTrade:
+    """大台的一筆成交。組 1 分 K、盯突破進場的觸發價都用它。"""
+
+    time: datetime
+    price: float
+
+
+@dataclass(frozen=True)
+class TxTradeCounts:
+    """大台到這一刻為止的**累計**成交買進／賣出筆數。筆差 = 賣出筆數 − 買進筆數。
+
+    累計起點（08:45？含夜盤？）還不知道，要等 ticket 03 的實機紀錄回答。
+    """
+
+    time: datetime
+    buy_count: int
+    sell_count: int
+
+
+@dataclass(frozen=True)
+class ProductTrade:
+    """交易商品的一筆成交。「部位不虧」用它當現價。交易大台時與 TxTrade 是同一筆。"""
+
+    time: datetime
+    price: float
+
+
+MarketEvent = Union[Clock, TxTrade, TxTradeCounts, ProductTrade]
+
+
+@dataclass(frozen=True)
+class MinuteBar:
+    """大台日盤的一根 1 分 K。`start` 是這根 K 棒開始的那一分鐘（08:45 那根是 08:45）。
+
+    券商 K 線標的是起點還是終點，文件沒寫（ticket 02 實機核對）；不管它怎麼標，
+    進到這個型別時一律換算成起點。
+    """
+
+    start: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+
+
+# ── 契約 ──────────────────────────────────────────────────────────────
+
+
+@runtime_checkable
+class Broker(Protocol):
+    """PTS 對券商的全部要求（規格 Implementation Decisions「broker」）。
+
+    失敗只有兩類會從 `place_order` 出來：`OrderFailed`（確定沒送出去）與
+    `FillUnknown`（送出去但不知道成交）。
+    """
+
+    def login(self) -> None:
+        """失敗是 LoginFailed，重試無用。"""
+
+    def get_contracts(self) -> dict[str, ContractInfo]:
+        """大台、小台、微台的近月下單代碼與最後交易日，以報價代碼為鍵。"""
+
+    def minute_bars(self, day: date) -> list[MinuteBar]:
+        """指定交易日的大台日盤 1 分 K，依時間排序。那天沒有資料就是空的。"""
+
+    def events(self) -> Iterator[MarketEvent]:
+        """訂閱並依序產生行情事件，直到串流結束。"""
+
+    def place_order(self, request: OrderRequest) -> OrderResult:
+        """送出市價 IOC，等到委託確定結束，回傳實際成交。"""

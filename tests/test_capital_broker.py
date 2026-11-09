@@ -12,14 +12,14 @@ import pytest
 
 import paths
 from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, FillUnknown,
-                    LoginFailed, OrderFailed, OrderRequest)
+                    LoginFailed, OrderFailed, OrderRequest, ProductListUnavailable)
 from broker.capital import CapitalBroker
 from fake_skcom import (FakeSkcom, fills, full_fill, no_sequence, refused_at_send, rejected,
                         silence)
 
 
 def _broker(skcom: FakeSkcom, **kwargs) -> CapitalBroker:
-    kwargs.setdefault("account", "F9990000000")
+    kwargs.setdefault("account", "F0000000000000")
     kwargs.setdefault("fill_timeout", 0.3)
     kwargs.setdefault("settle_seconds", 0)
     return CapitalBroker("A100000000", "pw", com=skcom, **kwargs)
@@ -53,6 +53,31 @@ def test_a_failed_login_is_a_login_failure_with_the_brokers_message():
         _broker(FakeSkcom(login_code=1001)).login()
 
 
+class _BrokenOnce(FakeSkcom):
+    """第一次載入元件就炸（例如換版後產生的介面檔不對），第二次正常。"""
+
+    def __init__(self):
+        super().__init__()
+        self.loads = 0
+
+    def load(self):
+        self.loads += 1
+        if self.loads == 1:
+            raise OSError("TYPE_E_CANTLOADLIBRARY")
+        super().load()
+
+
+def test_a_component_that_cannot_be_loaded_is_a_login_failure_and_can_be_retried():
+    """上層只認得 LoginFailed（要人處理、發告警）。原始的 COM 例外漏出去的話，
+    流程會以 traceback 收場而不是一則講得出原因的告警。"""
+    skcom = _BrokenOnce()
+    broker = _broker(skcom)
+    with pytest.raises(LoginFailed, match="TYPE_E_CANTLOADLIBRARY"):
+        broker.login()
+    broker.login()                      # 半套的狀態不可以卡住重試
+    assert ("SKCenterLib", "SKCenterLib_LoginSetQuote") in [c[:2] for c in skcom.calls]
+
+
 # --- 商品清單 ---
 
 
@@ -65,6 +90,19 @@ def test_the_near_month_contracts_come_from_the_components_product_list():
     assert {code: c.order_code for code, c in contracts.items()} == {
         TX_CODE: "TX11", MTX_CODE: "MTX11", TMF_CODE: "TM2611"}
     assert contracts[TX_CODE].last_trading_day == date(2026, 11, 18)
+
+
+class _ListExplodes(FakeSkcom):
+    def _SKQuoteLib_RequestStockList(self, market):
+        raise OSError("RPC 伺服器無法使用")
+
+
+def test_an_unexpected_error_while_listing_products_is_product_list_unavailable():
+    """商品清單查不到是「可以重試」的那一類，上層靠例外型別分辨要不要重試。"""
+    broker = _broker(_ListExplodes())
+    broker.login()
+    with pytest.raises(ProductListUnavailable, match="RPC"):
+        broker.get_contracts()
 
 
 # --- 委託欄位（規格第 27、28 條）---
@@ -105,7 +143,7 @@ def test_every_field_of_the_order_sent_to_the_broker(code, order_code, day_trade
     skcom = FakeSkcom()
     _place(skcom, _order(code, side=SELL, lots=3))
     assert vars(skcom.sent[0]) == {
-        "bstrFullAccount": "F9990000000",
+        "bstrFullAccount": "F0000000000000",
         "bstrStockNo": order_code,
         "sBuySell": 1,
         "bstrPrice": "M",
@@ -195,6 +233,20 @@ def test_a_certificate_that_cannot_be_read_stops_before_any_order():
     """少了憑證，送出去只會被回 1038「Cert Not Verified」，要人自己猜是哪一步漏了。"""
     skcom = FakeSkcom(cert_code=1038)
     with pytest.raises(OrderFailed, match="憑證"):
+        _place(skcom, _order())
+    assert skcom.sent == []
+
+
+class _CertExplodes(FakeSkcom):
+    def _ReadCertByID(self, user_id):
+        raise OSError("COM 物件已失效")
+
+
+def test_an_unexpected_error_before_the_send_is_order_failed():
+    """送出之前發生的任何事，都**確定**沒有送出去。原始例外漏出去的話，上層分不出
+    這是「沒送出去」還是「不知道」——而 broker 只該讓這兩類失敗出去。"""
+    skcom = _CertExplodes()
+    with pytest.raises(OrderFailed, match="COM 物件已失效"):
         _place(skcom, _order())
     assert skcom.sent == []
 

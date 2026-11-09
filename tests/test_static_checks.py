@@ -1,0 +1,116 @@
+"""守住**測試執行不到、或測試環境看不出來**的東西。"""
+
+import io
+import os
+import pathlib
+import subprocess
+import sys
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+FIXTURES = ROOT / "tests" / "fixtures"
+
+
+def _tracked(pattern: str):
+    """版控裡的檔案。「要守哪些檔案」與「哪些檔案進版控」是同一件事，不另外維護清單。"""
+    out = subprocess.run(["git", "ls-files", pattern], cwd=ROOT,
+                         capture_output=True, text=True, encoding="utf-8")
+    if out.returncode != 0:
+        pytest.skip("這裡不是 git 工作區，無法決定哪些檔案該守")
+    return [ROOT / name for name in out.stdout.splitlines() if (ROOT / name).is_file()]
+
+
+# --- 規格第 59 條：沒有群益元件、沒有帳號的機器上也能跑 ---
+
+
+def test_every_module_imports_on_a_machine_without_the_capital_component(tmp_path):
+    """群益元件只裝得起來在 Windows 上，而 broker 以外的程式碼都不需要它。
+
+    在 `comtypes`、`pythoncom` 一 import 就爆的環境裡，開一個子行程把每個模組都載入。
+    刻意不用 `importorskip` 或 monkeypatch——那兩種寫法在沒裝套件的機器上會直接跳過，
+    而那正是這條要守的機器。
+    """
+    for name in ("comtypes", "pythoncom", "win32com"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "__init__.py").write_text(
+            f"raise ImportError('模擬沒有安裝 {name}')", encoding="utf-8")
+    (tmp_path / "comtypes" / "client.py").write_text(
+        "raise ImportError('模擬沒有安裝 comtypes')", encoding="utf-8")
+
+    modules = ["paths", "settings", "broker", "broker.capital_wire", "broker.fake",
+               "broker.capital"]
+    code = "import " + ", ".join(modules)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(ROOT)])}
+    result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+    assert result.returncode == 0, (
+        f"有模組在載入時就需要群益元件——COM 的初始化必須延遲到函式內。\n{result.stderr}")
+
+
+# --- 測試跑不到的程式碼 ---
+
+
+def test_no_code_refers_to_a_name_that_does_not_exist():
+    """`broker/capital.py` 的 `_RealCom` 只在真的連上群益時才會跑，測試永遠執行不到。
+    用到不存在的名字 = 那一行一跑就 NameError，而那時使用者在上班。
+    （invest-os 2026-08-23：搬檔時漏掉一個 import，全部測試綠燈。）"""
+    api = pytest.importorskip("pyflakes.api", reason="pyflakes 沒裝，見 requirements.txt")
+    from pyflakes import messages
+    from pyflakes.reporter import Reporter
+
+    crashers = (messages.UndefinedName, messages.UndefinedLocal, messages.UndefinedExport)
+    found: list[str] = []
+
+    class Collect(Reporter):
+        def __init__(self):
+            super().__init__(io.StringIO(), io.StringIO())
+
+        def flake(self, message):
+            if isinstance(message, crashers):
+                found.append(str(message))
+
+        def syntaxError(self, filename, msg, lineno, offset, text):
+            found.append(f"{filename}:{lineno}: 語法錯誤 {msg}")
+
+    for path in _tracked("*.py"):
+        api.checkPath(str(path), Collect())
+    assert found == [], "以下的名字不存在，執行到那一行就會 NameError：\n" + "\n".join(found)
+
+
+def test_only_one_module_asks_where_the_program_lives():
+    """**`__file__` 只准出現在 `paths.py`。** invest-os 原本散在四個檔案，打包之後答案變了，
+    漏掉的那個不會報錯，只會讀不到設定，或把檔案寫進一個開機就消失的資料夾。
+    `tools/` 與 `tests/` 是開發用的，不在此限。"""
+    offenders = [
+        path.relative_to(ROOT).as_posix() for path in _tracked("*.py")
+        if not path.relative_to(ROOT).as_posix().startswith(("tools/", "tests/"))
+        and path.name != "paths.py"
+        and "__file__" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], f"這些檔案自己去問「程式在哪」：{offenders}。改用 paths 的函式。"
+
+
+# --- 進版控的真實樣本不可以帶帳戶識別資訊 ---
+
+
+def test_every_reply_sample_has_its_account_fields_masked():
+    """`fixtures/` 收的是券商回來的真實字串——那正是它們的價值。代價是一不小心就會把
+    帳戶識別資訊一起帶進版控。invest-os 2026-09-04 的稽核發現某份樣本的檔頭寫著
+    「已置換」，實際上沒有；三次都不是不知道要遮，是沒有東西在檢查。
+
+    `[4]` 期貨商代號、`[5]` 帳號、`[26]` 子帳號、`[27]` 營業員代號，在每一列都只能是
+    0／F 組成的假值。委託序號、書號、成交價、時間要留著：比對靠的就是它們。
+    """
+    rows = 0
+    for path in sorted(FIXTURES.glob("onnewdata-*.txt")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.split(",")
+            for i in (4, 5, 26, 27):
+                value = fields[i].strip()
+                assert set(value) <= {"0", "F"}, f"{path.name} 的欄位 [{i}] 不是假值：{value!r}"
+            rows += 1
+    assert rows >= 6, "樣本不見了，這條檢查等於沒有在跑"
