@@ -4,6 +4,8 @@
 
     python intraday.py
 
+排程叫醒它的入口是 `scheduled.py`（ticket 10）。
+
 每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。條件成立時：
 
   * 自動下單打開：送出市價 IOC → 把實際成交寫進部位檔 → 發一則成交訊息（ticket 06）。
@@ -48,6 +50,10 @@
   * **盤中重啟**（`_Restored`，規格第 48 條）：部位、停止進場記錄照舊從檔案讀；今天已經過去的
     1 分 K 與每根的筆差從原始行情檔讀回，群益回補的成交裡重啟前就處理過的不再處理。
     當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
+  * **排程每分鐘叫醒**（ticket 10，`tools/schedule.py`）：這就是失敗時的自動重啟，所以正常結束
+    之後也會再被叫醒。今天已經走到結局（心跳記錄寫了「收工了」）就什麼都不做
+    （`_finished_earlier`）；今天登入失敗過就不再登入（`login_failed_path`）。同一時間只有一個
+    盤中程式（`_alone`）。
 
 ## 突破進場的盯價
 
@@ -79,13 +85,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import logging
 import os
 import sys
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from typing import Callable
+from typing import Callable, Iterator
 
 import calendar_tw
 import heartbeat
@@ -97,7 +104,7 @@ import raw_market
 import settings
 import strategy
 from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
-                    FillUnknown, OrderFailed, OrderRequest, ProductTrade, TxTrade,
+                    FillUnknown, LoginFailed, OrderFailed, OrderRequest, ProductTrade, TxTrade,
                     TxTradeCounts)
 from raw_market import RawMarketWriter
 
@@ -137,6 +144,10 @@ class Ending(enum.Enum):
     CUTOFF = "13:20 收工"
     # 真的群益串流不會自己結束；會走到這裡的只有假 broker 的劇本放完了。
     STREAM_ENDED = "行情串流在 13:20 之前結束"
+    # 排程每分鐘叫醒盤中程式（ticket 10）：今天稍早那一輪已經走到結局，這一輪什麼都不做
+    FINISHED_EARLIER = "今天稍早已經收工，這次被叫醒什麼都不做"
+    # 今天稍早登入失敗過（`login_failed_path`）：重試沒有用，帳密錯了還會把帳號鎖住
+    LOGIN_FAILED_EARLIER = "今天登入失敗過，這次被叫醒不再登入"
 
 
 @dataclass(frozen=True)
@@ -172,6 +183,12 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     if not calendar_tw.is_trading_day(today):
         logger.info("%s 不是交易日，不登入", today)
         return SessionOutcome(Ending.NOT_A_TRADING_DAY)
+    if _finished_earlier(today):
+        return SessionOutcome(Ending.FINISHED_EARLIER)
+    if (failed := _read_login_failed(today)) is not None:
+        logger.error("今天登入失敗過（%s），不再登入。排除原因之後刪掉 %s，排程下一次叫醒時"
+                     "就會再登入", failed, login_failed_path(today))
+        return SessionOutcome(Ending.LOGIN_FAILED_EARLIER)
 
     pulse = _Pulse(today)
     # 當天已經有部位（盤中重啟）：交易商品、合約、口數一律以部位檔為準，不看設定檔
@@ -191,7 +208,11 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         logger.warning("設定檔的交易商品是 %s，但今天已經有 %s 的部位，今天照部位檔交易 %s",
                        config.product, product, product)
 
-    broker.login()
+    try:
+        broker.login()
+    except LoginFailed as exc:
+        _write_login_failed(today, str(exc))
+        raise
     orders = None
     if config.auto_order_enabled:
         # 近月合約（結算日當天就是當天到期的那個，規格第 9 條）在開盤前查好：查不到是
@@ -1035,6 +1056,66 @@ class _Pulse:
                          heartbeat.path(), type(exc).__name__, exc)
 
 
+def _finished_earlier(today: date) -> bool:
+    """今天稍早那一輪已經走到結局了沒有（心跳記錄寫了「收工了」）。
+
+    排程從 08:40 起每分鐘叫醒盤中程式一次，直到進場截止（ticket 10），所以正常結束之後
+    還會再被叫醒：部位檔讀不懂而不進場的那天，每一次都會再告警一次。結局只有自己走到的
+    那幾種會寫「收工了」（`_Pulse.finish`、`gave_up`），當掉、被關掉的不會——那正是要重啟的。
+
+    心跳記錄讀不懂就當成還沒收工：照常跑，它會被這一輪的心跳覆寫掉。
+    """
+    try:
+        beat = heartbeat.read()
+    except heartbeat.Unreadable as exc:
+        logger.warning("心跳記錄讀不懂，當成今天還沒收工：%s", exc)
+        return False
+    if beat is None or beat.trading_day != today or not beat.finished:
+        return False
+    logger.info("今天稍早已經收工（心跳記錄 %s），這次被叫醒什麼都不做", heartbeat.path())
+    return True
+
+
+def login_failed_path(day: date) -> str:
+    """那個交易日的登入失敗記錄：今天為什麼不再登入（ticket 10）。
+
+    排程每分鐘叫醒盤中程式一次（失敗時自動重啟），登入失敗卻是重試沒有用、要人處理的事
+    （`broker.LoginFailed`：帳密、憑證、群益元件沒註冊）。帳密錯了還每分鐘再試，一天就是
+    兩百多次錯誤的登入，可能把帳號鎖住——連使用者自己的 APP、OS 都登不進去。所以寫成檔，
+    之後被叫醒看到它就不再登入。
+
+    **不寫進心跳記錄**：這不是「收工了」。使用者要從 13:25 出場程式的「盤中程式今天沒有跑」
+    知道這件事（規格第 54 條），心跳記錄寫了「收工了」，出場程式就不講了。
+
+    排除原因之後刪掉它，排程下一次叫醒時就會再登入；放著不管，隔一個交易日也照常登入。
+    """
+    return os.path.join(paths.state_dir(), f"login-failed-{day:%Y%m%d}.txt")
+
+
+def _read_login_failed(day: date) -> str | None:
+    """今天稍早登入失敗的原因；沒有失敗過是 None。檔案存在就算，內容只是給人看的。"""
+    path = login_failed_path(day)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except (OSError, ValueError) as exc:     # UTF-8 的解碼錯誤是 ValueError
+        return f"（記錄在 {path}，但讀不懂：{type(exc).__name__}: {exc}）"
+
+
+def _write_login_failed(day: date, reason: str) -> None:
+    """寫不進去只記 log：這一輪照樣以登入失敗結束，代價是下一分鐘會再試一次。"""
+    path = login_failed_path(day)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(reason + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("登入失敗記錄寫不進 %s（%s: %s）：排程下一次叫醒時會再登入一次",
+                     path, type(exc).__name__, exc)
+
+
 # ── 停止進場記錄 ─────────────────────────────────────────────────────────
 
 
@@ -1110,16 +1191,64 @@ def main() -> int:
     today = date.today()
     _setup_logging(today)
 
-    config = settings.load()
-    secrets = settings.load_secrets(config)
-    broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
-    webhook = secrets.discord_webhook
+    with _alone() as alone:
+        if not alone:
+            logger.info("另一個盤中程式正在跑（%s 被鎖住），這一個什麼都不做", _lock_path())
+            return 0
+        config = settings.load()
+        secrets = settings.load_secrets(config)
+        broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
+        webhook = secrets.discord_webhook
+        try:
+            run(broker, config, today=today, notify=lambda text: discord.send(text, webhook))
+        except BrokerError as exc:
+            logger.error("盤中程式中止：%s", exc)
+            return 1
+        return 0
+
+
+def _lock_path() -> str:
+    return os.path.join(paths.state_dir(), "intraday.lock")
+
+
+@contextlib.contextmanager
+def _alone() -> Iterator[bool]:
+    """同一時間只有一個盤中程式（ticket 09、10）：鎖住 `state/intraday.lock`，鎖不到就是
+    另一個正在跑，交出 False。
+
+    兩個同時跑，同一分鐘就會進兩次場。排程設了「已經在跑就不啟動新的」，但它只管得到自己
+    叫醒的那一個行程：有人在命令列手動再跑一次，或排程只砍掉了外層的行程（venv 的
+    `python.exe` 是一層轉手、真正的直譯器是它的子行程），第二個就起來了。
+
+    用作業系統的檔案鎖，不用「檔案在不在」：行程不管怎麼死，鎖都跟著放掉；留下一個檔案的話，
+    當掉之後的每一次重啟都會以為還有人在跑。鎖檔本身留著，不刪。
+    """
+    path = _lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
     try:
-        run(broker, config, today=today, notify=lambda text: discord.send(text, webhook))
-    except BrokerError as exc:
-        logger.error("盤中程式中止：%s", exc)
-        return 1
-    return 0
+        try:
+            _lock(fd, True)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _lock(fd, False)
+    finally:
+        os.close(fd)
+
+
+def _lock(fd: int, on: bool) -> None:
+    """鎖住（或放掉）檔案的第一個位元組，鎖不到立刻拋 OSError、不等。"""
+    if sys.platform == "win32":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)        # msvcrt 鎖的是「目前位置起」的位元組
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if on else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if on else fcntl.LOCK_UN)
 
 
 def _setup_logging(today: date) -> None:

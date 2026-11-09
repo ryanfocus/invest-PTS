@@ -36,6 +36,9 @@
 **不要設定失敗時自動重跑。** 告警之後使用者可能已經自己平掉剩下的口數；這時再跑一次，
 出場程式照部位檔把那幾口再平一次，就是反向新倉（「部位還在」的告警也叫人自己平掉之後
 不要再執行出場程式）。`main()` 只有在程式本身出錯、或設定有錯時回 1，告警過的結局也回 0。
+
+排程叫醒它的入口是 `scheduled.py`，排程本身由 `tools/schedule.py` 建立。出場程式的排程每天都會
+叫醒它，所以 `logs/` 的 30 天清除也由它在做完正事之後執行（`housekeeping`）。
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from typing import Callable
 
 import calendar_tw
 import heartbeat
+import housekeeping
 import messages
 import paths
 import position_file
@@ -417,10 +421,19 @@ def main() -> int:
     出錯，或設定有錯——那時也盡量發一則告警，因為微台可能就這樣過夜，而平常沒有例行訊息
     能讓人發現。
     """
+    _setup_logging(date.today())
+    try:
+        return _scheduled_exit()
+    finally:
+        # 收尾：log 保留 30 天（ticket 10）。出場程式的排程每天都會叫醒它，正事出錯也照清——
+        # 個資的保存期限不該因為某天程式出錯就延長。永遠不拋例外。
+        housekeeping.purge_old_logs()
+
+
+def _scheduled_exit() -> int:
     from broker.capital import CapitalBroker
     from notifiers import discord
 
-    _setup_logging(date.today())
     status = 0
     try:
         config: settings.Config | BrokenSettings = settings.load()
