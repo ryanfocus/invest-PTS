@@ -52,7 +52,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 import paths
 import strategy
@@ -201,6 +201,30 @@ class PositionRecord:
 def path_for(day: date) -> str:
     """那個交易日的部位檔。"""
     return os.path.join(paths.state_dir(), f"position-{day:%Y%m%d}.json")
+
+
+_FILE_NAME = re.compile(r"position-(\d{8})\.json")
+
+
+def days() -> list[date]:
+    """有部位檔的交易日，由舊到新。出場程式靠它找到哪一天的出場沒有跑完（ticket 10）。
+
+    只認 `path_for` 取的檔名：寫到一半的暫存檔（`.position-*.tmp`）、人手改名留下的備份都不算。
+    """
+    try:
+        names = os.listdir(paths.state_dir())
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        match = _FILE_NAME.fullmatch(name)
+        if match is None:
+            continue
+        try:
+            found.append(datetime.strptime(match.group(1), "%Y%m%d").date())
+        except ValueError:
+            continue        # 長得像日期、其實不是（20261340）
+    return sorted(found)
 
 
 def read(day: date) -> PositionRecord | None:

@@ -12,7 +12,7 @@
 
 import os
 
-from broker import TMF_CODE, LoginFailed
+from broker import TMF_CODE, LoginFailed, LoginUnavailable
 from broker.fake import FakeBroker
 from day_script import DAY, PREVIOUS_DAY, at, calm_history, contracts, whole_morning
 from recording import RecordingNotifier
@@ -90,6 +90,17 @@ def test_after_a_failed_login_the_next_wake_ups_do_not_log_in_again():
     sent, outcome = _wake(login_error=_must_not_log_in("今天登入失敗過，不該再登入"))
     assert sent == []
     assert outcome.ending == intraday.Ending.LOGIN_FAILED_EARLIER
+
+
+def test_a_login_lost_to_the_network_is_tried_again_at_the_next_wake_up():
+    """開盤時碰上一次斷線、群益主機忙（`broker.LoginUnavailable`）：沒有驗證到密碼，不會把帳號
+    鎖住。下一分鐘排程叫醒時照常登入、照常跑完——一次網路異常不能賠掉一整天。"""
+    try:
+        _wake(login_error=LoginUnavailable("群益登入沒有成功（網路或群益主機），代碼 1108"))
+    except LoginUnavailable:
+        pass
+    _, outcome = _wake(whole_morning())
+    assert outcome.ending == intraday.Ending.CUTOFF
 
 
 def test_a_failed_login_still_shows_up_at_1325_as_the_intraday_program_not_running():

@@ -50,7 +50,17 @@ class BrokerError(Exception):
 
 
 class LoginFailed(BrokerError):
-    """登入失敗。重試無用，需要人介入（密碼、憑證、聲明書、元件沒註冊等）。"""
+    """登入失敗。重試無用，需要人介入（密碼、憑證、聲明書、元件沒註冊等）。
+
+    盤中程式看到它，今天就不再登入：帳密錯了還每分鐘再試，會把帳號鎖住（群益 307）。
+    分不清是哪一類的失敗也歸在這裡——賠掉一天的進場，好過鎖住使用者自己也在用的帳號。
+    """
+
+
+class LoginUnavailable(BrokerError):
+    """登入沒有成功，但原因是網路或群益主機（斷線、取不到主機清單、「請稍後再試」）。
+    **不是** `LoginFailed`：沒有驗證到密碼，過一會兒再試可能就好（盤中程式下一分鐘被排程叫醒時
+    再登入一次）。只有群益文件講明是這一類的代碼才算（`broker.capital`）。"""
 
 
 class ProductListUnavailable(BrokerError):
@@ -301,7 +311,7 @@ class Broker(Protocol):
     """
 
     def login(self) -> None:
-        """失敗是 LoginFailed，重試無用。"""
+        """失敗是 LoginFailed（重試無用）或 LoginUnavailable（網路、主機，稍後再試）。"""
 
     def get_contracts(self) -> dict[str, ContractInfo]:
         """大台、小台、微台的近月下單代碼與最後交易日，以報價代碼為鍵。"""

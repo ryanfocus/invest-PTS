@@ -4,8 +4,9 @@
 
     python exit_program.py
 
-只看今天的部位檔，不看盤中程式還在不在（規格第 49 條）：出場不能依賴盤中程式還活著，
-而且只有一個負責者，就不會兩邊都送平倉單、反而開出反向新倉。
+只照今天的部位檔平倉（之前的交易日沒平的只告警，見「給排程」），不看盤中程式還在不在
+（規格第 49 條）：出場不能依賴盤中程式還活著，而且只有一個負責者，就不會兩邊都送平倉單、
+反而開出反向新倉。
 
 交易商品一律以部位檔記載的為準，不看設定檔（規格第 43 條）：
 
@@ -39,6 +40,10 @@
 
 排程叫醒它的入口是 `scheduled.py`，排程本身由 `tools/schedule.py` 建立。出場程式的排程每天都會
 叫醒它，所以 `logs/` 的 30 天清除也由它在做完正事之後執行（`housekeeping`）。
+
+**錯過就補跑，可能落在別天。** 13:25 電腦關機的話，補跑是下一次開機的時候：隔天早上、隔天
+下午或週末，那時系統日期已經不是部位的那一天。所以每一次執行都先往回看（`_report_missed`）：
+之前的交易日部位檔還記著沒平的微台、那天又沒有出場記錄（`done_path`），就告警、不送單。
 """
 
 from __future__ import annotations
@@ -128,14 +133,27 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
 
     if not calendar_tw.is_trading_day(today):
         logger.info("%s 不是交易日，不登入", today)
-        return _end(Ending.NOT_A_TRADING_DAY)
-    if now.time() < strategy.ENTRY_CUTOFF:
+        ending = Ending.NOT_A_TRADING_DAY
+    elif now.time() < strategy.ENTRY_CUTOFF:
         # 盤中程式還在進場：它下一筆成交會用自己記憶體裡的部位整份覆寫部位檔，這裡記下的
-        # 出場明細就不見了，13:25 那一次再照舊檔平一次。只會是有人手動執行。
+        # 出場明細就不見了，13:25 那一次再照舊檔平一次。會走到這裡的是有人手動執行，或排程
+        # 補跑落在隔天早上——後者要處理的是前一天的部位，下面的 `_report_missed` 會講。
         logger.error("現在 %s，還沒到進場截止 %s，盤中程式可能還在進場，出場程式不動作",
                      f"{now:%H:%M}", f"{strategy.ENTRY_CUTOFF:%H:%M}")
-        return _end(Ending.TOO_EARLY)
+        ending = Ending.TOO_EARLY
+    else:
+        ending = _exit_today(broker, config, today=today, now=now, clock=clock, sleep=sleep,
+                             say=say)
+        _mark_done(today, ending.value)
+    # 之前的交易日留下的排在今天的出場之後：這裡出了什麼事，都擋不到今天的微台平倉
+    _report_missed(today, now, say)
+    return _end(ending)
 
+
+def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, today: date,
+                now: datetime, clock: Callable[[], datetime], sleep: Callable[[float], None],
+                say: Callable[[str], None]) -> Ending:
+    """今天的出場：進場截止之後才會走到這裡。"""
     _check_heartbeat(today, now, say)
     try:
         record = position_file.read(today)
@@ -145,23 +163,23 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
         logger.error("部位檔讀不懂，不送任何單：%s", exc)
         say(messages.exit_position_file_unreadable(
             at=now, reason=str(exc), closed=now.time() >= _DAY_SESSION_CLOSE))
-        return _end(Ending.POSITION_FILE_UNREADABLE)
+        return Ending.POSITION_FILE_UNREADABLE
     if record is None:
-        return _end(Ending.NO_POSITION)
+        return Ending.NO_POSITION
     if record.status == position_file.UNCERTAIN:
         # 不知道帳上有幾口：照檔裡的口數平，可能留下沒平的口數，也可能多平開出反向新倉。
         # 出場單不確定時更不能再送——它很可能已經成交了（規格第 50 條）。
         # 這一條排在商品前面：大台、小台雖然不送單，不確定一樣要講。
         logger.error("部位檔記著一筆不確定的委託（%s），不送任何單", record.uncertain)
         say(messages.exit_uncertain(at=now, record=record, closed=now >= _deadline(record)))
-        return _end(Ending.UNCERTAIN)
+        return Ending.UNCERTAIN
     if not record.open_lots:
         logger.info("部位檔的出場口數已經等於進場口數，部位已經了結")
-        return _end(Ending.ALREADY_CLOSED)
+        return Ending.ALREADY_CLOSED
     if record.product != TMF_CODE:
         logger.info("今天的部位是 %s %s %d 口，標了當沖，交給券商 13:30 強平，不送單",
                     record.order_code, record.direction, record.open_lots)
-        return _end(Ending.LEFT_TO_BROKER)
+        return Ending.LEFT_TO_BROKER
 
     ledger = _Ledger(record)
     ending = _MicroExit(broker, config, ledger, today=today, now=now, clock=clock,
@@ -173,7 +191,61 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
                      ledger.on_file.status)
         say(messages.exit_not_on_file(at=clock(), record=ledger.record, on_file=ledger.on_file,
                                       reason=ledger.error))
-    return _end(ending)
+    return ending
+
+
+def _report_missed(today: date, now: datetime, say: Callable[[str], None]) -> None:
+    """之前的交易日還留著沒平的微台：出場程式那天沒有跑完，這一次才被叫醒（ticket 10）。
+
+    排程「錯過就補跑」只補一次，而且是在電腦下一次能跑的時候：13:25 關機的話，補跑可能是
+    隔天早上（進場截止之前）、隔天下午，或週末（非交易日）。只看「今天」的部位檔，三種都會
+    安靜地結束，前一天的微台就這樣過夜（規格第 31 條）。
+
+    **一張單都不送**：那天的日盤早就收了（規格第 55 條），使用者也可能已經自己平掉——出場程式
+    不知道，再送就是反向新倉。只告警，請他確認帳戶。
+    """
+    for day in position_file.days():
+        if day >= today or os.path.exists(done_path(day)):
+            continue
+        try:
+            record = position_file.read(day)
+        except position_file.Unreadable as exc:
+            # 不知道那天留下什麼，照實講。今天的出場照常：一份舊檔不能讓今天的微台也過夜。
+            logger.error("%s 的部位檔讀不懂，出場程式那天又沒有跑完：%s", day, exc)
+            say(messages.exit_missed_unreadable(at=now, day=day, reason=str(exc)))
+            record = None
+        # 大台、小台那天 13:30 已經被券商當沖強平（規格第 30 條），跟出場程式有沒有跑無關
+        if (record is not None and record.product == TMF_CODE
+                and (record.open_lots or record.status == position_file.UNCERTAIN)):
+            logger.error("%s 的部位檔還記著微台 %s %d 口沒平（%s）：出場程式那天沒有跑完，不送單",
+                         day, record.direction, record.open_lots, record.status)
+            say(messages.exit_missed(at=now, record=record))
+        _mark_done(day, f"那天沒有跑完，{now:%Y-%m-%d %H:%M} 才發現")
+
+
+def done_path(day: date) -> str:
+    """那個交易日的出場記錄：出場程式已經處理過那一天的部位（ticket 10）。
+
+    之後每一次執行都會往回看（`_report_missed`），看到它就知道那一天不必再講——部位檔永遠
+    記著告警過的那幾口（使用者自己平掉，出場程式不會知道），沒有這份記錄就會每天再講一次。
+
+    **做完才寫**：那天跑到一半當掉、被砍掉、斷電的話沒有這份記錄，下一次執行就會把那天
+    當成沒跑完、照部位檔再講一次。寧可多講一次，不要安靜。
+    放在部位檔旁邊（`state/`，不在 30 天清除的範圍），一天一個小檔。
+    """
+    return os.path.join(paths.state_dir(), f"exit-done-{day:%Y%m%d}.txt")
+
+
+def _mark_done(day: date, how: str) -> None:
+    """寫下出場記錄。寫不進去只記 log：代價是下一次執行再講一次那天的部位。"""
+    path = done_path(day)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(how + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("出場記錄寫不進 %s（%s: %s）：下一次執行會再講一次 %s 的部位",
+                     path, type(exc).__name__, exc, day)
 
 
 def _check_heartbeat(today: date, now: datetime, say: Callable[[str], None]) -> None:

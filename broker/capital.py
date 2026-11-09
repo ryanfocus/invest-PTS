@@ -23,7 +23,7 @@ COM 本身被包在 `_RealCom` 這個小介面後面（載入、建立元件、�
      那邊因此每天印「回報連線狀態未知」，盤中斷線也偵測不到。成功連線時的代碼文件沒寫，
      所以「連上而且補送完畢」看的是 `OnComplete`。
 
-對外只會拋出 broker 定義的例外：登入是 `LoginFailed`、商品清單是
+對外只會拋出 broker 定義的例外：登入是 `LoginFailed`／`LoginUnavailable`、商品清單是
 `ProductListUnavailable`、送單只有兩類——`OrderFailed`（確定沒送出去）與
 `FillUnknown`（送出去但不知道成交）。元件自己拋的例外都會依發生在送出之前或之後
 轉成其中一類，上層不必猜。
@@ -46,6 +46,7 @@ from broker import (
     FillQuery,
     FillUnknown,
     LoginFailed,
+    LoginUnavailable,
     MarketEvent,
     MinuteBar,
     OrderFailed,
@@ -72,6 +73,24 @@ _SKCENTER_CLSID = "{AC30BAB5-194A-4515-A8D3-6260749F8577}"
 
 # 報價主機的連線狀態代碼：收到它才代表商品資料下載完成
 _STOCKS_READY = 3003
+
+# 登入時回這些代碼是網路或群益主機的問題，不是帳密、憑證：拋 `LoginUnavailable`，盤中程式
+# 下一分鐘被排程叫醒時再登入一次。來源是《策略王COM元件使用說明_V2.13.58》的錯誤代碼表與
+# 《V2.13.45以上登入代碼定義》，只收文件講明是網路、主機、「請重新登入／稍後再試」的。
+# **其餘一律是 `LoginFailed`**（今天不再登入），文件沒有的代碼也是：分不清的時候，賠掉一天的
+# 進場好過每分鐘再試、把使用者自己也在用的帳號鎖住（307 密碼被鎖定）。
+_LOGIN_TRY_AGAIN_LATER = frozenset({
+    101,    # 登入token異常：請重新登入
+    156,    # SK_ERROR_LOGIN_NO_SERVER_LIST：（GW）未能取得主機清單
+    1041,   # SK_ERROR_SERVER_NOT_CONNECTED：與主機尚未連線
+    1097,   # SK_ERROR_TELNET_LOGINSERVER_FAIL：Telnet 登入主機失敗
+    1108,   # SK_ERROR_TELNET_SERVER_FAIL：因網路異常，無法連線
+    1109,   # SK_ERROR_THERE_IS_NO_TOKEN：因登入未取得時效 token，請重新登入
+    1129,   # SK_ERROR_LOGIN_FAIL_IN_PROCESSING：登入失敗，請稍等五秒後再試
+    2020,   # SK_WARNING_PRECHECK_RESULT_FAIL：取得行情主機或回報主機連線資訊失敗
+    2021,   # SK_WARNING_PRECHECK_RESULT_EMPTY：取得行情主機或回報主機連線資訊結果為空值
+    2029,   # SK_WARNING_SHOULD_CHECK_NETWORK
+})
 
 # 報價連線斷了的代碼（文件 4-4-a、6 代碼表）。斷了之後成交與筆數都不會再來，時鐘照樣每秒
 # 一個：盤中程式靠它發現報價中斷並告警（規格第 53 條）。這裡只記 log——斷線之後群益會不會
@@ -417,7 +436,8 @@ class CapitalBroker:
     # --- 對外契約 ---
 
     def login(self) -> None:
-        """**只做身分驗證**。失敗一律 raise LoginFailed（重試無用，要人處理）。
+        """**只做身分驗證**。失敗是 LoginFailed（重試無用，要人處理）；群益回的是網路、主機類
+        代碼時是 LoginUnavailable（稍後再試，見 `_LOGIN_TRY_AGAIN_LATER`）。
 
         報價主機的連線刻意不放在這裡：那是會暫時性失敗的東西，歸類成 LoginFailed
         會讓它跳過重試。它屬於 `get_contracts` 與事件串流的範圍。
@@ -431,6 +451,8 @@ class CapitalBroker:
                 f"群益元件無法載入（{type(exc).__name__}）：{exc}。"
                 "換版之後發生的話，刪掉 comtypes 產生的介面檔再試") from exc
         code = self._center.SKCenterLib_LoginSetQuote(self._user_id, self._password, "Y")
+        if code in _LOGIN_TRY_AGAIN_LATER:
+            raise LoginUnavailable(f"群益登入沒有成功（網路或群益主機），{self._message(code)}")
         if code != 0:
             raise LoginFailed(f"群益登入失敗，{self._message(code)}")
         logger.info("群益登入成功")

@@ -298,6 +298,67 @@ def exit_incomplete(*, at: datetime, record: position_file.PositionRecord, reaso
     )
 
 
+def exit_missed(*, at: datetime, record: position_file.PositionRecord) -> str:
+    """出場程式在部位的那一天沒有跑完，`at` 這一次執行才發現（ticket 10：排程補跑落在隔天、
+    週末，或那天跑到一半停了）。「部位還在」：部位檔記著這幾口還沒平。
+
+    那一天的日盤早就收了，出場程式不送單，所以要人做的事講完整（買賣別、口數、下單代碼，
+    理由見 `exit_incomplete`）。但他可能已經在夜盤、或看到別的告警自己平掉了——出場程式不知道，
+    所以先請他確認帳戶。合約可能在這段時間結算掉了，最後交易日也一併講。
+    不講「不要重跑」：出場程式對過去的交易日從來不送單。
+
+    部位檔記著一筆不確定的委託時，改用「委託送出去了，但…」的說法（規格第 41 條），兩個數字
+    都寫出來（理由見 `exit_uncertain`），只請他確認帳戶、自己平掉還在的。
+    """
+    day = f"{record.trading_day:%m/%d}"
+    settled = (f"{record.order_code} 的最後交易日是 {record.last_trading_day:%m/%d}：過了那天 13:30 "
+               "還在的口數由交易所以最後結算價現金了結，不必再平。")
+    u = record.uncertain
+    if u is not None:
+        stage = "進場" if u.stage == position_file.ENTRY else "平倉"
+        side = (_SIDE_TEXT if u.stage == position_file.ENTRY else _CLOSE_SIDE_TEXT)[record.direction]
+        return (
+            f"【要你處理】PTS 委託送出去了，但不知道成交幾口：{day} 的微台沒有平倉\n"
+            f"不確定的委託：{stage}{side}{_PRODUCT_TEXT[record.product]} {u.requested_lots} 口"
+            f"（委託序號 {u.order_seq or '沒有拿到'}），已知至少成交 {u.known_filled} 口\n"
+            f"部位檔記到的部位（不含這一筆）：{_HOLDING_TEXT[record.direction]} {record.open_lots} 口\n"
+            f"{_missed_reason(day)}\n"
+            f"請到券商 APP 確認帳戶，自行平掉 PTS 還在的微台部位。{settled}\n"
+            f"{at:%Y/%m/%d %H:%M:%S}"
+        )
+    lots = record.open_lots
+    side = _CLOSE_SIDE_TEXT[record.direction]
+    return (
+        f"【要你處理】PTS 部位還在：{day} 的微台沒有平倉，還剩{_HOLDING_TEXT[record.direction]} "
+        f"{lots} 口\n"
+        f"{_missed_reason(day)}\n"
+        "請先到券商 APP 確認帳戶（你可能已經自己平掉了），還在的話請自行"
+        f"{side}{_PRODUCT_TEXT[record.product]} {lots} 口（{record.order_code}）。{settled}\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def exit_missed_unreadable(*, at: datetime, day: date, reason: str) -> str:
+    """出場程式在 `day` 沒有跑完，那天的部位檔又讀不懂（規格第 38 條）：不知道那天留下什麼。
+
+    讀不懂就不知道是哪個商品：大台、小台那天 13:30 已經被券商強平，微台沒有人平。
+    """
+    return (
+        f"【要你處理】PTS {day:%m/%d} 的部位檔讀不懂，出場程式沒有平倉\n"
+        f"{_missed_reason(f'{day:%m/%d}')}。部位檔：{reason}\n"
+        "PTS 那天可能留下微台部位：請到券商 APP 確認帳戶，還在的話請自行平掉。大台、小台標了當沖，"
+        "那天 13:30 已經由券商強平。\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+def _missed_reason(day: str) -> str:
+    """出場程式那天為什麼沒平：排程補跑落在隔天或週末，或那天跑到一半停了——分不出是哪一種，
+    兩種都講。"""
+    return (f"原因：出場程式 {day} 沒有跑完（電腦當時關機、睡著，或出場程式中途停了），"
+            "這一次執行才發現。那天的日盤已經收盤，不送單")
+
+
 def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,
                      on_file: position_file.PositionRecord, reason: str) -> str:
     """出場程式平倉了，部位檔卻寫不進去。平倉照樣做完了，要人做的只有一件事：**不要重跑**。

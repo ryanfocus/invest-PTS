@@ -12,7 +12,8 @@ import pytest
 
 import paths
 from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, FillUnknown,
-                    LoginFailed, OrderFailed, OrderRequest, ProductListUnavailable)
+                    LoginFailed, LoginUnavailable, OrderFailed, OrderRequest,
+                    ProductListUnavailable)
 from broker.capital import CapitalBroker
 from fake_skcom import (FakeSkcom, fills, full_fill, no_sequence, refused_at_send, rejected,
                         reply_row, silence)
@@ -51,6 +52,41 @@ def test_the_component_writes_its_logs_into_the_project_log_directory():
 def test_a_failed_login_is_a_login_failure_with_the_brokers_message():
     with pytest.raises(LoginFailed, match="群益訊息1001"):
         _broker(FakeSkcom(login_code=1001)).login()
+
+
+# 群益文件裡講明是網路、主機或「稍後再試」的登入代碼（《策略王COM元件使用說明_V2.13.58》
+# 錯誤代碼表與《V2.13.45以上登入代碼定義》）。這些沒有驗證到密碼，再試不會累積密碼錯誤次數。
+_TRY_AGAIN_LATER = {
+    101: "登入token異常／請重新登入",
+    156: "SK_ERROR_LOGIN_NO_SERVER_LIST：未能取得主機清單",
+    1041: "SK_ERROR_SERVER_NOT_CONNECTED：與主機尚未連線",
+    1097: "SK_ERROR_TELNET_LOGINSERVER_FAIL：Telnet登入主機失敗",
+    1108: "SK_ERROR_TELNET_SERVER_FAIL：因網路異常，無法連線",
+    1109: "SK_ERROR_THERE_IS_NO_TOKEN：因登入未取得時效token，請重新登入",
+    1129: "SK_ERROR_LOGIN_FAIL_IN_PROCESSING：登入失敗，請稍等五秒後再試",
+    2020: "SK_WARNING_PRECHECK_RESULT_FAIL：取得行情主機或回報主機連線資訊失敗",
+    2021: "SK_WARNING_PRECHECK_RESULT_EMPTY：取得行情主機或回報主機連線資訊結果為空值",
+    2029: "SK_WARNING_SHOULD_CHECK_NETWORK",
+}
+
+
+@pytest.mark.parametrize("code", _TRY_AGAIN_LATER, ids=_TRY_AGAIN_LATER.values())
+def test_a_login_that_failed_on_the_network_or_the_brokers_servers_is_worth_trying_again(code):
+    """`LoginFailed` 的意思是「重試無用，要人處理」：盤中程式看到它，今天就不再登入（帳密錯了
+    每分鐘再試會把帳號鎖住，群益 307）。開盤時碰上一次斷線、群益主機忙，卻不是這一類——
+    當成這一類的話，一次網路異常就賠掉一整天，排程的每分鐘重啟也接不住。"""
+    with pytest.raises(LoginUnavailable, match=f"群益訊息{code}"):
+        _broker(FakeSkcom(login_code=code)).login()
+
+
+@pytest.mark.parametrize("code", [300, 306, 307, 600, 604, 151, 1001, 9999],
+                         ids=["密碼錯誤", "身分證字號錯誤", "密碼被鎖定", "憑證錯誤", "憑證過期",
+                              "舊版密碼錯誤", "登入失敗請看LOG", "文件沒有的代碼"])
+def test_any_other_login_failure_is_not_worth_trying_again(code):
+    """帳密、憑證，以及文件沒講清楚的代碼，都當成「重試無用」：分不清的時候，賠掉一天的進場
+    好過把帳號鎖住——鎖住的帳號連使用者自己的 APP、OS 都登不進去。"""
+    with pytest.raises(LoginFailed):
+        _broker(FakeSkcom(login_code=code)).login()
 
 
 class _BrokenOnce(FakeSkcom):

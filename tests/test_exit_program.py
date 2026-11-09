@@ -709,6 +709,117 @@ def test_run_before_the_entry_cutoff_it_does_nothing():
     assert _file() == content
 
 
+# --- 出場程式那天沒有跑完，之後才被叫醒（規格第 31、55 條）---
+#
+# 13:25 電腦關機、睡著或出場程式中途停了。排程「錯過就補跑」，但補跑可能落在隔天早上、
+# 隔天下午，或是週末——那時系統日期已經不是部位的那一天。微台過夜是這個策略唯一不能接受
+# 的結果，而平常沒有例行訊息能讓人發現它。
+
+TUESDAY = date(2026, 11, 10)
+SATURDAY = date(2026, 11, 14)
+
+LATER = {
+    "隔天早上（13:20 之前）": datetime(2026, 11, 10, 8, 10),
+    "隔天下午（13:45 之後）": datetime(2026, 11, 10, 14, 0),
+    "週末": datetime(2026, 11, 14, 10, 0),
+}
+
+
+def _monday_missed(at: datetime) -> str:
+    return (
+        "【要你處理】PTS 部位還在：11/09 的微台沒有平倉，還剩多單 3 口\n"
+        "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，或出場程式中途停了），"
+        "這一次執行才發現。那天的日盤已經收盤，不送單\n"
+        "請先到券商 APP 確認帳戶（你可能已經自己平掉了），還在的話請自行賣出微台 3 口（TM2611）。"
+        "TM2611 的最後交易日是 11/18：過了那天 13:30 還在的口數由交易所以最後結算價現金了結，"
+        "不必再平。\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
+@pytest.mark.parametrize("at", LATER.values(), ids=LATER.keys())
+def test_a_micro_position_left_on_a_day_the_exit_program_missed_is_reported_later(at):
+    """週一的部位檔記著微台多單 3 口、一口都沒平，週一的出場程式沒有跑。之後不管哪天、幾點
+    被叫醒，都要講週一那 3 口——只看「今天」的部位檔的話，隔天早上是「進場截止之前」、
+    週末是「非交易日」、隔天下午是「今天沒有部位」，三種都安靜地結束。
+    那一天的日盤早就收了，不送單（規格第 55 條）。"""
+    content = _on_file()
+    broker, sent, _ = _run(at=at, login_error=AssertionError("前一天的部位不送單，不該登入"))
+    assert broker.orders == []
+    assert [m for m in sent if "11/09" in m] == [_monday_missed(at)]
+    assert _file() == content
+
+
+def test_a_missed_day_is_reported_once_not_on_every_later_run():
+    """週二 08:10 補跑時講過週一那 3 口了。週二 13:25 照常叫醒、之後每天也都會叫醒：部位檔
+    永遠記著那 3 口（使用者自己平掉的話，出場程式不會知道），每天講一次就是每天一則假警報。"""
+    _on_file()
+    _, first, _ = _run(at=datetime(2026, 11, 10, 8, 10))
+    _intraday_ran(TUESDAY)
+    _, later, _ = _run(at=_at("13:25", TUESDAY))
+    _, after_that, _ = _run(at=_at("13:25", date(2026, 11, 11)))
+
+    assert len([m for m in first if "11/09" in m]) == 1
+    assert [m for m in later + after_that if "11/09" in m] == []
+
+
+def test_a_day_whose_exit_program_already_raised_the_alarm_is_not_reported_again():
+    """週一 13:25 出場程式照常跑了：平倉被拒、重試用完，已經告警「部位還在」。部位檔照樣記著
+    那 3 口沒平——隔天再講一次，就是同一件事的第二則告警。"""
+    _on_file()
+    _, monday, _ = _run(order_errors=[OrderFailed("保證金不足")] * 4)
+    assert len(monday) == 1
+    _intraday_ran(TUESDAY)
+    _, tuesday, _ = _run(at=_at("13:25", TUESDAY))
+    assert tuesday == []
+
+
+def test_a_missed_day_whose_position_file_cannot_be_read_is_reported_and_today_still_exits():
+    """週一的部位檔讀不懂、週一的出場程式又沒跑：不知道那天有沒有微台，照實講（規格第 38 條）。
+    今天的出場照常——一份舊檔讀不懂，不能讓今天的微台也跟著過夜。"""
+    path = position_file.path_for(DAY)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{寫到一半")
+    _intraday_ran(TUESDAY)
+    _on_file(TUESDAY, entries=_lots(1))
+
+    broker, sent, _ = _run(at=_at("13:25", TUESDAY))
+
+    assert [(o.side, o.lots, o.trading_day) for o in broker.orders] == [(SELL, 1, TUESDAY)]
+    assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 11/09 的部位檔讀不懂，出場程式沒有平倉"]
+    assert sent[0].splitlines()[2] == (
+        "PTS 那天可能留下微台部位：請到券商 APP 確認帳戶，還在的話請自行平掉。大台、小台標了當沖，"
+        "那天 13:30 已經由券商強平。")
+
+
+def test_an_uncertain_micro_position_on_a_missed_day_is_reported():
+    """週一有一筆進場單送出去了、不知道成交幾口，週一的出場程式又沒跑。帳上可能比檔裡多一口
+    （規格第 50 條：「委託送出去了，但…」），一樣要講。"""
+    _on_file(status="UNCERTAIN", uncertain={"stage": "ENTRY", "order_seq": "2315609990003",
+                                            "requested_lots": 1, "known_filled": 0})
+    _, sent, _ = _run(at=datetime(2026, 11, 10, 8, 10))
+    assert sent == [
+        "【要你處理】PTS 委託送出去了，但不知道成交幾口：11/09 的微台沒有平倉\n"
+        "不確定的委託：進場買進微台 1 口（委託序號 2315609990003），已知至少成交 0 口\n"
+        "部位檔記到的部位（不含這一筆）：多單 3 口\n"
+        "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，或出場程式中途停了），"
+        "這一次執行才發現。那天的日盤已經收盤，不送單\n"
+        "請到券商 APP 確認帳戶，自行平掉 PTS 還在的微台部位。TM2611 的最後交易日是 11/18：過了那天 "
+        "13:30 還在的口數由交易所以最後結算價現金了結，不必再平。\n"
+        "2026/11/10 08:10:00",
+    ]
+
+
+@pytest.mark.parametrize("product, order_code", [("TX00AM", "TX11"), ("MTX00AM", "MTX11")],
+                         ids=["大台", "小台"])
+def test_tx_and_mtx_on_a_missed_day_were_closed_by_the_broker_and_need_no_word(product,
+                                                                             order_code):
+    """大台、小台標了當沖，那天 13:30 券商就強平了，跟出場程式有沒有跑無關（規格第 30 條）。"""
+    _on_file(product=product, order_code=order_code)
+    _, sent, _ = _run(at=datetime(2026, 11, 10, 8, 10))
+    assert sent == []
+
+
 # --- Discord 關閉（規格第 45 條）---
 
 

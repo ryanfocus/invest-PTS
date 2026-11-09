@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import date, datetime
@@ -167,9 +168,32 @@ def test_both_programs_run_as_the_logged_in_user_who_holds_the_certificate(venv,
     assert principal.find("t:LogonType", _NS).text == "InteractiveToken"
 
 
+def _hours(duration: str) -> float:
+    """ISO 8601 的時間長度（PT14H、PT4H40M、PT1H）換成小時。"""
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", duration)
+    assert match, duration
+    return int(match.group(1) or 0) + int(match.group(2) or 0) / 60
+
+
+def test_a_catch_up_run_started_before_the_open_is_not_killed_before_the_1320_cutoff(venv):
+    """執行上限是從**這一個**盤中程式啟動時算的，不是從 08:40。週末整個關機、週一 00:30 開機，
+    補跑當下就把盤中程式叫起來，它一路常駐到 13:20 收工——將近 13 小時。上限比這短的話，
+    工作排程器會在盤中把它砍掉：等待中的突破進場丟了（規格第 48 條，不恢復），剛好砍在送單
+    與成交之間就是一筆「不確定」，當天不再進場、出場程式也不自動平倉。
+
+    上限也不能長到卡住隔天：13:20 那一刻才起來、又卡住的那一個，要在隔天 08:40 之前被砍掉，
+    「已經在跑就不啟動新的」才不會讓隔天整天都叫不醒。"""
+    task = _install(venv).definitions[INTRADAY]
+    limit = _hours(task.find("t:Settings/t:ExecutionTimeLimit", _NS).text)
+    from_midnight_to_cutoff = 13 + 20 / 60
+    from_cutoff_to_next_open = (24 - (13 + 20 / 60)) + (8 + 40 / 60)
+    assert from_midnight_to_cutoff < limit < from_cutoff_to_next_open
+
+
 def test_the_intraday_program_is_not_woken_while_the_network_is_down(venv):
-    """登入失敗今天就不再試（帳密錯了每分鐘再試會把帳號鎖住，群益代碼 307）。開機自動登入之後
-    網路還沒好的那幾秒去登入，登入失敗就賠掉一整天；網路不通時不叫醒，下一分鐘再看。
+    """帳密、憑證與分不清的登入失敗今天就不再試（帳密錯了每分鐘再試會把帳號鎖住，群益代碼
+    307）。開機自動登入之後網路還沒好的那幾秒去登入，回的代碼萬一不在群益文件的網路類裡，
+    就賠掉一整天；網路不通時不叫醒，下一分鐘再看。
     出場程式照樣叫醒：它是微台唯一的出場，連不上也要留下記錄。"""
     definitions = _install(venv).definitions
     assert definitions[INTRADAY].find("t:Settings/t:RunOnlyIfNetworkAvailable", _NS).text == "true"

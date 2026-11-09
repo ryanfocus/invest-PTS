@@ -9,7 +9,7 @@ import os
 import time
 
 import paths
-from housekeeping import LOG_RETENTION_DAYS, purge_old_logs
+from housekeeping import purge_old_logs
 
 DAY = 86400
 
@@ -49,11 +49,19 @@ def test_logs_older_than_30_days_are_removed_including_the_capital_component_log
     assert [p for p in fresh if not os.path.exists(p)] == []
 
 
-def test_a_log_exactly_30_days_old_is_kept():
-    """邊界留著：「保留 30 天」的自然理解是「30 天內的都在」，砍掉邊界會讓最舊的那天撲空。"""
-    edge = _in_logs("exit-20261011.log", days_old=LOG_RETENTION_DAYS - 0.01)
-    purge_old_logs()
-    assert os.path.exists(edge)
+def test_a_log_is_kept_for_exactly_30_days_and_removed_one_second_later():
+    """「保留 30 天」（規格第 60 條）：剛好 30 天的還在——自然的理解是「30 天內的都在」，砍掉
+    邊界會讓最舊的那天撲空——多一秒就刪。30 天寫成字面值，不從程式的常數算：改了保留天數、
+    或把邊界從「留」改成「刪」，這裡都要紅。"""
+    written = 1_790_000_000.0                   # 2026-09-21 前後，哪一刻都一樣
+    path = _in_logs("exit-20260921.log", days_old=0)
+    os.utime(path, (written, written))
+
+    purge_old_logs(now=written + 30 * DAY)
+    assert os.path.exists(path), "剛好 30 天的 log 要留著"
+
+    purge_old_logs(now=written + 30 * DAY + 1)
+    assert not os.path.exists(path), "超過 30 天的 log 要刪掉"
 
 
 def test_raw_market_data_and_state_are_never_purged():

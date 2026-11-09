@@ -52,8 +52,8 @@
     當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
   * **排程每分鐘叫醒**（ticket 10，`tools/schedule.py`）：這就是失敗時的自動重啟，所以正常結束
     之後也會再被叫醒。今天已經走到結局（心跳記錄寫了「收工了」）就什麼都不做
-    （`_finished_earlier`）；今天登入失敗過就不再登入（`login_failed_path`）。同一時間只有一個
-    盤中程式（`_alone`）。
+    （`_finished_earlier`）；今天登入失敗過就不再登入（`login_failed_path`）——網路、群益主機的
+    問題（`LoginUnavailable`）不算，下一分鐘照樣再登入。同一時間只有一個盤中程式（`_alone`）。
 
 ## 突破進場的盯價
 
@@ -213,6 +213,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     except LoginFailed as exc:
         _write_login_failed(today, str(exc))
         raise
+    # `LoginUnavailable`（網路、群益主機）不寫：往外拋、這一輪結束，下一分鐘排程叫醒時再登入
     orders = None
     if config.auto_order_enabled:
         # 近月合約（結算日當天就是當天到期的那個，規格第 9 條）在開盤前查好：查不到是
@@ -1080,9 +1081,12 @@ def login_failed_path(day: date) -> str:
     """那個交易日的登入失敗記錄：今天為什麼不再登入（ticket 10）。
 
     排程每分鐘叫醒盤中程式一次（失敗時自動重啟），登入失敗卻是重試沒有用、要人處理的事
-    （`broker.LoginFailed`：帳密、憑證、群益元件沒註冊）。帳密錯了還每分鐘再試，一天就是
-    兩百多次錯誤的登入，可能把帳號鎖住——連使用者自己的 APP、OS 都登不進去。所以寫成檔，
-    之後被叫醒看到它就不再登入。
+    （`broker.LoginFailed`：帳密、憑證、群益元件沒註冊，以及分不清是哪一類的代碼）。帳密錯了還
+    每分鐘再試，一天就是兩百多次錯誤的登入，可能把帳號鎖住——連使用者自己的 APP、OS 都登不
+    進去。所以寫成檔，之後被叫醒看到它就不再登入。
+
+    網路或群益主機的問題（`broker.LoginUnavailable`：斷線、取不到主機清單、「請稍後再試」）
+    **不寫**：沒有驗證到密碼，不會鎖帳號；下一分鐘再登入一次，開盤時的一次斷線才不會賠掉一整天。
 
     **不寫進心跳記錄**：這不是「收工了」。使用者要從 13:25 出場程式的「盤中程式今天沒有跑」
     知道這件事（規格第 54 條），心跳記錄寫了「收工了」，出場程式就不講了。
