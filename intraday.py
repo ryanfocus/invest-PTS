@@ -1,12 +1,13 @@
-"""盤中程式：每個交易日 08:40 啟動，收大台行情、組 1 分 K、存原始行情，13:20 結束。
+"""盤中程式：每個交易日 08:40 啟動，收大台行情、組 1 分 K、存原始行情、判斷進場，13:20 結束。
 
 用法（在專案根目錄）：
 
     python intraday.py
 
-ticket 02 只有最小路徑：**不判斷、不下單、不發訊息**。它的價值是讓實機資料盡早開始
-累積（ticket 03 要用一週的原始行情回答筆差的事實問題）。之後的 ticket 在 `run()` 的
-「一根 K 棒結束」那一點接上策略判斷，在成交事件上接突破進場的盯價。
+每一根 1 分 K 結束時交給策略判斷（`strategy.decide`）。目前只有條件 1、2 與模擬模式
+（ticket 04）：條件成立就在交易商品當下的價格模擬成交一次，發一則標示「模擬」的訊息，
+**完全不呼叫下單 API**。真實下單（ticket 06）、條件 3、4 與突破進場的盯價（ticket 05）
+之後接在同樣的地方。
 
 ## 時間
 
@@ -29,20 +30,27 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, timedelta
+from typing import Callable
 
 import calendar_tw
 import indicators
+import messages
 import paths
 import settings
+import strategy
 from broker import Broker, BrokerError, ProductTrade, TxTrade, TxTradeCounts
 from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
 
 # 13:20 進場截止，盤中程式在那一刻收工（規格「兩支程式」一節）。13:19 那根到這時結束，
-# 照樣交出來；之後的事件不組 K 棒、也不寫進原始行情。
-SESSION_END = time(13, 20)
+# 照樣交出來；之後的事件不組 K 棒、也不寫進原始行情。時刻是策略常數，定義在策略判斷。
+SESSION_END = strategy.ENTRY_CUTOFF
+
+# 往前找幾個交易日的 1 分 K 當暖身與昨收。日曆認得國定假日，認不得颱風假這類臨時休市
+# （那天查不到 K 棒），所以查不到就再往前一天。
+_HISTORY_LOOKBACK = 5
 
 
 class Ending(enum.Enum):
@@ -65,8 +73,10 @@ class SessionOutcome:
     bars: tuple[indicators.ClosedBar, ...] = ()
 
 
-def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutcome:
+def run(broker: Broker, config: settings.Config, *, today: date,
+        notify: Callable[[str], bool]) -> SessionOutcome:
     """跑一個交易日的上午。`today` 是啟動當天的日期（見模組說明「時間」）。
+    `notify` 送出一則 Discord（測試換成記錄器）；Discord 開關在這裡把關，關著就不呼叫它。
 
     原始行情會**先暫存、確認報價屬於今天之後才寫檔**：開盤前的累計筆數（08:40 起）
     要留著回答「從什麼時候開始累計」（ticket 03），但臨時休市那天一行都不能寫——
@@ -85,11 +95,17 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
        看起來就和臨時休市一模一樣。拿它收工的話，一次開盤時的斷線就賠掉一整天，
        而且程式正常結束，排程的失敗重啟也不會接手。等的代價是零（見第一點）。
     """
+    if config.auto_order_enabled:
+        # ticket 06 接上真實下單時拿掉。在那之前照樣跑的話，使用者會以為條件成立時真的下了單。
+        raise NotImplementedError(
+            "自動下單（order.auto_enabled: true）還沒有實作，目前只能跑模擬模式。"
+            "把 config/settings.yaml 的 auto_enabled 改回 false")
     if not calendar_tw.is_trading_day(today):
         logger.info("%s 不是交易日，不登入", today)
         return SessionOutcome(Ending.NOT_A_TRADING_DAY)
 
     broker.login()
+    trading = _Trading(config, notify, _load_history(broker, today))
     end_at = datetime.combine(today, SESSION_END)
     state = indicators.BarState()
     bars: list[indicators.ClosedBar] = []
@@ -97,10 +113,11 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
     confirmed = False               # 收到今天日盤的成交了
     other_day: date | None = None   # 收過哪一個別的交易日的大台成交
 
-    def _close(closed: indicators.ClosedBar | None) -> None:
+    def _close(closed: indicators.ClosedBar | None, now: datetime) -> None:
         if closed is not None:
             bars.append(closed)
-            _log_bar(closed)
+            _log_bar(closed, trading.rsi(bars))
+            trading.on_bar(bars, now)
 
     ending = Ending.STREAM_ENDED
     try:
@@ -112,7 +129,7 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
                 continue
             if event.time >= end_at:
                 state, closed = indicators.close_forming(state)
-                _close(closed)
+                _close(closed, event.time)
                 ending = Ending.CUTOFF
                 if not confirmed and other_day is not None:
                     logger.warning("到 %s 都沒有今天的成交，收到的是 %s 的報價（臨時休市？）",
@@ -125,10 +142,12 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
                     raw.confirm()
                 raw.trade(event)
                 state, closed = indicators.add_trade(state, event)
-                _close(closed)
+                _close(closed, event.time)
             elif isinstance(event, TxTradeCounts):
                 raw.counts(event)
                 state = indicators.add_counts(state, event)
+            elif isinstance(event, ProductTrade):
+                trading.product_price = event.price
     finally:
         raw.close()
 
@@ -136,17 +155,143 @@ def run(broker: Broker, config: settings.Config, *, today: date) -> SessionOutco
     return SessionOutcome(ending, tuple(bars))
 
 
-def _log_bar(closed: indicators.ClosedBar) -> None:
-    """每一根都寫進 log：實機時要拿它和看盤軟體的大台 1 分 K 逐根核對。"""
+def _log_bar(closed: indicators.ClosedBar, rsi: float | None) -> None:
+    """每一根都寫進 log：實機時要拿它（含 RSI）和看盤軟體的大台 1 分 K 逐根核對。"""
     bar = closed.bar
     bichai = "未知（還沒收到累計成交筆數）" if closed.bichai is None else closed.bichai
-    logger.info("1 分 K %s 開 %g 高 %g 低 %g 收 %g 筆差 %s",
-                f"{bar.start:%H:%M}", bar.open, bar.high, bar.low, bar.close, bichai)
+    logger.info("1 分 K %s 開 %g 高 %g 低 %g 收 %g 筆差 %s RSI %s",
+                f"{bar.start:%H:%M}", bar.open, bar.high, bar.low, bar.close, bichai,
+                "未知" if rsi is None else f"{rsi:.2f}")
+
+
+# ── 暖身與昨收 ──────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _History:
+    """前一個交易日的大台日盤 1 分 K。RSI 的暖身用它，昨收是它最後一根的收盤價。
+
+    ⚠️ 昨收**不是**結算價，也不是群益商品資料裡的參考價（`nRef`）：兩者可能差到幾十點，
+       開高／開低就會判斷錯（規格第 5 條）。
+    """
+
+    day: date
+    bars: tuple[indicators.ClosedBar, ...]
+
+    @property
+    def close(self) -> float:
+        return self.bars[-1].bar.close
+
+
+def _load_history(broker: Broker, today: date) -> _History | None:
+    """往前找最近一個有 1 分 K 的交易日。查不到就是 None：今天不判斷，但照常收行情。
+
+    查詢失敗不中止盤中程式：原始行情照樣要記（ticket 03 要一週的資料），只是今天沒有
+    昨收與暖身，任何條件都判斷不了。
+    """
+    day = today
+    for _ in range(_HISTORY_LOOKBACK):
+        day -= timedelta(days=1)
+        while not calendar_tw.is_trading_day(day):
+            day -= timedelta(days=1)
+        try:
+            bars = broker.minute_bars(day)
+        except BrokerError as exc:
+            logger.error("取 %s 的大台 1 分 K 失敗，今天不判斷進場：%s", day, exc)
+            return None
+        if bars:
+            history = _History(day, tuple(indicators.ClosedBar(b, None) for b in bars))
+            logger.info("昨收 %g（%s %s 那根的收盤價），暖身 %d 根",
+                        history.close, day, f"{bars[-1].start:%H:%M}", len(bars))
+            return history
+        logger.info("%s 查不到大台 1 分 K（臨時休市？），再往前一個交易日", day)
+    logger.error("往前 %d 個交易日都查不到大台 1 分 K，沒有昨收，今天不判斷進場",
+                 _HISTORY_LOOKBACK)
+    return None
+
+
+# ── 判斷之後：模擬成交與通知 ──────────────────────────────────────────────
+
+
+class _Trading:
+    """每根 K 棒結束時問策略，條件成立就進場、累計部位、發通知。
+
+    目前只有模擬模式（ticket 04）：成交價是交易商品**當下的價格**（最新一筆成交），
+    部位只留在記憶體裡——**不寫部位檔**（規格第 42 條）。出場程式看的是部位檔，
+    模擬的口數不能讓它以為今天有部位。
+    """
+
+    def __init__(self, config: settings.Config, notify: Callable[[str], bool],
+                 history: _History | None):
+        self._config = config
+        self._notify = notify
+        self._history = history
+        self.position: strategy.Position | None = None
+        # 交易商品的現價：部位不虧用它，模擬也成交在它
+        self.product_price: float | None = None
+
+    def rsi(self, today: list[indicators.ClosedBar]) -> float | None:
+        if self._history is None:
+            return None
+        return strategy.rsi(self._history.bars + tuple(today))
+
+    def on_bar(self, today: list[indicators.ClosedBar], now: datetime) -> None:
+        """一根 K 棒剛結束（`now` 是讓它結束的那個事件的時間）。"""
+        if self._history is None:
+            return
+        first = today[0].bar
+        # 開盤價是 08:45 那根的開盤價。今天第一根不是 08:45（開盤時報價斷了），
+        # 就不知道今天是開高還是開低，條件 1、2 整天都不會成立。
+        today_open = first.open if first.start.time() == indicators.DAY_SESSION_OPEN else None
+        if today_open is None and len(today) == 1:
+            logger.warning("今天第一根 1 分 K 是 %s 不是 08:45，不知道開盤價，條件 1、2 今天不判斷",
+                           f"{first.start:%H:%M}")
+        decision = strategy.decide(strategy.Situation(
+            bars=self._history.bars + tuple(today),
+            today_open=today_open,
+            yesterday_close=self._history.close,
+            now=now,
+            position=self.position,
+            product_price=self.product_price,
+            lots_per_entry=self._config.lots_per_entry,
+            max_position=self._config.max_position,
+        ))
+        if decision is not None:
+            self._simulate(decision, now)
+
+    def _simulate(self, decision: strategy.Enter, now: datetime) -> None:
+        price = self.product_price
+        if price is None:
+            logger.warning("%s 成立，但還沒有交易商品的成交價，這一分鐘不進場",
+                           decision.condition.value)
+            return
+        held = self.position
+        total = decision.lots + (held.lots if held else 0)
+        avg = (price * decision.lots + (held.avg_price * held.lots if held else 0)) / total
+        self.position = strategy.Position(decision.direction, total, avg)
+        logger.info("模擬進場：%s %s %d 口 @ %g，累計 %d 口，均價 %.2f",
+                    decision.condition.value, decision.direction, decision.lots, price,
+                    total, avg)
+        self._send(messages.entry(
+            at=now, product=self._config.product, direction=decision.direction,
+            condition=decision.condition, lots=decision.lots, price=price,
+            total_lots=total, avg_price=avg, simulated=True))
+
+    def _send(self, text: str) -> None:
+        if not self._config.discord_enabled:
+            logger.info("Discord 已關閉，不發送")
+            return
+        self._notify(text)
 
 
 def main() -> int:
-    """排程的進入點（ticket 10 建排程）。登入、收行情、13:20 結束。"""
+    """排程的進入點（ticket 10 建排程）。登入、收行情、判斷進場、13:20 結束。
+
+    **這裡是唯一建立真實 broker 與 Discord 連線的地方**：`run()` 不知道自己拿到的是
+    真的還是假的，測試因此能在沒有群益元件的機器上跑完整個流程。
+    """
     from broker.capital import CapitalBroker
+    from notifiers import discord
 
     # 今天是哪一天：**只在這裡讀一次系統時鐘**（見模組說明「時間」）
     today = date.today()
@@ -155,9 +300,10 @@ def main() -> int:
     config = settings.load()
     secrets = settings.load_secrets(config)
     broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
+    webhook = secrets.discord_webhook
     try:
-        run(broker, config, today=today)
-    except BrokerError as exc:
+        run(broker, config, today=today, notify=lambda text: discord.send(text, webhook))
+    except (BrokerError, NotImplementedError) as exc:
         logger.error("盤中程式中止：%s", exc)
         return 1
     return 0

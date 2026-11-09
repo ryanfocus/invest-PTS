@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from broker import Clock, ProductTrade, TxTrade, TxTradeCounts
+from broker import Clock, MinuteBar, ProductTrade, TxTrade, TxTradeCounts
 
 DAY = date(2026, 11, 9)              # 週一，一般交易日
 
@@ -61,4 +61,54 @@ def whole_morning(day: date = DAY) -> list:
             k += 1
             events.append(TxTradeCounts(t, buy_count=k, sell_count=2 * k))
         t += timedelta(seconds=1)
+    return events
+
+
+# ── 進場劇本 ────────────────────────────────────────────────────────────
+
+PREVIOUS_DAY = date(2026, 11, 6)     # DAY 的前一個交易日（週五）
+
+
+def history(closes: list[float], day: date = PREVIOUS_DAY) -> list[MinuteBar]:
+    """前一個交易日的大台日盤 1 分 K（`FakeBroker(minute_bars={day: ...})` 用）：從 08:45 起
+    每分鐘一根，開高低收都是同一個價。最後一根的收盤價就是昨收（GLOSSARY）。"""
+    start = datetime.combine(day, datetime.strptime("08:45", "%H:%M").time())
+    return [MinuteBar(start + timedelta(minutes=i), c, c, c, c) for i, c in enumerate(closes)]
+
+
+def calm_history(close: float = 45000, day: date = PREVIOUS_DAY) -> list[MinuteBar]:
+    """平淡的前一天：300 根在 close−10 與 close 之間來回，收在 `close`。漲跌各半，
+    RSI 落在 50 附近——今天的走勢才是讓它越過 70／30 的原因。"""
+    return history([close - 10 if i % 2 == 0 else close for i in range(300)], day)
+
+
+def minute(hhmm: str, open_: float, close: float, *, bichai: int | None = None,
+           product: float | None = None, day: date = DAY) -> list:
+    """一分鐘的劇本：`:00` 成交在開盤價、`:20` 累計筆數（給了筆差才有）、`:30` 成交在收盤價、
+    `:40` 交易商品成交（沒給就是大台的收盤價）。
+
+    這根 K 棒要等**下一分鐘的第一筆成交**才結束，策略也在那時判斷——所以劇本最後要再接
+    一分鐘（或一筆成交），最後那根才會被判斷到。
+    """
+    base = datetime.combine(day, datetime.strptime(hhmm, "%H:%M").time())
+    events: list = [TxTrade(base, float(open_))]
+    if bichai is not None:
+        buy = 20000
+        events.append(TxTradeCounts(base + timedelta(seconds=20), buy_count=buy,
+                                    sell_count=buy + bichai))
+    events.append(TxTrade(base + timedelta(seconds=30), float(close)))
+    events.append(ProductTrade(base + timedelta(seconds=40),
+                               float(close if product is None else product)))
+    return events
+
+
+def rally(start: str, n: int, *, open_: float = 45100, step: float = 10, bichai: int = 1500,
+          day: date = DAY) -> list:
+    """從 `start` 起連續 `n` 分鐘的強勢：每根開盤比上一根高 `step`（紅K）、收在開盤 + `step`、
+    筆差 `bichai`。交易商品成交在大台的收盤價。"""
+    t0 = datetime.combine(day, datetime.strptime(start, "%H:%M").time())
+    events: list = []
+    for i in range(n):
+        o = open_ + i * step
+        events += minute(f"{t0 + timedelta(minutes=i):%H:%M}", o, o + step, bichai=bichai, day=day)
     return events

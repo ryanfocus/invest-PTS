@@ -39,7 +39,8 @@ def test_every_module_imports_on_a_machine_without_the_capital_component(tmp_pat
         "raise ImportError('模擬沒有安裝 comtypes')", encoding="utf-8")
 
     modules = ["paths", "settings", "calendar_tw", "broker", "broker.capital_wire",
-               "broker.fake", "broker.capital", "indicators", "raw_market", "intraday"]
+               "broker.fake", "broker.capital", "indicators", "raw_market", "intraday",
+               "strategy", "messages", "notifiers.discord"]
     code = "import " + ", ".join(modules)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(ROOT)])}
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,
@@ -114,3 +115,32 @@ def test_every_reply_sample_has_its_account_fields_masked():
                 assert set(value) <= {"0", "F"}, f"{path.name} 的欄位 [{i}] 不是假值：{value!r}"
             rows += 1
     assert rows >= 6, "樣本不見了，這條檢查等於沒有在跑"
+
+
+# --- 策略常數只出現在策略判斷一處（規格「策略判斷」一節）---
+
+
+def test_strategy_times_and_thresholds_appear_only_in_the_strategy_module():
+    """改常數等於換了一個策略。散在流程裡的那一份，改的時候一定會漏——漏掉的不會報錯，
+    只會讓 13:20 收工和 13:20 進場截止變成兩個時間。
+
+    只掃認得出來、不會誤傷的幾個：08:50、09:45、13:20 這三個時刻，以及筆差門檻 1000、
+    RSI 門檻 70。30、5、100 在別處太常見（逾時秒數、保留天數、價格倍數），不掃。
+    """
+    import ast
+
+    times = {(8, 50), (9, 45), (13, 20)}
+    numbers = {1000, 70}
+    offenders: list[str] = []
+    for path in _tracked("*.py"):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel.startswith(("tests/", "tools/")) or rel == "strategy.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "time"
+                    and tuple(getattr(a, "value", None) for a in node.args[:2]) in times):
+                offenders.append(f"{rel}:{node.lineno} time{tuple(a.value for a in node.args)}")
+            elif (isinstance(node, ast.Constant) and type(node.value) is int
+                    and node.value in numbers):
+                offenders.append(f"{rel}:{node.lineno} {node.value}")
+    assert offenders == [], f"策略常數出現在策略判斷以外：{offenders}"

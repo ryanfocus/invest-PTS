@@ -17,10 +17,12 @@ PTS 拿掉了 OS 專屬的部分（倉別 N／O 的對帳、三商品比價）�
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 
-from broker import BUY, PRODUCT_CODES, ContractInfo, OrderRequest, ProductListUnavailable
+from broker import (BUY, PRODUCT_CODES, ContractInfo, MinuteBar, OrderRequest,
+                    ProductListUnavailable, QuoteUnavailable)
 
 # ── OnNewData 的欄位位置 ──────────────────────────────────────────────
 #
@@ -323,3 +325,50 @@ def build_future_order_fields(request: OrderRequest, account: str) -> dict:
         "sNewClose": _NEW_CLOSE_AUTO,
         "sReserved": _SESSION_INTRADAY,
     }
+
+
+# ── 1 分 K 歷史（OnNotifyKLineData，新版格式）─────────────────────────────
+#
+# 文件 4-4-b 的新版 1 分線：`(年/月/日, 時:分, 開盤價, 最高價, 最低價, 收盤價, 成交量)`，
+# 價格「已進行過小數點處理」，不用除 100。文件自己的例子卻是
+# `2021/8/2 09:01 12.95,12.95,12.95.12.95,5`——日期與時間之間是空白、月日沒補零、還有一個
+# 逗號打成句點。所以分隔符號逗號、空白都收；欄位數不對、數字讀不出來就**拒絕整批**，
+# 不跳過：少一根，昨收或暖身就悄悄錯了。⚠️ 第一次實機收到的字串要回來釘成 fixture。
+
+_KLINE_SEPARATORS = re.compile(r"[,\s]+")
+_KLINE_FIELDS = 7
+# 日盤的 K 棒標籤：標起點是 08:45…13:44，標終點是 08:46…13:45。文件沒說是哪一種
+# （notes/capital-api.md 第 3 節），所以看有沒有 08:45 那根來分辨：標終點的話，
+# 08:45 之前沒有日盤，不會有這個標籤。
+_SESSION_OPEN = time(8, 45)
+_SESSION_LAST_LABEL = time(13, 45)
+
+
+def parse_minute_bars(rows: list[str], day: date) -> list[MinuteBar]:
+    """群益送來的 1 分 K 字串 → `day` 那天日盤的 `MinuteBar`（一律標起點），依時間排序。
+
+    別天的、日盤以外的列不收（文件的全盤範例會帶前一晚的夜盤）。看不懂的列是
+    `QuoteUnavailable`，訊息裡附上那一列——K 線字串沒有帳號資訊，可以寫進 log。
+    """
+    labelled: list[tuple[datetime, float, float, float, float]] = []
+    for row in rows:
+        text = row.strip()
+        if not text or text.startswith("##"):
+            continue
+        fields = _KLINE_SEPARATORS.split(text)
+        try:
+            if len(fields) != _KLINE_FIELDS:
+                raise ValueError(f"應該有 {_KLINE_FIELDS} 個欄位，這一列有 {len(fields)} 個")
+            at = datetime.strptime(f"{fields[0]} {fields[1]}", "%Y/%m/%d %H:%M")
+            o, h, low, c = (float(f) for f in fields[2:6])
+        except ValueError as exc:
+            raise QuoteUnavailable(f"看不懂群益的 1 分 K：{row!r}（{exc}）") from None
+        if at.date() == day and _SESSION_OPEN <= at.time() <= _SESSION_LAST_LABEL:
+            labelled.append((at, o, h, low, c))
+
+    end_labelled = labelled and all(at.time() != _SESSION_OPEN for at, *_ in labelled)
+    shift = timedelta(minutes=1) if end_labelled else timedelta(0)
+    bars = [MinuteBar(at - shift, o, h, low, c) for at, o, h, low, c in labelled]
+    # 換算成起點之後，日盤是 08:45–13:44；標起點時的 13:45 不屬於日盤
+    return sorted((b for b in bars if b.start.time() < _SESSION_LAST_LABEL),
+                  key=lambda b: b.start)

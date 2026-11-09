@@ -1,0 +1,39 @@
+# Source: StockCharts ChartSchool - Relative Strength Index (RSI), example spreadsheet cs-rsi.xls
+# Page: https://chartschool.stockcharts.com/table-of-contents/technical-indicators-and-overlays/technical-indicators/relative-strength-index-rsi
+# Retrieved: 2026-10-01. 33 QQQQ closes; rsi_14 is StockCharts' own published 14-day Wilder RSI (blank = not yet defined;
+# row 14 held the column label "RSI" in the source sheet, not a value).
+# This is an INDEPENDENT source of expected values for the RSI formula (not computed by this project).
+n,close,rsi_14
+1,44.3389,
+2,44.0902,
+3,44.1497,
+4,43.6124,
+5,44.3278,
+6,44.8264,
+7,45.0955,
+8,45.4245,
+9,45.8433,
+10,46.0826,
+11,45.8931,
+12,46.0328,
+13,45.614,
+14,46.282,
+15,46.282,70.53278948369497
+16,46.0028,66.31856180517232
+17,46.0328,66.54982993552764
+18,46.4116,69.40630533884433
+19,46.2222,66.3551690562718
+20,45.6439,57.97485571430819
+21,46.2122,62.929606754597
+22,46.2521,63.25714756254528
+23,45.7137,56.05929871526324
+24,46.4515,62.37707144318042
+25,45.7835,54.70757308126129
+26,45.3548,50.4227744114564
+27,44.0288,39.989823145376604
+28,44.1783,41.46048197570564
+29,44.2181,41.86891609254328
+30,44.5672,45.46321244528675
+31,43.4205,37.30404208985967
+32,42.6628,33.07952299438848
+33,43.1314,37.77295211443486

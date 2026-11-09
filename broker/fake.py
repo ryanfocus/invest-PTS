@@ -34,6 +34,7 @@ class FakeBroker:
       ——市價單成交在當下的價格。兩者都沒有就拒絕送單（那是測試沒寫對）。
     - `fills`：每筆委託實際成交幾口，逐筆消耗。沒給就是全部成交。
     - `order_errors`：每筆委託要拋的例外（`None` 代表照常成交），逐筆消耗。
+    - `minute_bars_error`：查 1 分 K 時要拋的例外（每次都拋）。
     """
 
     def __init__(
@@ -47,6 +48,7 @@ class FakeBroker:
         order_errors: Iterable[Exception | None] = (),
         login_error: Exception | None = None,
         contracts_error: Exception | None = None,
+        minute_bars_error: Exception | None = None,
     ):
         self._contracts = contracts or {}
         self._events = list(events)
@@ -57,6 +59,7 @@ class FakeBroker:
         self._order_errors = list(order_errors)
         self._login_error = login_error
         self._contracts_error = contracts_error
+        self._minute_bars_error = minute_bars_error
         # 收到的委託，依序。「一次都沒被呼叫」就是斷言 `orders == []`——
         # 這是唯一會動到錢的路徑，證明它沒被走過比證明它走對了更重要。
         # 被 `ensure_sendable` 擋下的委託沒有送出去，所以不在這裡。
@@ -72,6 +75,8 @@ class FakeBroker:
         return dict(self._contracts)
 
     def minute_bars(self, day: date) -> list[MinuteBar]:
+        if self._minute_bars_error is not None:
+            raise self._minute_bars_error
         return list(self._minute_bars.get(day, []))
 
     def events(self, product: str) -> Iterator[MarketEvent]:

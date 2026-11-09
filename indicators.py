@@ -4,13 +4,14 @@
 原始行情檔照順序重播一次，得到和當時一樣的筆差（ticket 09；群益的筆差沒有歷史回補）。
 狀態是一個不可變的 `BarState`，每個事件回傳新的狀態，沒有 I/O。
 
-ticket 04 的 RSI(5) 也放在這裡。
+RSI 也在這裡：期數由策略判斷給（策略常數只出現在那一處）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, time
+from typing import Sequence
 
 from broker import MinuteBar, TxTrade, TxTradeCounts
 
@@ -87,3 +88,32 @@ def close_forming(state: BarState) -> tuple[BarState, ClosedBar | None]:
 def _bichai(counts: TxTradeCounts | None) -> int | None:
     """筆差 = 成交賣出筆數 − 成交買進筆數（GLOSSARY）。正值解讀為大戶在買。"""
     return None if counts is None else counts.sell_count - counts.buy_count
+
+
+# ── RSI ─────────────────────────────────────────────────────────────────
+
+
+def rsi(closes: Sequence[float], period: int) -> float | None:
+    """以 `closes` 最後一筆為準的 Wilder RSI（0–100）。不到 `period + 1` 筆時是 None。
+
+    移植 invest-WOIC `indicators/rsi.py` 的 wilder 算法（已對照 StockCharts 範例驗證，
+    同一份 fixture 在 tests/test_rsi.py）：第一筆平均 = 前 N 期總和 ÷ N；之後 =
+    (前值 × (N−1) + 當期) ÷ N。平均跌幅 0 → 100、平均漲幅 0 → 0（StockCharts 的定義）。
+
+    ⚠️ Wilder 的遞推受起點影響，所以呼叫端要接上暖身資料（規格第 4 條）。PTS 用前一個
+       交易日的整個日盤（約 300 根）：起點的權重剩 (4/5)^300，08:50 一開始就是收斂後的值。
+    期數由呼叫端給：RSI 期數是策略常數，只出現在策略判斷一處。
+    """
+    changes = [b - a for a, b in zip(closes, closes[1:])]
+    if len(changes) < period:
+        return None
+    gains = [max(c, 0.0) for c in changes]
+    losses = [max(-c, 0.0) for c in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100.0 * avg_gain / (avg_gain + avg_loss)

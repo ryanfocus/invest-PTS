@@ -58,7 +58,8 @@ from broker import (
     TX_CODE,
     ensure_sendable,
 )
-from broker.capital_wire import build_future_order_fields, parse_product_list, summarize_fills
+from broker.capital_wire import (build_future_order_fields, parse_minute_bars,
+                                 parse_product_list, summarize_fills)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,12 @@ _PRICE_SCALE = 100
 
 # 每隔幾秒問一次主機時間，保持報價連線（文件 4-4-5：「請固定每十五秒呼叫此函式」）
 _KEEPALIVE = timedelta(seconds=15)
+
+# 1 分 K 歷史的查詢參數（文件 4-4-24）。AM 盤由 sTradeSession 選，代碼不帶 AM。
+_KLINE_CODE = "TX00"
+_KLINE_MINUTES = 0          # sKLineType：0 分線
+_KLINE_NEW_FORMAT = 1       # sOutType：1 新版（價格已處理過小數點）
+_KLINE_AM_SESSION = 1       # sTradeSession：1 AM 盤（日盤）
 
 
 class _RealCom:
@@ -205,6 +212,9 @@ class _QuoteEvents:
         self.received_at = datetime.min
         self.trade_info_seen = False
         self.unknown_indexes: set[int] = set()
+        # 1 分 K 歷史：一次只查一天，收齊（OnKLineComplete）之前不送下一個查詢
+        self.kline_rows: list[str] = []
+        self.kline_done = False
 
     def OnConnection(self, nKind, nCode):
         if nKind == _STOCKS_READY:
@@ -248,6 +258,21 @@ class _QuoteEvents:
             self.market.append(ProductTrade(t, price))
 
     OnNotifyHistoryTicksLONG = OnNotifyTicksLONG
+
+    def OnNotifyKLineData(self, bstrStockNo, bstrData):
+        """一根 1 分 K 的字串（文件 4-4-b）。解析留到收齊之後：這裡拋例外會被 COM 吞掉。
+
+        文件 4-4-t 的備註說結束時會「回傳一筆以『##』開頭的內容」，沒說是哪個事件，
+        所以這裡也認它。
+        """
+        if bstrData.startswith("##"):
+            self.kline_done = True
+            return
+        self.kline_rows.append(bstrData)
+
+    def OnKLineComplete(self, bstrEndString):
+        """「收完歷史KLine，等收到此事件通知後表示回補完成」（文件 4-4-t）。"""
+        self.kline_done = True
 
     def OnNotifyFutureTradeInfoLONG(self, bstrStockNo, sMarketNo, nStockIdx, nBuyTotalCount,
                                     nSellTotalCount, nBuyTotalQty, nSellTotalQty,
@@ -445,14 +470,52 @@ class CapitalBroker:
     # --- 行情 ---
 
     def minute_bars(self, day: date) -> list[MinuteBar]:
-        """指定交易日的大台日盤 1 分 K。
+        """指定交易日的大台日盤 1 分 K（細節與出處見 notes/capital-api.md 第 3 節）。
 
-        ticket 04 實作：`SKQuoteLib_RequestKLineAMByDate(代碼, 0 分線, 1 新版格式,
-        1 AM 盤, 日期, 日期, 1)`，從 `OnNotifyKLineData` 收、等 `OnKLineComplete`。
-        新版格式的真實字串要先錄下來當 fixture（文件的例子本身就不一致），
-        K 棒時間標的是起點還是終點也要實機核對。見 notes/capital-api.md 第 3 節。
+        `SKQuoteLib_RequestKLineAMByDate(TX00, 0 分線, 1 新版格式, 1 AM 盤, 日期, 日期, 1 分)`，
+        從 `OnNotifyKLineData` 一列一列收，收到結束通知才算齊。盤別由 `sTradeSession`
+        選，所以代碼不帶 AM（帶 AM 的寫法只有逐筆與報價的文件提到）。
+
+        ⚠️ 三件事文件沒寫、要實機核對（ticket 04 的 Comments）：新版格式的真實字串、
+           K 棒時間標的是起點還是終點（`parse_minute_bars` 從資料本身分辨）、
+           `TX00` 加 AM 盤是不是真的只給日盤。
+
+        沒有資料（臨時休市）是空的 list；查不了、沒收齊、看不懂是 `QuoteUnavailable`——
+        元件自己拋的例外也是，不讓它漏出去中止整個盤中程式。
         """
-        raise NotImplementedError("大台 1 分 K 歷史由 ticket 04 實作")
+        if self._center is None:
+            raise QuoteUnavailable("尚未登入，不能查 1 分 K")
+        try:
+            return self._query_minute_bars(day)
+        except QuoteUnavailable:
+            raise
+        except ProductListUnavailable as exc:
+            raise QuoteUnavailable(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise QuoteUnavailable(
+                f"查 1 分 K 時元件發生錯誤（{type(exc).__name__}）：{exc}") from exc
+
+    def _query_minute_bars(self, day: date) -> list[MinuteBar]:
+        self._ensure_quote_connection()
+        events = self._quote_events
+        events.kline_rows = []
+        events.kline_done = False
+        ymd = f"{day:%Y%m%d}"
+        code = self._quote.SKQuoteLib_RequestKLineAMByDate(
+            _KLINE_CODE, _KLINE_MINUTES, _KLINE_NEW_FORMAT, _KLINE_AM_SESSION, ymd, ymd, 1)
+        if code != 0:
+            raise QuoteUnavailable(f"查 {day:%Y/%m/%d} 的大台 1 分 K 失敗，{self._message(code)}")
+        if not self._pump_until(lambda: events.kline_done, self._connect_timeout):
+            raise QuoteUnavailable(
+                f"{self._connect_timeout:.0f} 秒內沒有收齊 {day:%Y/%m/%d} 的大台 1 分 K"
+                f"（收到 {len(events.kline_rows)} 根，沒有結束通知）")
+        bars = parse_minute_bars(events.kline_rows, day)
+        if bars:
+            # 原始的第一列與最後一列留在 log：實機時要看群益標的是起點還是終點
+            logger.info("%s 的大台 1 分 K：%d 根（群益的第一列 %r，最後一列 %r）",
+                        f"{day:%Y/%m/%d}", len(bars), events.kline_rows[0],
+                        events.kline_rows[-1])
+        return bars
 
     def events(self, product: str) -> Iterator[MarketEvent]:
         """訂閱大台與交易商品 `product` 的行情，依收到的順序產生行情事件。串流不會自己結束。

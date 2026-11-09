@@ -15,6 +15,8 @@
   * 行情：`SKQuoteLib_RequestTicks` 回 `(page, 代碼)`；訂閱之後，`market` 劇本裡的行情事件
     （逐筆成交、累計筆數）在下一次訊息幫浦時送達。成交事件只帶商品的系統索引
     `nIndex`，對應哪個商品要先用 `SKQuoteLib_GetStockByNoLONG` 查（`stock_index`）
+  * 1 分 K 歷史：`SKQuoteLib_RequestKLineAMByDate` 之後，`klines` 裡那一天的字串逐列以
+    `OnNotifyKLineData` 送達，最後是 `OnKLineComplete("##")`（文件 4-4-b、4-4-t）
   * 結構（`SKSTOCKLONG`、`FUTUREORDER`）只認型別庫裡有的欄位名，見 `_Struct`
 """
 
@@ -119,7 +121,9 @@ class FakeSkcom:
                  replayed_rows: tuple[str, ...] = (), on_send=None,
                  product_list: str = PRODUCT_LIST, pump_error: Exception | None = None,
                  stock_index: dict[str, int] | None = None, market: list[tuple] = (),
-                 quote_codes: dict[str, int] | None = None):
+                 quote_codes: dict[str, int] | None = None,
+                 klines: dict[str, list[str]] | None = None, kline_completes: bool = True,
+                 kline_error: Exception | None = None):
         self.login_code = login_code
         self.set_log_path_code = set_log_path_code
         self.cert_code = cert_code
@@ -135,6 +139,11 @@ class FakeSkcom:
         self.market = list(market)
         # 報價函式的回傳代碼：{函式名稱: 代碼}，沒列的回 0（成功）
         self.quote_codes = quote_codes or {}
+        # 1 分 K 歷史：{起始日期 YYYYMMDD: [OnNotifyKLineData 的字串, ...]}
+        self.klines = klines or {}
+        self.kline_completes = kline_completes
+        # 查 1 分 K 時元件自己拋的例外（不是回傳代碼）
+        self.kline_error = kline_error
         # 所有函式呼叫，依序：(元件名, 函式名, 參數)
         self.calls: list[tuple] = []
         # 送到 SendFutureOrderCLR 的委託物件
@@ -230,6 +239,18 @@ class FakeSkcom:
 
     def _SKQuoteLib_RequestFutureTradeInfo(self, page, code):
         return self.quote_codes.get("SKQuoteLib_RequestFutureTradeInfo", 0)
+
+    def _SKQuoteLib_RequestKLineAMByDate(self, code, kline_type, out_type, session, start, end,
+                                         minutes):
+        if self.kline_error is not None:
+            raise self.kline_error
+        ret = self.quote_codes.get("SKQuoteLib_RequestKLineAMByDate", 0)
+        if ret == 0:
+            for row in self.klines.get(start, []):
+                self.fire("SKQuoteLib", "OnNotifyKLineData", code, row)
+            if self.kline_completes:
+                self.fire("SKQuoteLib", "OnKLineComplete", "##")
+        return ret
 
     def _ReadCertByID(self, user_id):
         return self.cert_code

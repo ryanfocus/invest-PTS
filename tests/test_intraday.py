@@ -9,6 +9,7 @@ from datetime import date
 from broker import TMF_CODE
 from broker.fake import FakeBroker
 from day_script import at, clock, counts, product_trade, trade, whole_morning
+from recording import RecordingNotifier
 import intraday
 import settings
 
@@ -22,7 +23,7 @@ def _config(product: str = TMF_CODE) -> settings.Config:
 
 
 def _run(broker: FakeBroker, today: date = TRADING_DAY) -> intraday.SessionOutcome:
-    return intraday.run(broker, _config(), today=today)
+    return intraday.run(broker, _config(), today=today, notify=RecordingNotifier())
 
 
 # --- 一整個上午 ---
