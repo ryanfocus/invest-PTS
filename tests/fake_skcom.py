@@ -12,6 +12,9 @@
   * `SKReplyLib_ConnectByID` 之後送 `OnSolaceReplyConnection`、補送舊回報、`OnComplete`
     ——**不送舊名 `OnConnect`**：這個版本已經移除它（文件 2.13.48）
   * `SendFutureOrderCLR` 成功時回 `(13 碼序號, 0)`，回報（`OnNewData`）之後才到
+  * 行情：`SKQuoteLib_RequestTicks` 回 `(page, 代碼)`；訂閱之後，`market` 劇本裡的行情事件
+    （逐筆成交、累計筆數）在下一次訊息幫浦時送達。成交事件只帶商品的系統索引
+    `nIndex`，對應哪個商品要先用 `SKQuoteLib_GetStockByNoLONG` 查（`stock_index`）
 """
 
 from __future__ import annotations
@@ -47,6 +50,11 @@ PRODUCT_LIST = (
 )
 
 
+# 商品的系統索引（逐筆成交事件只帶這個）。數字本身沒有意義，只要三個商品互不相同。
+TX_INDEX, MTX_INDEX, TMF_INDEX = 101, 102, 103
+STOCK_INDEX = {"TX00AM": TX_INDEX, "MTX00AM": MTX_INDEX, "TM0000AM": TMF_INDEX}
+
+
 class FakeSkcom:
     """`CapitalBroker` 的 COM 執行環境替身。
 
@@ -59,7 +67,9 @@ class FakeSkcom:
                  cert_code: int = 0, reply_connection_code: int = 0,
                  reply_completes: bool = True, reply_drop_code: int | None = None,
                  replayed_rows: tuple[str, ...] = (), on_send=None,
-                 product_list: str = PRODUCT_LIST, pump_error: Exception | None = None):
+                 product_list: str = PRODUCT_LIST, pump_error: Exception | None = None,
+                 stock_index: dict[str, int] | None = None, market: list[tuple] = (),
+                 quote_codes: dict[str, int] | None = None):
         self.login_code = login_code
         self.set_log_path_code = set_log_path_code
         self.cert_code = cert_code
@@ -70,6 +80,11 @@ class FakeSkcom:
         self.on_send = on_send or full_fill(45000.0)
         self.product_list = product_list
         self.pump_error = pump_error
+        self.stock_index = STOCK_INDEX if stock_index is None else stock_index
+        # 訂閱之後送達的行情事件：[(事件名稱, 參數), ...]
+        self.market = list(market)
+        # 報價函式的回傳代碼：{函式名稱: 代碼}，沒列的回 0（成功）
+        self.quote_codes = quote_codes or {}
         # 所有函式呼叫，依序：(元件名, 函式名, 參數)
         self.calls: list[tuple] = []
         # 送到 SendFutureOrderCLR 的委託物件
@@ -103,6 +118,9 @@ class FakeSkcom:
     def new_future_order(self) -> SimpleNamespace:
         return SimpleNamespace()
 
+    def new_stock(self) -> SimpleNamespace:
+        return SimpleNamespace()
+
     # --- 給元件替身用 ---
 
     def fire(self, lib_name: str, event: str, *args) -> None:
@@ -133,6 +151,9 @@ class FakeSkcom:
         return f"群益訊息{code}"
 
     def _SKQuoteLib_EnterMonitorLONG(self):
+        code = self.quote_codes.get("SKQuoteLib_EnterMonitorLONG", 0)
+        if code:
+            return code
         self.fire("SKQuoteLib", "OnConnection", 3001, 0)
         self.fire("SKQuoteLib", "OnConnection", STOCKS_READY, 0)
         return 0
@@ -142,6 +163,23 @@ class FakeSkcom:
         self.fire("SKQuoteLib", "OnNotifyCommodityListWithTypeNo", market, self.product_list[:half])
         self.fire("SKQuoteLib", "OnNotifyCommodityListWithTypeNo", market, self.product_list[half:])
         return 0
+
+    def _SKQuoteLib_RequestTicks(self, page, code):
+        ret = self.quote_codes.get("SKQuoteLib_RequestTicks", 0)
+        if ret == 0:
+            for event, args in self.market:
+                self.fire("SKQuoteLib", event, *args)
+            self.market = []
+        return page, ret
+
+    def _SKQuoteLib_GetStockByNoLONG(self, code, stock):
+        ret = self.quote_codes.get("SKQuoteLib_GetStockByNoLONG", 0)
+        if ret == 0:
+            stock.nStockidx = self.stock_index[code]
+        return stock, ret
+
+    def _SKQuoteLib_RequestFutureTradeInfo(self, page, code):
+        return self.quote_codes.get("SKQuoteLib_RequestFutureTradeInfo", 0)
 
     def _ReadCertByID(self, user_id):
         return self.cert_code

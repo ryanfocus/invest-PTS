@@ -57,6 +57,14 @@ class ProductListUnavailable(BrokerError):
     """商品清單查不到、或缺少要用的商品。重試可能有幫助。"""
 
 
+class QuoteUnavailable(BrokerError):
+    """行情訂閱不起來（報價主機連不上、群益拒絕訂閱）。訊息講得出是哪一步、群益怎麼說。
+
+    少了任何一路，那天的判斷就缺一條腿（沒有筆差或沒有成交價），所以不是安靜地少一種
+    事件，而是在開始收行情之前就失敗。
+    """
+
+
 # 委託失敗只分兩類，界線是「單有沒有送出去」（規格第 41、50、51 條）。
 # 這是整個系統最貴的一條分界線：
 #
@@ -193,7 +201,7 @@ def ensure_sendable(request: OrderRequest) -> None:
         )
 
 
-# ── 行情：事件串流與 1 分 K（ticket 02 起實作在群益 broker 上）──────────────
+# ── 行情：事件串流與 1 分 K ──────────────────────────────────────────────
 #
 # 盤中程式的「現在」一律取自事件上的時間，不讀系統時鐘（規格「時間」一節）。
 # 所以每一個事件都帶 `time`，由 broker 蓋上：
@@ -202,8 +210,9 @@ def ensure_sendable(request: OrderRequest) -> None:
 #     迴圈裡用本機時鐘產生。
 #   * 筆差的來源 `OnNotifyFutureTradeInfoLONG` 沒有日期也沒有時間，`TxTradeCounts`
 #     的時間是 broker 收到它的時刻。
-#   * 成交價來自逐筆成交（`OnNotifyTicksLONG`），要濾掉試撮（`nSimulate=1`）與
-#     不是今天的回補（`nDate`）。
+#   * 成交價來自逐筆成交（`OnNotifyTicksLONG`），帶的是交易所的時間。試撮（`nSimulate=1`）
+#     由 broker 濾掉；**不是今天的回補照樣送出**，日期留在時間上——「報價屬於前一個交易日」
+#     是盤中流程要判斷的事（規格第 10 條），broker 先濾掉的話它就看不到證據了。
 #
 # 細節與出處見 scratchpad 的 notes/capital-api.md 第 1–4 節。
 
@@ -281,8 +290,11 @@ class Broker(Protocol):
     def minute_bars(self, day: date) -> list[MinuteBar]:
         """指定交易日的大台日盤 1 分 K，依時間排序。那天沒有資料就是空的。"""
 
-    def events(self) -> Iterator[MarketEvent]:
-        """訂閱並依序產生行情事件，直到串流結束。"""
+    def events(self, product: str) -> Iterator[MarketEvent]:
+        """訂閱大台與交易商品 `product`（報價代碼），依序產生行情事件。
+
+        真 broker 的串流不會自己結束，由呼叫端在 13:20 停止取用。
+        """
 
     def place_order(self, request: OrderRequest) -> OrderResult:
         """送出市價 IOC，等到委託確定結束，回傳實際成交。"""

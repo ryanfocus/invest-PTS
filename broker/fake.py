@@ -14,6 +14,7 @@ from datetime import date
 from typing import Iterable, Iterator
 
 from broker import (
+    PRODUCT_CODES,
     ContractInfo,
     MarketEvent,
     MinuteBar,
@@ -27,7 +28,7 @@ from broker import (
 class FakeBroker:
     """照劇本回放一個交易日。
 
-    - `events`：`events()` 依序產生的行情事件。
+    - `events`：`events(product)` 依序產生的行情事件（一整個交易日的劇本）。
     - `minute_bars`：{交易日: 那天的大台 1 分 K}。
     - `fill_price`：成交價。沒給的話用劇本裡**已經回放過的**最後一筆 `ProductTrade`
       ——市價單成交在當下的價格。兩者都沒有就拒絕送單（那是測試沒寫對）。
@@ -73,7 +74,11 @@ class FakeBroker:
     def minute_bars(self, day: date) -> list[MinuteBar]:
         return list(self._minute_bars.get(day, []))
 
-    def events(self) -> Iterator[MarketEvent]:
+    def events(self, product: str) -> Iterator[MarketEvent]:
+        """劇本裡的事件，依序。`product` 只檢查不使用：劇本本身已經決定了交易商品的成交，
+        但傳錯代碼的流程在真 broker 上會訂錯商品，不能在這裡默默放行。"""
+        if product not in PRODUCT_CODES:
+            raise ValueError(f"交易商品必須是 {PRODUCT_CODES} 其中之一，收到 {product!r}")
         for event in self._events:
             if isinstance(event, ProductTrade):
                 self._last_product_price = event.price

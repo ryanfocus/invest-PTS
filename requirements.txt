@@ -1,5 +1,8 @@
 PyYAML>=6.0
 
+# 台灣國定假日（交易日判定）。颱風假這類臨時休市它不知道，由報價交易日檢查擋下。
+holidays>=0.60
+
 # 群益 API（Windows COM）。加 platform marker 是為了讓策略邏輯能在非 Windows 上
 # 開發與測試——這兩個套件在別的平台裝不起來，而 broker.capital 以外的程式碼都不需要它們。
 comtypes>=1.2.0; sys_platform == "win32"

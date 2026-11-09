@@ -31,14 +31,17 @@ COM 本身被包在 `_RealCom` 這個小介面後面（載入、建立元件、�
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import time
-from datetime import date
+from collections import deque
+from datetime import date, datetime, timedelta
 from typing import Callable, Iterator
 
 import paths
 from broker import (
+    Clock,
     ContractInfo,
     FillUnknown,
     LoginFailed,
@@ -48,6 +51,11 @@ from broker import (
     OrderRequest,
     OrderResult,
     ProductListUnavailable,
+    ProductTrade,
+    QuoteUnavailable,
+    TxTrade,
+    TxTradeCounts,
+    TX_CODE,
     ensure_sendable,
 )
 from broker.capital_wire import build_future_order_fields, parse_product_list, summarize_fills
@@ -64,6 +72,12 @@ _STOCKS_READY = 3003
 
 # 商品清單的市場別：0 上市、1 上櫃、2 期貨、3 選擇權
 _MARKET_FUTURES = 2
+
+# 報價的價格是整數、放大 100 倍（官方範例與 invest-os 實測都是 /100，和期交所一致）
+_PRICE_SCALE = 100
+
+# 每隔幾秒問一次主機時間，保持報價連線（文件 4-4-5：「請固定每十五秒呼叫此函式」）
+_KEEPALIVE = timedelta(seconds=15)
 
 
 class _RealCom:
@@ -105,6 +119,9 @@ class _RealCom:
 
     def new_future_order(self):
         return self._sk.FUTUREORDER()
+
+    def new_stock(self):
+        return self._sk.SKSTOCKLONG()
 
 
 def _resolve_dll_path() -> str:
@@ -167,11 +184,27 @@ class _ReplyEvents:
 
 
 class _QuoteEvents:
-    """報價連線狀態與商品清單的接收端。"""
+    """報價連線狀態、商品清單與行情的接收端。
+
+    行情事件在訊息幫浦裡被呼叫，這裡只把它們翻成 PTS 的行情事件、排進 `market`，
+    由 `CapitalBroker.events()` 依序交出去。
+
+    ⚠️ 這些函式裡**不可以呼叫群益的查詢函式**（`GetStockByIndexLONG`、`GetTickLONG`，
+       文件 4-4-l／m 備註）。所以「哪個索引是哪個商品」是訂閱時先查好的（`tick_codes`）。
+    ⚠️ 這裡拋出的例外會被 comtypes 吞掉只印出來，所以看不懂的資料自己跳過、記下來。
+    """
 
     def __init__(self) -> None:
         self.stocks_ready = False
         self.commodity_chunks: list[str] = []
+        self.market: deque[MarketEvent] = deque()
+        # 商品的系統索引 → 報價代碼。逐筆成交事件只帶索引，不帶代碼。
+        self.tick_codes: dict[int, str] = {}
+        self.product = ""
+        # 這一輪訊息幫浦開始的時刻。累計筆數事件沒有時間，用它當「收到的時刻」。
+        self.received_at = datetime.min
+        self.trade_info_seen = False
+        self.unknown_indexes: set[int] = set()
 
     def OnConnection(self, nKind, nCode):
         if nKind == _STOCKS_READY:
@@ -180,6 +213,57 @@ class _QuoteEvents:
     def OnNotifyCommodityListWithTypeNo(self, sMarketNo, bstrCommodityData):
         # 清單很長（實測 46 萬字元），會分多次送來，全部接完再一起解析
         self.commodity_chunks.append(bstrCommodityData)
+
+    def OnNotifyTicksLONG(self, sMarketNo, nIndex, nPtr, nDate, nTimehms, nTimemillismicros,
+                          nBid, nAsk, nClose, nQty, nSimulate):
+        """一筆成交（文件 4-4-m）。回補（History）的參數完全相同，同一個函式處理。
+
+        ⚠️ 試撮（`nSimulate=1`）不是成交：08:30 起就有，2026-08-10 最早的試撮價 44981，
+           真正的開盤價 44985 在 08:45:00。
+        ⚠️ `nTimehms` 是整數，08:45:00 是 `84500`，用整數除法拆，不能切字串。
+        ⚠️ **不在這裡濾掉別的交易日的成交**：那是盤中流程的報價交易日檢查要看的證據
+           （規格第 10 條），日期原樣放在事件的時間上。
+        `nTimemillismicros` 不用：文件說目前只有證券商品有值。
+        """
+        if nSimulate:
+            return
+        code = self.tick_codes.get(nIndex)
+        if code is None:
+            if nIndex not in self.unknown_indexes:
+                self.unknown_indexes.add(nIndex)
+                logger.warning("收到索引 %s 的成交，但訂閱時查到的是 %s，這個索引的成交全部略過",
+                               nIndex, self.tick_codes)
+            return
+        try:
+            t = datetime(nDate // 10000, nDate // 100 % 100, nDate % 100,
+                         nTimehms // 10000, nTimehms // 100 % 100, nTimehms % 100)
+        except ValueError:
+            logger.warning("看不懂的逐筆成交時間（nDate=%s nTimehms=%s），略過這一筆",
+                           nDate, nTimehms)
+            return
+        price = nClose / _PRICE_SCALE
+        if code == TX_CODE:
+            self.market.append(TxTrade(t, price))
+        if code == self.product:
+            self.market.append(ProductTrade(t, price))
+
+    OnNotifyHistoryTicksLONG = OnNotifyTicksLONG
+
+    def OnNotifyFutureTradeInfoLONG(self, bstrStockNo, sMarketNo, nStockidx, nBuyTotalCount,
+                                    nSellTotalCount, nBuyTotalQty, nSellTotalQty,
+                                    nBuyDealTotalCount, nSellDealTotalCount):
+        """大台的累計筆數（文件 4-4-q）。筆差用的是最後兩個：**成交**買進／賣出筆數。
+        前四個是**委託**的筆數與口數，名字很像，用錯不會報錯，但筆差就完全不是同一個東西。
+
+        事件沒有日期也沒有時間，所以時間是收到它的時刻。從什麼時候開始累計、多久推一次，
+        文件都沒寫（ticket 03 實機回答）。
+        """
+        if not self.trade_info_seen:
+            self.trade_info_seen = True
+            # 文件沒說回來的代碼是 TX00AM 還是別的寫法；第一次實機時看一眼
+            logger.info("第一筆累計成交筆數：代碼 %s", bstrStockNo)
+        self.market.append(TxTradeCounts(self.received_at, buy_count=nBuyDealTotalCount,
+                                         sell_count=nSellDealTotalCount))
 
 
 class CapitalBroker:
@@ -194,6 +278,8 @@ class CapitalBroker:
         connect_timeout: float = 30.0,
         fill_timeout: float = 30.0,
         settle_seconds: float = 2.0,
+        pump_interval: float = 0.05,
+        now: Callable[[], datetime] = datetime.now,
         com=None,
     ):
         self._user_id = user_id
@@ -206,6 +292,8 @@ class CapitalBroker:
         # 等「不一定會來」的非同步事件的時間：聲明書狀態、回報連線結果、帳號查詢。
         # 這些事件沒有可以等的完成條件（全部簽過的聲明書就不再回傳），只能等一段時間。
         self._settle_seconds = settle_seconds
+        self._pump_interval = pump_interval
+        self._now = now
         self._com = com
         self._center = None
         self._handlers: list = []
@@ -354,27 +442,68 @@ class CapitalBroker:
             raise ProductListUnavailable(f"{wait:.0f} 秒內未取得完整商品清單")
         return parsed
 
-    # --- 行情（ticket 02 起實作）---
+    # --- 行情 ---
 
     def minute_bars(self, day: date) -> list[MinuteBar]:
         """指定交易日的大台日盤 1 分 K。
 
-        ticket 02／04 實作：`SKQuoteLib_RequestKLineAMByDate(代碼, 0 分線, 1 新版格式,
+        ticket 04 實作：`SKQuoteLib_RequestKLineAMByDate(代碼, 0 分線, 1 新版格式,
         1 AM 盤, 日期, 日期, 1)`，從 `OnNotifyKLineData` 收、等 `OnKLineComplete`。
         新版格式的真實字串要先錄下來當 fixture（文件的例子本身就不一致），
         K 棒時間標的是起點還是終點也要實機核對。見 notes/capital-api.md 第 3 節。
         """
-        raise NotImplementedError("大台 1 分 K 歷史由 ticket 02／04 實作")
+        raise NotImplementedError("大台 1 分 K 歷史由 ticket 04 實作")
 
-    def events(self) -> Iterator[MarketEvent]:
-        """訂閱並產生行情事件。
+    def events(self, product: str) -> Iterator[MarketEvent]:
+        """訂閱大台與交易商品 `product` 的行情，依收到的順序產生行情事件。串流不會自己結束。
 
-        ticket 02 實作：大台逐筆成交（`RequestTicks` → `OnNotifyTicksLONG`，濾掉試撮與
-        不是今天的回補）、累計成交筆數（`RequestFutureTradeInfo` →
-        `OnNotifyFutureTradeInfoLONG`）、交易商品成交價，以及在 `_pump_until` 的迴圈裡
-        用本機時鐘每跨過一個整秒產生一個 `Clock`。見 notes/capital-api.md 第 1、2、4 節。
+        訂閱三樣東西（細節與出處見 notes/capital-api.md 第 1、2、4 節）：
+
+          * 大台的逐筆成交（`RequestTicks`）→ `TxTrade`。第一次訂閱會先回補當天的成交，
+            休市時回補的是最近一個日盤。
+          * 交易商品的逐筆成交 → `ProductTrade`。交易大台時同一筆成交兩種事件各一個。
+          * 大台的累計成交筆數（`RequestFutureTradeInfo`）→ `TxTradeCounts`。
+
+        另外每跨過本機時鐘的一個整秒產生一個 `Clock`：群益沒有每秒一次的事件
+        （`OnTimer` 每分鐘一次），而 13:20 收工、報價中斷偵測在沒有成交時也要知道現在幾點。
+
+        訂閱不起來是 `QuoteUnavailable`，在交出第一個事件之前。
         """
-        raise NotImplementedError("行情事件串流由 ticket 02 實作")
+        if self._center is None:
+            raise QuoteUnavailable("尚未登入")
+        try:
+            self._ensure_quote_connection()
+        except ProductListUnavailable as exc:
+            raise QuoteUnavailable(str(exc)) from exc
+        self._quote_events.product = product
+        for page, code in enumerate(dict.fromkeys((TX_CODE, product))):
+            _, ret = self._quote.SKQuoteLib_RequestTicks(page, code)
+            if ret != 0:
+                raise QuoteUnavailable(f"訂閱 {code} 的逐筆成交失敗，{self._message(ret)}")
+            stock, ret = self._quote.SKQuoteLib_GetStockByNoLONG(code, self._com.new_stock())
+            if ret != 0:
+                raise QuoteUnavailable(f"查不到 {code} 的商品資料，{self._message(ret)}")
+            self._quote_events.tick_codes[stock.nStockidx] = code
+            logger.info("已訂閱 %s 的逐筆成交（page %d，索引 %s）", code, page, stock.nStockidx)
+        ret = self._quote.SKQuoteLib_RequestFutureTradeInfo(ctypes.c_short(0), TX_CODE)
+        if ret != 0:
+            raise QuoteUnavailable(f"訂閱 {TX_CODE} 的累計成交筆數失敗，{self._message(ret)}")
+        last_second = None
+        last_keepalive: datetime | None = None
+        while True:
+            now = self._now()
+            if last_keepalive is None or now - last_keepalive >= _KEEPALIVE:
+                last_keepalive = now
+                self._quote.SKQuoteLib_RequestServerTime()
+            self._quote_events.received_at = now
+            self._com.pump()
+            second = now.replace(microsecond=0)
+            if second != last_second:
+                last_second = second
+                yield Clock(now)
+            while self._quote_events.market:
+                yield self._quote_events.market.popleft()
+            time.sleep(self._pump_interval)
 
     # --- 下單 ---
 

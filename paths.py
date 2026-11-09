@@ -43,6 +43,17 @@ def logs_dir() -> str:
     return os.path.join(app_root(), "logs")
 
 
+def market_data_dir() -> str:
+    """原始行情記錄：每個交易日一個檔（規格第 58 條）。
+
+    ⚠️ **刻意不放在 `logs/` 底下。** `logs/` 每 30 天清一次（ticket 10），而這裡是
+       長期保留的資料：ticket 03 靠它回答筆差的事實問題，盤中重啟時只能從這裡讀回
+       筆差（群益的筆差沒有歷史回補），作者日後也要拿它做 tick 等級的回測。
+       它不含帳號資訊，所以沒有非清不可的理由。換機器時要整個複製過去。
+    """
+    return os.path.join(app_root(), "marketdata")
+
+
 def capital_log_dir() -> str:
     """群益元件自己寫的 log（含身分證字號）。
 

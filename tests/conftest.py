@@ -25,6 +25,15 @@ def logs_never_touch_the_real_directory(tmp_path_factory, monkeypatch):
     return logs
 
 
+@pytest.fixture(autouse=True)
+def market_dir(tmp_path_factory, monkeypatch):
+    """**測試絕不碰正式的原始行情目錄。** 那裡是長期保留的真實行情——ticket 03 靠它
+    回答筆差的事實問題，作者日後也要拿它回測。混進一份假的劇本，就污染了那一天。"""
+    directory = tmp_path_factory.mktemp("marketdata")
+    monkeypatch.setattr(paths, "market_data_dir", lambda: str(directory))
+    return directory
+
+
 class _RealComForbidden:
     def __init__(self, *args, **kwargs):
         raise AssertionError(

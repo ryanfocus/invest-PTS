@@ -122,7 +122,7 @@ def test_the_fake_fills_everything_at_the_last_traded_price_by_default():
     t = datetime(2026, 11, 9, 8, 50)
     fake = FakeBroker(contracts=CONTRACTS, events=[ProductTrade(t, 45010.0),
                                                    ProductTrade(t, 45012.0)])
-    for _ in fake.events():
+    for _ in fake.events(TMF_CODE):
         pass
     result = fake.place_order(_order(lots=2))
     assert (result.filled_lots, result.avg_price) == (2, 45012.0)
@@ -165,7 +165,15 @@ def test_the_fake_replays_the_days_events_in_order():
     t = datetime(2026, 11, 9, 8, 45)
     script = [Clock(t), TxTrade(t, 45000.0), TxTradeCounts(t, buy_count=10, sell_count=12),
               ProductTrade(t, 45001.0)]
-    assert list(FakeBroker(events=script).events()) == script
+    assert list(FakeBroker(events=script).events(TMF_CODE)) == script
+
+
+@pytest.mark.parametrize("product", ["TMF", "TX00", ""])
+def test_the_fake_refuses_to_stream_a_product_code_the_real_broker_would_not_subscribe(product):
+    """劇本已經決定了交易商品的成交，假 broker 用不到這個參數——但真 broker 拿它去訂閱，
+    流程傳錯代碼（設定檔的名字 TMF、不帶 AM 的全盤代碼）在實機上就是訂錯商品。"""
+    with pytest.raises(ValueError, match="交易商品"):
+        next(FakeBroker(events=[Clock(datetime(2026, 11, 9, 8, 45))]).events(product))
 
 
 def test_the_fake_returns_the_minute_bars_of_the_day_asked_for():
