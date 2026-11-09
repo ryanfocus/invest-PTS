@@ -28,7 +28,8 @@
       "last_trading_day": "2026-11-18",     最後交易日
       "status": "CONFIRMED",                CONFIRMED（已確認）／UNCERTAIN（不確定）
       "entries": [{"order_seq": "2315610000001", "lots": 1, "price": 45150.0}],
-      "exits": [],                          出場委託，格式同 entries（出場程式寫）
+      "exits": [],                          出場委託，格式同 entries（出場程式寫）。
+                                            口數加起來等於 entries 就是**已了結**
       "uncertain": null                     不確定的那一筆：
                                             {"stage": "ENTRY"／"EXIT", "order_seq": "…",
                                              "requested_lots": 2, "known_filled": 0}
@@ -168,6 +169,15 @@ class PositionRecord:
         return sum(f.lots for f in self.entries)
 
     @property
+    def open_lots(self) -> int:
+        """還沒平掉的口數：進場減出場。出場程式平的就是這幾口，不多也不少（規格第 32 條）。
+
+        **0 就是已了結**：出場明細的口數等於進場，部位檔不另外存一個「已了結」旗標——
+        兩份記載同一件事，總有一天會互相矛盾，而出場程式要拿著它去下單。
+        """
+        return self.entered_lots - sum(f.lots for f in self.exits)
+
+    @property
     def avg_price(self) -> float | None:
         """進場的成交均價，依口數加權。還沒有成交時是 None。"""
         lots = self.entered_lots
@@ -222,8 +232,8 @@ def write(record: PositionRecord) -> None:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    logger.info("部位檔已更新：%s %s 進場 %d 口（%s）", record.order_code, record.direction,
-                record.entered_lots, record.status)
+    logger.info("部位檔已更新：%s %s 進場 %d 口、還沒平 %d 口（%s）", record.order_code,
+                record.direction, record.entered_lots, record.open_lots, record.status)
 
 
 # ── JSON 格式（和出場程式、和人之間的約定）─────────────────────────────────

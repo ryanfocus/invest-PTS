@@ -16,6 +16,7 @@ from typing import Iterable, Iterator
 from broker import (
     PRODUCT_CODES,
     ContractInfo,
+    FillQuery,
     MarketEvent,
     MinuteBar,
     OrderRequest,
@@ -35,6 +36,8 @@ class FakeBroker:
     - `fills`：每筆委託實際成交幾口，逐筆消耗。沒給就是全部成交。
     - `order_errors`：每筆委託要拋的例外（`None` 代表照常成交），逐筆消耗。
     - `minute_bars_error`：查 1 分 K 時要拋的例外（每次都拋）。
+    - `fill_queries`：成交查詢（`query_fills`）的答案，逐次消耗。**沒安排卻被查就是
+      AssertionError**：查詢只該出現在出場單不確定之後，測試沒預期到它就是流程走錯路。
     """
 
     def __init__(
@@ -49,6 +52,7 @@ class FakeBroker:
         login_error: Exception | None = None,
         contracts_error: Exception | None = None,
         minute_bars_error: Exception | None = None,
+        fill_queries: Iterable[FillQuery] = (),
     ):
         self._contracts = contracts or {}
         self._events = list(events)
@@ -60,6 +64,10 @@ class FakeBroker:
         self._login_error = login_error
         self._contracts_error = contracts_error
         self._minute_bars_error = minute_bars_error
+        self._fill_queries = list(fill_queries)
+        # 被查過的委託，依序：(委託序號, 交易日, 委託口數)。出場單不確定時查的必須是
+        # **那一張出場單**——拿進場單的序號去查，查到的是早上的成交，看起來就像已經平倉。
+        self.queries: list[tuple[str, date, int]] = []
         # 收到的委託，依序。「一次都沒被呼叫」就是斷言 `orders == []`——
         # 這是唯一會動到錢的路徑，證明它沒被走過比證明它走對了更重要。
         # 被 `ensure_sendable` 擋下的委託沒有送出去，所以不在這裡。
@@ -110,3 +118,18 @@ class FakeBroker:
             raise AssertionError(
                 "這個測試沒有安排成交價：給 fill_price=，或在劇本裡放交易商品的成交（ProductTrade）")
         return OrderResult(order_seq=seq, filled_lots=filled, avg_price=price)
+
+    def query_fills(self, order_seq: str, trading_day: date,
+                    requested_lots: int) -> FillQuery:
+        self.queries.append((order_seq, trading_day, requested_lots))
+        if not self._fill_queries:
+            raise AssertionError(
+                f"這個測試沒有安排成交查詢的答案（委託 {order_seq}）：給 fill_queries=")
+        answer = self._fill_queries.pop(0)
+        if answer.lots is not None and not 1 <= answer.lots <= requested_lots:
+            # 真的 broker 回不出這個值（超過委託量的加總會被判定為看不懂）
+            raise AssertionError(f"查到 {answer.lots} 口，不在 1 到委託的 {requested_lots} 口之間")
+        if answer.lots is not None and not answer.avg_price:
+            # 真的 broker 認得出成交列就一定讀得到價格（讀不到是看不懂，算查詢失敗）
+            raise AssertionError("查到成交卻沒有成交價：給 FillQuery(lots=…, avg_price=…)")
+        return answer

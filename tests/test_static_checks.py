@@ -40,7 +40,7 @@ def test_every_module_imports_on_a_machine_without_the_capital_component(tmp_pat
 
     modules = ["paths", "settings", "calendar_tw", "broker", "broker.capital_wire",
                "broker.fake", "broker.capital", "indicators", "raw_market", "intraday",
-               "strategy", "messages", "notifiers.discord", "position_file"]
+               "strategy", "messages", "notifiers.discord", "position_file", "exit_program"]
     code = "import " + ", ".join(modules)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), str(ROOT)])}
     result = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp_path,
@@ -115,6 +115,25 @@ def test_every_reply_sample_has_its_account_fields_masked():
                 assert set(value) <= {"0", "F"}, f"{path.name} 的欄位 [{i}] 不是假值：{value!r}"
             rows += 1
     assert rows >= 6, "樣本不見了，這條檢查等於沒有在跑"
+
+
+def test_every_report_sample_has_its_account_fields_masked():
+    """委託查詢與成交查詢的真實回傳（出場單不確定時的兩段查詢用）同樣帶著帳戶識別資訊，
+    位置和推播不同：委託查詢 `[3]` 期貨商代號、`[5]` `[6]` 帳號、`[39]` 營業員代號；成交查詢
+    `[3]` `[5]` `[6]`、`[32]` 營業員代號。委託書號、序號、成交價、時間要留著。
+    兩種查詢用欄位數分：委託查詢一列 77 欄、成交查詢 52 欄。"""
+    rows = 0
+    for path in sorted(FIXTURES.glob("reports-*.txt")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("TF,"):
+                continue
+            fields = line.split(",")
+            masked = (3, 5, 6, 39) if len(fields) > 55 else (3, 5, 6, 32)
+            for i in masked:
+                value = fields[i].strip()
+                assert set(value) <= {"0", "F"}, f"{path.name} 的欄位 [{i}] 不是假值：{value!r}"
+            rows += 1
+    assert rows >= 10, "樣本不見了，這條檢查等於沒有在跑"
 
 
 # --- 策略常數只出現在策略判斷一處（規格「策略判斷」一節）---

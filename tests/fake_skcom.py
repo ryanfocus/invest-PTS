@@ -17,6 +17,8 @@
     `nIndex`，對應哪個商品要先用 `SKQuoteLib_GetStockByNoLONG` 查（`stock_index`）
   * 1 分 K 歷史：`SKQuoteLib_RequestKLineAMByDate` 之後，`klines` 裡那一天的字串逐列以
     `OnNotifyKLineData` 送達，最後是 `OnKLineComplete("##")`（文件 4-4-b、4-4-t）
+  * 委託查詢、成交查詢（`GetOrderReport`／`GetFulfillReport`）：阻塞式，直接回傳字串
+    （`order_report`／`fulfill_report`），沒給就是查無資料 `M003`（文件 4-2-97、4-2-98）
   * 結構（`SKSTOCKLONG`、`FUTUREORDER`）只認型別庫裡有的欄位名，見 `_Struct`
 """
 
@@ -123,7 +125,8 @@ class FakeSkcom:
                  stock_index: dict[str, int] | None = None, market: list[tuple] = (),
                  quote_codes: dict[str, int] | None = None,
                  klines: dict[str, list[str]] | None = None, kline_completes: bool = True,
-                 kline_error: Exception | None = None):
+                 kline_error: Exception | None = None,
+                 order_report: str = "M003", fulfill_report: str = "M003"):
         self.login_code = login_code
         self.set_log_path_code = set_log_path_code
         self.cert_code = cert_code
@@ -144,6 +147,9 @@ class FakeSkcom:
         self.kline_completes = kline_completes
         # 查 1 分 K 時元件自己拋的例外（不是回傳代碼）
         self.kline_error = kline_error
+        # 委託查詢與成交查詢的回傳（真實格式見 tests/fixtures/reports-*.txt）
+        self.order_report = order_report
+        self.fulfill_report = fulfill_report
         # 所有函式呼叫，依序：(元件名, 函式名, 參數)
         self.calls: list[tuple] = []
         # 送到 SendFutureOrderCLR 的委託物件
@@ -251,6 +257,12 @@ class FakeSkcom:
             if self.kline_completes:
                 self.fire("SKQuoteLib", "OnKLineComplete", "##")
         return ret
+
+    def _GetOrderReport(self, user_id, account, fmt):
+        return self.order_report
+
+    def _GetFulfillReport(self, user_id, account, fmt):
+        return self.fulfill_report
 
     def _ReadCertByID(self, user_id):
         return self.cert_code

@@ -186,6 +186,25 @@ class OrderResult:
     avg_price: float | None     # 成交均價（依口數加權）；0 口時是 None
 
 
+@dataclass(frozen=True)
+class FillQuery:
+    """出場單送出去卻不知道成交時，向券商**查到的**成交紀錄（規格第 50 條的兩段查詢）。
+
+    三種結局，告警要講得分開：
+
+        查到成交   lots ≥ 1，avg_price 是這些成交的均價
+        查不到     lots 是 None、failure 是空字串：委託或成交紀錄裡找不到這一筆
+        查詢失敗   lots 是 None、failure 是原因：元件出錯、查詢錯誤（M999）、紀錄說不通
+
+    ⚠️ **「查不到」不是 0 口。** 紀錄可能只是還沒反映；當成「確定沒成交」的話，
+       已經成交的那幾口就沒有人知道。所以沒有「查到 0 口」這種答案。
+    """
+
+    lots: int | None
+    avg_price: float | None = None
+    failure: str = ""
+
+
 def ensure_sendable(request: OrderRequest) -> None:
     """送單前的最後一道檢查。兩個 broker 都在送出之前呼叫它，規則因此只有一份。
 
@@ -298,3 +317,10 @@ class Broker(Protocol):
 
     def place_order(self, request: OrderRequest) -> OrderResult:
         """送出市價 IOC，等到委託確定結束，回傳實際成交。"""
+
+    def query_fills(self, order_seq: str, trading_day: date,
+                    requested_lots: int) -> FillQuery:
+        """用委託序號向券商查這筆委託成交了幾口。只在出場單 `FillUnknown` 之後用。
+
+        **不拋例外**：它是失敗路徑上的補救，自己再出錯就是「查詢失敗」這個答案。
+        """

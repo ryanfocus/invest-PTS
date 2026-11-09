@@ -378,3 +378,109 @@ def parse_minute_bars(rows: list[str], day: date) -> list[MinuteBar]:
     # 換算成起點之後一律是 08:45–13:44
     return sorted((MinuteBar(at - shift, o, h, low, c) for at, o, h, low, c in labelled),
                   key=lambda b: b.start)
+
+
+# ── 委託查詢與成交查詢（GetOrderReport／GetFulfillReport）─────────────────────
+#
+# 出場單送出去卻不知道成交時的兩段查詢（規格第 50 條後半）。從 invest-os 搬來，欄位位置是
+# 那邊用真實回傳驗證過的（tests/fixtures/reports-*.txt），和 OnNewData 是**不同的格式**。
+#
+# ⚠️ **委託序號只在委託查詢裡，成交查詢沒有。** 串得起兩份的只有委託書號，所以要兩段：
+#    先用序號換出書號，再拿書號去加總成交。
+# ⚠️ 成交查詢的欄位，官方文件從第 14 欄起比真實資料多算一欄。以真實資料為準。
+# ⚠️ 樣本全部是微台、不標當沖。大台、小台與當沖列長什麼樣還沒看過（ticket 11）。
+_ORDER_MARKET, _ORDER_BOOK_NO, _ORDER_SEQ, _ORDER_DAY = 0, 7, 8, 11
+_FILL_MARKET, _FILL_BOOK_NO, _FILL_DAY = 0, 7, 9
+_FILL_PRICE, _FILL_QTY = 25, 26
+
+# 查詢的兩種非答案，意思相反：查無資料是正常的（單還沒進紀錄、那天沒交易），
+# 查詢錯誤是故障。兩者都**不是**「確定沒成交」，但告警要講得分開。
+_QUERY_NO_DATA = "M003"
+_QUERY_ERROR = "M999"
+
+
+class ReportUnreadable(Exception):
+    """查詢的回傳不能信：查詢錯誤（M999），或內容說不通（價差列、超過委託量、0 口、價格讀不出來）。
+
+    和「查不到」（回 None）分開：查不到可能只是紀錄還沒反映，說不通則代表欄位位置或比對前提
+    已經破了。兩者都不可以當成確定的答案，訊息講得出是哪一種。
+    """
+
+
+def _query_rows(text: str) -> list[list[str]]:
+    """查詢回傳切成一列一列的欄位。查無資料與空的回傳是 []；查詢錯誤拋 `ReportUnreadable`。"""
+    text = (text or "").strip()
+    if not text or text.startswith(_QUERY_NO_DATA):
+        return []
+    if text.startswith(_QUERY_ERROR):
+        raise ReportUnreadable(f"券商回覆查詢錯誤（{text[:80]}）")
+    return [line.split(",") for line in text.splitlines() if line.strip()]
+
+
+def parse_order_book_no(text: str, order_seq: str, trading_day: date) -> str | None:
+    """第一段：用**委託序號**在委託查詢裡找到自己那一列，回傳**委託書號**。找不到是 None。
+
+    序號**整欄精確比對**，不是子字串：多一位數的別人的序號會被子字串比中，拿到別人的書號、
+    加總別人的成交（invest-os 突變測試抓到過）。空序號一列都不比。
+    **一定要比日期**：書號與序號的唯一性沒有驗證過，日期是擋住舊紀錄的唯一一道。
+    """
+    if not order_seq:
+        return None
+    day = f"{trading_day:%Y%m%d}"
+    for fields in _query_rows(text):
+        if len(fields) <= _ORDER_DAY:
+            continue
+        if fields[_ORDER_MARKET].strip() != _FUTURES:
+            continue        # 證券、海期的列格式完全不同
+        if fields[_ORDER_SEQ].strip() != order_seq or fields[_ORDER_DAY].strip() != day:
+            continue
+        book_no = fields[_ORDER_BOOK_NO].strip()
+        if book_no:
+            return book_no
+    return None
+
+
+def parse_fills(text: str, book_no: str, trading_day: date,
+                requested_lots: int) -> tuple[int, float] | None:
+    """第二段：加總這個委託書號當天的成交，回傳（口數, 依口數加權的成交均價）。
+
+    找不到任何一列是 None——**不是 0 口**：紀錄可能只是還沒反映，當成「確定沒成交」的話，
+    已經成交的口數就沒有人知道。
+
+    找到了卻說不通就拋 `ReportUnreadable`。這幾道檢查和欄位位置無關，欄位推錯時最可能的症狀
+    （撿到一個不相干的數字）靠它們擋：
+      * 價差列（整列有斜線）：一張委託兩列，加總會翻倍；PTS 不下價差單，看到就是書號認錯了
+      * 口數不是 ≥ 1 的整數、價格讀不出來或不是正數
+      * 加總超過委託口數：不可能是真的，當成「全部成交」的話，帳上可能還有沒平的口數
+    """
+    if not book_no:
+        return None
+    day = f"{trading_day:%Y%m%d}"
+    lots = 0
+    cost = 0.0
+    for fields in _query_rows(text):
+        if len(fields) <= _FILL_QTY:
+            continue
+        if fields[_FILL_MARKET].strip() != _FUTURES:
+            continue
+        if fields[_FILL_BOOK_NO].strip() != book_no or fields[_FILL_DAY].strip() != day:
+            continue
+        if "/" in ",".join(fields):
+            # 看**整列**：真實的價差成交列在商品那一欄放的是單腳代碼，斜線只在最後一欄
+            raise ReportUnreadable(f"委託書號 {book_no} 的成交是價差單，不是 PTS 送的單")
+        qty = fields[_FILL_QTY].strip()
+        try:
+            price = float(fields[_FILL_PRICE].strip())
+        except ValueError:
+            price = 0.0
+        if not qty.isdigit() or int(qty) < 1 or price <= 0:
+            raise ReportUnreadable(
+                f"委託書號 {book_no} 的成交列讀不懂（口數 {qty!r}、價格 {fields[_FILL_PRICE]!r}）")
+        lots += int(qty)
+        cost += int(qty) * price
+    if not lots:
+        return None
+    if lots > requested_lots:
+        raise ReportUnreadable(
+            f"委託書號 {book_no} 的成交加總 {lots} 口，超過委託的 {requested_lots} 口")
+    return lots, cost / lots

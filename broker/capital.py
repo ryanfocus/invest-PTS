@@ -43,6 +43,7 @@ import paths
 from broker import (
     Clock,
     ContractInfo,
+    FillQuery,
     FillUnknown,
     LoginFailed,
     MarketEvent,
@@ -58,8 +59,9 @@ from broker import (
     TX_CODE,
     ensure_sendable,
 )
-from broker.capital_wire import (build_future_order_fields, parse_minute_bars,
-                                 parse_product_list, summarize_fills)
+from broker.capital_wire import (ReportUnreadable, build_future_order_fields, parse_fills,
+                                 parse_minute_bars, parse_order_book_no, parse_product_list,
+                                 summarize_fills)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,11 @@ _KLINE_CODE = "TX00"
 _KLINE_MINUTES = 0          # sKLineType：0 分線
 _KLINE_NEW_FORMAT = 1       # sOutType：1 新版（價格已處理過小數點）
 _KLINE_AM_SESSION = 1       # sTradeSession：1 AM 盤（日盤）
+
+# 委託查詢、成交查詢（文件 4-2-97、4-2-98）：格式 1 是全部委託／完整成交。
+# 「查詢為阻塞式」「限制每次查詢間需間隔五秒」——invest-os 留了半秒餘裕。
+_REPORT_ALL = 1
+_QUERY_INTERVAL_SECONDS = 5.5
 
 
 class _RealCom:
@@ -305,6 +312,7 @@ class CapitalBroker:
         settle_seconds: float = 2.0,
         pump_interval: float = 0.05,
         now: Callable[[], datetime] = datetime.now,
+        sleep: Callable[[float], None] = time.sleep,
         com=None,
     ):
         self._user_id = user_id
@@ -319,6 +327,8 @@ class CapitalBroker:
         self._settle_seconds = settle_seconds
         self._pump_interval = pump_interval
         self._now = now
+        # 成交查詢兩段之間的等待（測試換掉它，才不必真的等五秒）
+        self._sleep = sleep
         self._com = com
         self._center = None
         self._handlers: list = []
@@ -734,6 +744,54 @@ class CapitalBroker:
             logger.warning("委託 %s 沒有成交（市價 IOC 當下沒有對手價）", seq)
         return OrderResult(order_seq=seq, filled_lots=summary.filled_lots,
                            avg_price=summary.avg_price)
+
+    # --- 成交查詢 ---
+
+    def query_fills(self, order_seq: str, trading_day: date,
+                    requested_lots: int) -> FillQuery:
+        """用委託序號向券商查成交紀錄（規格第 50 條後半）。出場單 `FillUnknown` 之後才用。
+
+        兩段，被迫的（invest-os 2026-08-19 實測）：委託序號只在委託查詢裡，成交查詢沒有。
+        先用序號換出委託書號，再拿書號去加總成交。⚠️ **兩段之間一定要等五秒以上**：官方文件
+        「限制每次查詢間需間隔五秒」。
+
+        ⚠️ **不經過送單前「回報連線斷了就不送」的檢查。** 平倉單收不到回報，最常見的原因就是
+           回報連線斷了；查詢是下單元件的阻塞式呼叫，不走回報連線，斷線照樣查得到。
+
+        **不拋例外**：它是失敗路徑上的補救，自己再出錯就是「查詢失敗」這個答案，讓出場程式
+        照樣發得出告警。
+        """
+        try:
+            if not self._account:
+                return FillQuery(lots=None, failure="未設定期貨帳號，無法查詢")
+            if self._center is None:
+                return FillQuery(lots=None, failure="尚未登入，無法查詢")
+            if not self._order_ready:
+                self._prepare_order_components()
+
+            raw = self._order.GetOrderReport(self._user_id, self._account, _REPORT_ALL)
+            book_no = parse_order_book_no(raw, order_seq, trading_day)
+            if not book_no:
+                logger.info("委託查詢找不到序號 %s 的委託書號", order_seq)
+                return FillQuery(lots=None)
+            logger.info("委託 %s 的委託書號是 %s", order_seq, book_no)
+
+            self._sleep(_QUERY_INTERVAL_SECONDS)
+
+            raw = self._order.GetFulfillReport(self._user_id, self._account, _REPORT_ALL)
+            found = parse_fills(raw, book_no, trading_day, requested_lots)
+            if found is None:
+                logger.info("成交查詢找不到委託書號 %s 的成交", book_no)
+                return FillQuery(lots=None)
+            lots, avg_price = found
+            logger.info("成交查詢：委託書號 %s 成交 %d 口，均價 %g", book_no, lots, avg_price)
+            return FillQuery(lots=lots, avg_price=avg_price)
+        except ReportUnreadable as exc:
+            logger.error("成交查詢的回傳不能信：%s", exc)
+            return FillQuery(lots=None, failure=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("成交查詢失敗（%s）：%s", type(exc).__name__, exc)
+            return FillQuery(lots=None, failure=f"{type(exc).__name__}: {exc}")
 
     def _save_raw_replies(self, seq: str, since: int) -> None:
         """把這次委託期間收到的回覆原封不動存進 `logs/`。存**整個視窗**，不只自己那筆。
