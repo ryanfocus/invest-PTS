@@ -1,0 +1,13 @@
+PyYAML>=6.0
+
+# 群益 API（Windows COM）。加 platform marker 是為了讓策略邏輯能在非 Windows 上
+# 開發與測試——這兩個套件在別的平台裝不起來，而 broker.capital 以外的程式碼都不需要它們。
+comtypes>=1.2.0; sys_platform == "win32"
+pywin32>=306; sys_platform == "win32"
+
+# 開發
+pytest>=8.0
+
+# 靜態檢查。broker/capital.py 有一大段只在真的連上群益元件時才會跑，
+# 測試執行不到——見 tests/test_static_checks.py。
+pyflakes>=3.0
