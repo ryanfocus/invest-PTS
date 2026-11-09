@@ -25,6 +25,10 @@
 
 三則告警用固定的說法開頭，使用者一眼分得出是哪一種（`messages`）。
 
+「今天不再進場」寫成檔（停止進場記錄，`stop_path`），告警之前先寫：盤中程式當掉被重啟
+（規格第 48 條）之後看到它，照樣不進場、不再告警。只放在記憶體的話，被拒的單會在重啟後
+再送一次、再告警一次；「不確定」或成交寫不進部位檔時，重啟後部位檔看不出今天出過事。
+
 ## 突破進場的盯價
 
 條件 3、4 在 09:45 之後不立刻進場，策略判斷回答的是「設定突破進場」（`strategy.Breakout`）。
@@ -164,7 +168,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         orders = _Orders(broker, today, contract, record)
     trading = _Trading(config, notify, _load_history(broker, today),
                        _load_settlement_day(broker, today), orders,
-                       product=product, record=record)
+                       today=today, product=product, record=record)
     end_at = datetime.combine(today, SESSION_END)
     state = indicators.BarState()
     bars: list[indicators.ClosedBar] = []
@@ -462,22 +466,28 @@ class _Trading:
 
     def __init__(self, config: settings.Config, notify: Callable[[str], bool],
                  history: _History | None, settlement_day: date | None,
-                 orders: _Orders | None, *, product: str,
+                 orders: _Orders | None, *, today: date, product: str,
                  record: position_file.PositionRecord | None):
         self._config = config
         self._notify = notify
         self._history = history
         self._settlement_day = settlement_day
         self._orders = orders
+        self._today = today
         self._product = product
         self.position = _held(record)
         # 當天不再進場。部位不確定時，帳上的口數不知道，部位不虧、加碼上限都算不了
         # （規格第 50 條）——啟動時讀到「不確定」、或今天這裡送出的委託變成不確定
         # （`_fill_unknown`）；委託被拒（`_not_sent`）、成交寫不進部位檔（`_not_on_file`）
-        # 時也打開。只在記憶體裡：被拒之後重啟，會再試一次。
+        # 時也打開。打開時寫下停止進場記錄（`_stop`），重啟後照樣不進場。
         self._stopped = record is not None and record.status == position_file.UNCERTAIN
         if self._stopped:
             logger.warning("部位檔記著一筆不確定的委託（%s），今天不再進場", record.uncertain)
+        else:
+            earlier = _read_stop(today)
+            if earlier is not None:
+                self._stopped = True
+                logger.warning("今天稍早已經停止進場，重啟後照樣不進場：%s", earlier)
         # 交易商品的現價：部位不虧用它，模擬也成交在它
         self.product_price: float | None = None
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
@@ -606,7 +616,7 @@ class _Trading:
         不再進場，是因為被拒的原因（保證金不足、憑證問題）下一分鐘還在：條件每分鐘成立，
         就每分鐘再被拒一次、再發一則告警（規格第 51 條）。
         """
-        self._stopped = True
+        self._stop(now, f"委託沒有送出去：{exc}")
         logger.error("%s 的委託沒有送出去，今天不再進場：%s", decision.condition.value, exc)
         self._send(messages.order_not_sent(
             at=now, product=self._product, direction=decision.direction, lots=decision.lots,
@@ -617,8 +627,12 @@ class _Trading:
 
         不再進場，是因為帳上的口數從這一刻起不知道：部位不虧、加碼上限都算不了
         （規格第 50 條）。盤中程式照樣跑到收工，原始行情繼續記。
+
+        「不確定」寫不進部位檔時，重啟後光看部位檔看不出今天出過事——停止進場記錄就是為了
+        這種時候。
         """
-        self._stopped = True
+        self._stop(now, f"委託 {exc.order_seq or '（沒有序號）'} 送出去了，"
+                        f"但不知道成交幾口：{exc}")
         logger.error("%s 的委託 %s 送出去了，但不知道成交幾口（已知至少 %d 口），"
                      "今天不再進場：%s", decision.condition.value,
                      exc.order_seq or "（沒有序號）", exc.known_filled, exc)
@@ -637,10 +651,10 @@ class _Trading:
 
         不再進場，是因為從這一刻起部位檔和帳上對不上：再成交的口數寫進去，出場程式也只會
         平檔裡那些，要人自己平的口數越滾越多；告警裡講好的「自行平掉這幾口」也不再準。
-        盤中程式照樣跑到收工，原始行情繼續記。
+        盤中程式照樣跑到收工，原始行情繼續記。重啟後部位檔裡沒有這一筆，所以靠停止進場記錄。
         """
-        self._stopped = True
         record, fill = exc.record, exc.fill
+        self._stop(now, f"成交 {fill.lots} 口（委託 {fill.order_seq}）寫不進部位檔：{exc}")
         on_file = exc.on_file.entered_lots if exc.on_file is not None else 0
         self.position = _held(record)
         logger.error("成交 %s %d 口 @ %g（委託 %s）寫不進部位檔，帳上共 %d 口、檔裡 %d 口，"
@@ -672,8 +686,67 @@ class _Trading:
             condition=decision.condition, lots=decision.lots, price=price,
             total_lots=total, avg_price=avg, simulated=True, trigger=trigger))
 
+    def _stop(self, now: datetime, why: str) -> None:
+        """今天不再進場，並寫下停止進場記錄。告警之前先寫：發 Discord 會卡住、會失敗。"""
+        self._stopped = True
+        _write_stop(self._today, f"{now:%Y/%m/%d %H:%M:%S} {why}")
+
     def _send(self, text: str) -> None:
         _send(self._config, self._notify, text)
+
+
+# ── 停止進場記錄 ─────────────────────────────────────────────────────────
+
+
+def stop_path(day: date) -> str:
+    """那個交易日的停止進場記錄：今天為什麼不再進場（ticket 07）。
+
+    「今天不再進場」只放在記憶體的話，盤中程式一重啟（規格第 48 條）就忘了：被拒的單
+    再送一次、再告警一次（規格第 51 條）；「不確定」或成交寫不進部位檔時，檔裡看不出
+    今天出過事，重啟後照常加碼。所以寫成檔，重啟時看到它就不進場。
+
+    只有盤中程式自己讀，出場程式不看（兩支程式之間只靠部位檔與心跳記錄，規格「兩支程式」
+    一節）。放在部位檔旁邊，不在 `logs/`：30 天清除的範圍外，但一天一個小檔，留著無妨。
+    """
+    return os.path.join(paths.state_dir(), f"entries-stopped-{day:%Y%m%d}.txt")
+
+
+def _read_stop(day: date) -> str | None:
+    """今天稍早停止進場的原因；沒有停過是 None。
+
+    **檔案存在就是停過**，內容只是寫給人看的原因。讀不懂（寫到一半斷電、被改壞）也一樣
+    不進場：和部位檔同一個道理，讀不懂不能當成「沒事」。
+    """
+    path = stop_path(day)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except (OSError, ValueError) as exc:     # UTF-8 的解碼錯誤是 ValueError
+        return f"（記錄在 {path}，但讀不懂：{type(exc).__name__}: {exc}）"
+
+
+def _write_stop(day: date, line: str) -> None:
+    """寫下停止進場記錄。
+
+    直接附加，不像部位檔先寫暫存檔再置換：重啟時只看檔案在不在，寫到一半也一樣算數；
+    少了置換那一步，部位檔被防毒鎖住、`os.replace` 失敗的時候，這裡照樣寫得進去——
+    那正是最需要它的時候（「不確定」或成交寫不進部位檔）。
+
+    寫不進去只記 log，不往外拋：接著要發的告警比它要緊，冒出 `run()` 的話一則都發不出去。
+    今天這一輪照樣停止進場（記憶體裡），只是重啟後記不得。
+    """
+    path = stop_path(day)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())       # 真的落到磁碟：寫完緊接著可能就是當機重啟
+    except Exception as exc:  # noqa: BLE001
+        logger.error("停止進場記錄寫不進 %s（%s: %s）：盤中程式若重啟，今天可能會再進場",
+                     path, type(exc).__name__, exc)
 
 
 def _send(config: settings.Config, notify: Callable[[str], bool], text: str) -> None:

@@ -22,6 +22,7 @@ from day_script import DAY, PREVIOUS_DAY, at, calm_history, rally, trade
 from recording import RecordingNotifier
 from test_live_orders import CONTRACTS, _config, _file, _locked, _on_file, _run
 import intraday
+import paths
 import position_file
 
 
@@ -58,6 +59,51 @@ def test_a_rejected_order_stops_entries_for_the_day_and_alerts_once():
         "2026/11/09 08:50:00",
     ]
     assert not os.path.exists(position_file.path_for(DAY))
+
+
+def test_after_a_rejection_a_restart_the_same_day_neither_orders_nor_alerts_again():
+    """08:50 的委託被拒，之後盤中程式因為別的原因當掉，排程把它重啟（規格第 48 條）。
+    被拒的原因（保證金不足）還在，而第一則告警已經說了「今天不再進場」：重啟後條件照樣
+    每分鐘成立，也一筆都不送、不再告警。只記在記憶體裡的話，每重啟一次就再被拒一次、
+    再告警一次。"""
+    _run(_all_morning(), order_errors=[OrderFailed("委託被拒：保證金不足")])
+
+    broker, sent = _run(_all_morning(), order_errors=[OrderFailed("委託被拒：保證金不足")])
+
+    assert broker.orders == []
+    assert sent == []
+    assert not os.path.exists(position_file.path_for(DAY))
+
+
+def test_a_stop_record_that_cannot_be_read_still_means_no_entries_today():
+    """停止進場記錄寫到一半斷電、或被別的程式寫壞了。它存在，就代表今天稍早停止過進場：
+    讀不懂內容不是照常進場的理由，也不可以讓盤中程式在啟動時就當掉（原始行情還要記）。"""
+    os.makedirs(os.path.dirname(intraday.stop_path(DAY)), exist_ok=True)
+    with open(intraday.stop_path(DAY), "wb") as fh:
+        fh.write(b"\xff\xfe\x00")
+
+    outcome, sent = _run_outcome(_all_morning())
+
+    assert outcome.ending is intraday.Ending.STREAM_ENDED
+    assert sent == []
+    assert not os.path.exists(position_file.path_for(DAY))
+
+
+def test_when_the_stop_record_cannot_be_written_the_alert_still_goes_out_once(
+        monkeypatch, tmp_path):
+    """部位檔的資料夾不能寫（磁碟滿、權限被改）：停止進場記錄寫不進去。這時最要緊的是告警
+    照樣發出、盤中程式不中止；讓例外冒出 `run()` 的話，程式帶著 traceback 結束，
+    一則告警都沒有。"""
+    blocked = tmp_path / "not-a-folder"
+    blocked.write_text("")
+    monkeypatch.setattr(paths, "state_dir", lambda: str(blocked / "state"))
+
+    outcome, sent = _run_outcome(_all_morning(),
+                                 order_errors=[OrderFailed("委託被拒：保證金不足")])
+
+    assert outcome.ending is intraday.Ending.STREAM_ENDED
+    assert len(sent) == 1
+    assert sent[0].startswith("【要你處理】PTS 委託沒有送出去，今天不再進場\n")
 
 
 def test_a_rejection_after_earlier_fills_leaves_them_on_file_as_confirmed():
@@ -167,14 +213,34 @@ def test_when_the_uncertain_state_cannot_be_written_the_alert_says_the_file_is_s
     ]
 
 
-def test_when_the_first_order_is_uncertain_and_cannot_be_written_no_file_is_left(
-        monkeypatch, state_dir):
+def test_when_the_uncertain_state_cannot_be_written_a_restart_still_enters_nothing(
+        monkeypatch):
+    """不確定的那一筆寫不進部位檔，檔裡還是已確認的 2 口；之後盤中程式重啟。光看部位檔，
+    今天什麼事都沒發生——但帳上可能已經多了這一筆、口數不知道，告警也說了今天不再進場。
+    重啟後照常加碼的話，部位不虧和加碼上限都在少算的口數上判斷。"""
+    content = _on_file(product="TM0000AM", order_code="TM2611")
+    replace = os.replace
+    _locked(monkeypatch)
+    _run(_all_morning(), order_errors=[
+        FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
+    # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
+    monkeypatch.setattr(os, "replace", replace)
+
+    broker, sent = _run(_all_morning())
+
+    assert broker.orders == []
+    assert sent == []
+    assert _file() == content
+
+
+def test_when_the_first_order_is_uncertain_and_cannot_be_written_no_position_file_is_left(
+        monkeypatch):
     """今天第一筆就不確定、又寫不進去：沒有部位檔，出場程式什麼都不會平。"""
     _locked(monkeypatch)
     outcome, sent = _run_outcome(_all_morning(), order_errors=[FillUnknown("回報斷了")])
 
     assert outcome.ending is intraday.Ending.STREAM_ENDED
-    assert os.listdir(state_dir) == []
+    assert not os.path.exists(position_file.path_for(DAY))
     assert sent[0].splitlines()[4] == ("請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平："
                                        "這筆實際成交的要你自己在 13:30 前平掉。")
 
