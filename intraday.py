@@ -47,7 +47,8 @@
     「報價恢復之前不會進場」就不是真的。新的進場則判斷不出來：斷線前後缺了成交的 K 棒還在一次
     判斷會讀到的最近幾根裡時不判斷（`_missing_bars`），筆數停住過的筆差是不知道
     （`indicators._close`）。
-  * **盤中重啟**（`_Restored`，規格第 48 條）：部位、停止進場記錄照舊從檔案讀；今天已經過去的
+  * **盤中重啟**（`_Restored`，規格第 48 條）：部位、停止進場記錄照舊從檔案讀，設定照當天第一次
+    啟動時的快照（`day_settings`：改設定最快下一個交易日才生效）；今天已經過去的
     1 分 K 與每根的筆差從原始行情檔讀回，群益回補的成交裡重啟前就處理過的不再處理。
     當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
   * **排程每分鐘叫醒**（ticket 10，`tools/schedule.py`）：這就是失敗時的自動重啟，所以正常結束
@@ -95,6 +96,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable, Iterator
 
 import calendar_tw
+import day_settings
 import heartbeat
 import indicators
 import messages
@@ -191,9 +193,12 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                      "就會再登入", failed, login_failed_path(today))
         return SessionOutcome(Ending.LOGIN_FAILED_EARLIER)
 
+    # 改設定最快下一個交易日才生效：自動下單開關、口數、加碼上限、交易商品照今天第一次啟動時的
+    # （`day_settings`）。重讀的話，生效與否就看盤中程式有沒有剛好當掉重啟。
+    config = day_settings.for_today(config, today)
     pulse = _Pulse(today)
     # 當天已經有部位（盤中重啟）：交易商品、合約、口數一律以部位檔為準，不看設定檔
-    # （規格第 43 條）。改設定最快下一個交易日才生效，進場和出場就不會是不同的商品。
+    # （規格第 43 條）。進場和出場就不會是不同的商品。
     try:
         record = position_file.read(today)
     except position_file.Unreadable as exc:

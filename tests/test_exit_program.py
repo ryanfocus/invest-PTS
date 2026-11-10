@@ -40,10 +40,6 @@ def intraday_ran_today(state_dir):
     _intraday_ran(DAY)
 
 
-# 今天進場用的設定：自動下單打開（部位檔只有真實下單才會寫）
-LIVE = make_config(auto_order_enabled=True)
-
-
 class _Time:
     """出場程式的時鐘與睡眠。睡多久，時鐘就往前走多久；每一次睡了多久都記下來。"""
 
@@ -69,7 +65,7 @@ def _run(*, at: datetime | None = None, config=None, **broker_options):
     broker = FakeBroker(**broker_options)
     notifier = RecordingNotifier()
     time = _Time(at or _at("13:25"))
-    exit_program.run(broker, config or LIVE, notify=notifier, clock=time.clock,
+    exit_program.run(broker, config or make_config(), notify=notifier, clock=time.clock,
                      sleep=time.sleep)
     return broker, notifier.sent, time
 
@@ -173,7 +169,7 @@ def test_the_settings_say_tx_but_the_file_says_micro_so_micro_is_closed():
     """使用者盤中把設定改成大台。今天的部位是微台，照部位檔平微台。
     照設定檔的話，微台什麼都不平就過夜了。"""
     _on_file()
-    broker, _, _ = _run(config=make_config(auto_order_enabled=True, product="TX00AM"))
+    broker, _, _ = _run(config=make_config(product="TX00AM"))
     assert _orders(broker) == [("TM2611", SELL, 3, False, DAY)]
 
 
@@ -181,7 +177,7 @@ def test_the_settings_say_micro_but_the_file_says_mtx_so_nothing_is_sent():
     """反過來：設定改成微台，今天的部位是小台。照設定檔的話，會對一個沒有部位的微台送
     賣單——開出一口空單過夜；同時小台又被券商強平。"""
     content = _on_file(product="MTX00AM", order_code="MTX11")
-    broker, sent, _ = _run(config=make_config(auto_order_enabled=True, product=TMF_CODE))
+    broker, sent, _ = _run(config=make_config(product=TMF_CODE))
     assert broker.orders == []
     assert sent == []
     assert _file() == content
@@ -576,7 +572,7 @@ def test_killed_while_looking_up_an_exit_order_it_is_never_sent_again():
     _on_file()
     first = _KilledDuringLookup(fill_price=45200.0, order_errors=[_SENT_BUT_UNKNOWN])
     with pytest.raises(_Killed):
-        exit_program.run(first, LIVE, notify=RecordingNotifier(),
+        exit_program.run(first, make_config(), notify=RecordingNotifier(),
                          clock=lambda: _at("13:25"), sleep=lambda seconds: None)
     assert len(first.orders) == 1
 
@@ -624,24 +620,18 @@ def test_once_an_exit_order_is_uncertain_nothing_more_is_sent():
     assert _file()["uncertain"]["order_seq"] == "2315610000002"
 
 
-# --- 自動下單關閉：完全不呼叫下單 API（規格第 42 條）---
+# --- 要不要平微台只看部位檔（規格第 31、43 條：改設定最快下一個交易日才生效）---
 
 
-def test_with_auto_order_off_a_micro_position_on_file_is_reported_not_closed():
-    """模擬模式不寫部位檔，所以「開關關著卻有部位檔」代表使用者今天進場之後把它關掉了。
-    關掉就是不要程式碰下單 API：不登入、不送單。但微台沒人平就過夜，一定要講。"""
-    content = _on_file()
-    broker, sent, _ = _run(config=make_config(),
-                           login_error=AssertionError("自動下單關閉時不該登入"))
-    assert broker.orders == []
-    assert sent == [
-        "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口\n"
-        "原因：自動下單已關閉（order.auto_enabled: false），出場程式不送單\n"
-        "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。\n"
-        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 3 口再賣出一次，開出反向新倉。\n"
-        "2026/11/09 13:25:00",
-    ]
-    assert _file() == content
+def test_a_micro_position_on_file_is_closed_even_if_auto_order_was_switched_off_since():
+    """部位檔只有真實下單會寫，所以有微台部位檔就代表今天是真的進場了。使用者之後把自動下單
+    關掉，那是明天的事：今天的微台照樣 13:25 平掉——不平的話它就過夜（Problem Statement 第 4 點）。
+    今天進場時開關是開著的（當天的設定快照），所以這不違反第 42 條。"""
+    _on_file()
+    broker, sent, _ = _run(config=make_config())
+    assert _orders(broker) == [("TM2611", SELL, 3, False, DAY)]
+    assert sent == []
+    assert [e["lots"] for e in _file()["exits"]] == [3]
 
 
 def test_with_auto_order_off_and_no_position_file_it_stays_quiet():
@@ -721,8 +711,8 @@ def test_an_alert_that_did_not_go_out_is_told_again_on_the_next_run(notifier):
     微台就這樣過夜——所以那一天不寫出場記錄，週二出場程式執行時把週一那 3 口再講一次。"""
     _on_file()
     first = notifier()
-    exit_program.run(FakeBroker(fill_price=45200.0, login_error=_OFFLINE), LIVE, notify=first,
-                     clock=_Time(_at("13:25")).clock, sleep=lambda seconds: None)
+    exit_program.run(FakeBroker(fill_price=45200.0, login_error=_OFFLINE), make_config(),
+                     notify=first, clock=_Time(_at("13:25")).clock, sleep=lambda seconds: None)
     assert [m.splitlines()[0] for m in first.sent] == [
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口"]
 
@@ -890,7 +880,7 @@ def test_each_exit_alert_uses_only_its_own_fixed_wording(situation):
 
 def test_with_discord_off_the_position_is_still_closed_and_nothing_is_sent():
     _on_file()
-    broker, sent, _ = _run(config=make_config(auto_order_enabled=True, discord_enabled=False),
+    broker, sent, _ = _run(config=make_config(discord_enabled=False),
                            order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 4
     assert sent == []
@@ -984,7 +974,7 @@ def _main(*, at: datetime | None = None, broker: FakeBroker | None = None,
 def test_when_the_program_itself_breaks_main_still_raises_the_alarm(tmp_path, monkeypatch):
     """出場程式是微台唯一的出場。它自己出錯中止的話，部位可能就這樣過夜，而平常沒有例行
     訊息能讓人發現——所以 `main()` 盡量發一則告警，並回 1 讓排程記錄留下痕跡。"""
-    posted = main_env(tmp_path, monkeypatch, settings_text=_settings())
+    posted = main_env(tmp_path, monkeypatch)
     _on_file()
     time = _Time(_at("13:25"))
 
@@ -1018,7 +1008,7 @@ def test_when_the_program_breaks_the_alarm_gives_the_deadline_that_applies(
     13:45 之後才當掉，要人做的是夜盤（規格第 41、55 條）。收盤前還要講不要重跑：
     使用者自己平掉之後再執行一次，它會照部位檔再平一次。
     13:25 起跑，登入卡到 `hhmm` 才出錯。"""
-    posted = main_env(tmp_path, monkeypatch, settings_text=_settings())
+    posted = main_env(tmp_path, monkeypatch)
     _on_file()
     time = _Time(_at("13:25"))
 
@@ -1033,7 +1023,7 @@ def test_when_the_program_breaks_the_alarm_gives_the_deadline_that_applies(
 
 def _settings(**values: str) -> str:
     """今天的設定檔：自動下單打開（今天進場了），換掉 `values` 那幾個值。"""
-    return settings_yaml(**{"auto": "true", **values})
+    return settings_yaml(auto="true", **values)
 
 
 BROKEN_SETTINGS = {
@@ -1045,25 +1035,30 @@ BROKEN_SETTINGS = {
 
 @pytest.mark.parametrize("settings_text, error", BROKEN_SETTINGS.values(),
                          ids=BROKEN_SETTINGS.keys())
-def test_settings_that_cannot_be_read_still_raise_the_alarm_for_the_micro_position(
+def test_settings_that_cannot_be_read_do_not_stop_the_micro_position_from_being_closed(
         settings_text, error, tmp_path, monkeypatch):
-    """使用者盤中改設定時打錯字（規格第 43 條預期盤中會改）。出場程式讀不懂設定，就不知道
-    自動下單是不是開著，一張單都不送（規格第 47 條：一啟動就擋下來）——但微台沒人平就過夜，
-    所以照樣讀部位檔，告警「部位還在」並講明原因。回 1，排程記錄留下痕跡。"""
+    """使用者盤中改設定時打錯字（規格第 43 條預期盤中會改）。出場程式要不要平微台只看部位檔，
+    平倉用的帳密在 `.env`，都和設定檔無關：照樣 13:25 平掉。設定檔要修——不修的話下一個交易日
+    盤中程式一啟動就會被擋下來（規格第 47 條）——所以另外講一則，回 1，排程記錄留下痕跡。"""
     posted = main_env(tmp_path, monkeypatch, settings_text=settings_text)
-    content = _on_file()
+    _on_file()
 
-    code, brokers = _main(login_error=AssertionError("設定有錯不該登入"))
+    code, brokers = _main()
 
     assert code == 1
-    assert brokers[0].orders == []
+    assert _orders(brokers[0]) == [("TM2611", SELL, 3, False, DAY)]
+    assert [e["lots"] for e in _file()["exits"]] == [3]
+    assert len(posted.sent) == 1
     lines = posted.sent[0].splitlines()
-    assert lines[0] == "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口"
-    assert lines[1].startswith("原因：設定檔有錯，出場程式不送單：")
+    assert lines[0] == "【要你處理】PTS 設定檔有錯，出場程式照部位檔處理今天的微台"
+    assert lines[1].startswith("設定檔：")
     if error:
         assert lines[1].endswith(error)
-    assert lines[2] == "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。"
-    assert _file() == content
+    assert lines[2:] == [
+        "今天的微台照部位檔平倉，不看設定檔。設定檔不修好，下一個交易日盤中程式一啟動就會被擋下來："
+        "請在下一個交易日 08:40 之前修好 config/settings.yaml。",
+        "2026/11/09 13:25:00",
+    ]
 
 
 def test_settings_that_cannot_be_read_without_a_position_stay_quiet(tmp_path, monkeypatch):
@@ -1076,11 +1071,11 @@ def test_settings_that_cannot_be_read_without_a_position_stay_quiet(tmp_path, mo
 
 def test_settings_that_cannot_be_read_but_say_discord_is_off_send_nothing(tmp_path, monkeypatch):
     """設定檔有錯，但 Discord 開關本身讀得到、寫的是 false：使用者明白關掉了，照樣不發
-    （規格第 45 條）。開關本身讀不到時才當成開著——那時不講，微台就安靜地過夜。"""
+    （規格第 45 條）。開關本身讀不到時才當成開著。微台照樣平掉。"""
     posted = main_env(tmp_path, monkeypatch,
                       settings_text=_settings(product="TMX", discord="false"))
     _on_file()
-    code, brokers = _main(login_error=AssertionError("設定有錯不該登入"))
+    code, brokers = _main()
     assert code == 1
-    assert brokers[0].orders == []
+    assert _orders(brokers[0]) == [("TM2611", SELL, 3, False, DAY)]
     assert posted.sent == []

@@ -28,8 +28,7 @@ def _exit(when: str = "13:25", day: date = DAY, **broker_options) -> tuple[FakeB
     broker = FakeBroker(**broker_options)
     notifier = RecordingNotifier()
     now = at(f"{when}:00", day)
-    exit_program.run(broker, make_config(auto_order_enabled=True), notify=notifier,
-                     clock=lambda: now,
+    exit_program.run(broker, make_config(), notify=notifier, clock=lambda: now,
                      sleep=lambda seconds: None)
     return broker, notifier.sent
 

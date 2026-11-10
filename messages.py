@@ -450,6 +450,21 @@ def heartbeat_unreadable(*, at: datetime, reason: str, log: str) -> str:
     )
 
 
+def exit_settings_broken(*, at: datetime, error: str) -> str:
+    """出場程式讀不懂設定檔，照部位檔處理了今天的微台（規格第 43、47 條）。
+
+    出場程式用不到設定檔：要不要平只看部位檔，帳密在 `.env`。要人做的事是**修設定檔**——
+    下一個交易日盤中程式一啟動就會被它擋下來（規格第 47 條）。微台沒平完的話另有一則
+    「部位還在」，這裡不重複講部位。"""
+    return (
+        "【要你處理】PTS 設定檔有錯，出場程式照部位檔處理今天的微台\n"
+        f"設定檔：{error}\n"
+        "今天的微台照部位檔平倉，不看設定檔。設定檔不修好，下一個交易日盤中程式一啟動就會被擋下來："
+        "請在下一個交易日 08:40 之前修好 config/settings.yaml。\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
 _EXIT_GOES_ON = "出場程式照常處理部位檔裡的部位。"
 _BEFORE_NEXT_OPEN = "下一個交易日 08:40 之前排除。"
 

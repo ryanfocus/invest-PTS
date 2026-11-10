@@ -447,7 +447,14 @@ class CapitalBroker:
 
         報價主機的連線刻意不放在這裡：那是會暫時性失敗的東西，歸類成 LoginFailed
         會讓它跳過重試。它屬於 `get_contracts` 與事件串流的範圍。
+
+        帳號、密碼是空的就不送：出場程式在設定檔讀不懂時，`.env` 讀得到多少用多少，缺的就是空的。
+        送給群益只會換來一個看不懂的代碼，這裡直接講是 `.env` 的哪一個沒填（重試無用，`LoginFailed`）。
         """
+        missing = [name for name, value in (("CAPITAL_USER_ID", self._user_id),
+                                            ("CAPITAL_PASSWORD", self._password)) if not value]
+        if missing:
+            raise LoginFailed(f".env 沒有填 {'、'.join(missing)}，無法登入群益")
         try:
             self._ensure_com()
         except LoginFailed:

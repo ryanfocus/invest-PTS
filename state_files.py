@@ -10,14 +10,15 @@
 | `entries-stopped-YYYYMMDD.txt` | 盤中程式 | 盤中程式（重啟） | `intraday.stop_path` |
 | `login-failed-YYYYMMDD.txt` | 盤中程式 | 盤中程式（下一次被叫醒） | `intraday.login_failed_path` |
 | `exit-done-YYYYMMDD.txt` | 出場程式 | 出場程式（之後每一次執行） | `exit_program.done_path` |
+| `day-settings-YYYYMMDD.json` | 盤中程式（當天第一次啟動） | 盤中程式（重啟） | `day_settings` |
 | `intraday.lock` | 盤中程式 | — | `intraday._alone` |
 
 兩支程式之間只靠部位檔與心跳記錄溝通（規格「兩支程式」一節）；其他的都只有寫它的那支程式讀。
 
 兩種寫法，各有理由：
 
-  * **JSON 記錄**（`write_json`）：先寫暫存檔再置換。內容整份都要對（部位口數、心跳的時刻），
-    寫到一半斷電只能留下舊的或新的，不能是半個（規格第 52 條）。
+  * **JSON 記錄**（`write_json`）：先寫暫存檔再置換。內容整份都要對（部位口數、心跳的時刻、
+    當天的設定），寫到一半斷電只能留下舊的或新的，不能是半個（規格第 52 條）。
   * **標記檔**（`write_marker`／`read_marker`）：**檔案存在就算數**，內容只是寫給人看的原因。
     直接寫、不經置換：寫到一半也一樣算數；部位檔被防毒鎖住、`os.replace` 失敗的時候，這裡照樣
     寫得進去——停止進場記錄最需要的正是那種時候。

@@ -8,7 +8,9 @@
 （規格第 49 條）：出場不能依賴盤中程式還活著，而且只有一個負責者，就不會兩邊都送平倉單、
 反而開出反向新倉。
 
-交易商品一律以部位檔記載的為準，不看設定檔（規格第 43 條）：
+**要不要平、平什麼一律以部位檔為準，不看設定檔**（規格第 43 條：改設定最快下一個交易日才生效）。
+部位檔只有真實下單會寫，所以有部位檔就是今天真的進場了：之後才把自動下單關掉、或把設定檔改壞，
+今天的微台照樣平（設定檔讀不懂時另外告警，`BrokenSettings`）。帳密在 `.env`：
 
   * **微台**：市價平掉 PTS 自己的全部口數（ADR-0002）——部位檔裡還沒平的那幾口，不多也不少，
     帳上其他的部位（使用者自己的、OS 的）不碰（規格第 32 條）。每筆最多 10 口（第 33 條）。
@@ -21,7 +23,7 @@
 
 任何不確定的情況都不猜，改發 Discord 請使用者處理：部位檔讀不懂、部位不確定、平倉單送出去
 卻不知道成交（查過券商紀錄仍無法確認全部成交）、重試完仍有剩餘、13:45 之後才補跑、
-結算日 13:30 近月停止交易時還有剩餘、設定檔有錯（`BrokenSettings`）。告警裡要人在幾點前
+結算日 13:30 近月停止交易時還有剩餘、設定檔有錯但已照部位檔平倉。告警裡要人在幾點前
 做什麼，照的是出場程式自己停止送單的同一個期限（`_deadline`）。
 例行的平倉完成**不發訊息**（規格：只有「有入場」與「需要你動手」才發）。
 
@@ -111,13 +113,12 @@ class ExitOutcome:
 
 @dataclass(frozen=True)
 class BrokenSettings:
-    """設定檔（或 `.env`）有錯時，`main()` 交給 `run()` 的東西，代替 `settings.Config`。
+    """設定檔讀不懂時，`main()` 交給 `run()` 的東西，代替 `settings.Config`。
 
-    使用者盤中改設定時打錯字（規格第 43 條預期盤中會改），出場程式不能就此不做事：
-    帳上的微台沒人平就過夜，而平常沒有例行訊息能讓人發現。可是設定讀不懂，就不知道自動
-    下單是不是開著——關掉就是不要程式碰下單 API（規格第 42 條）——所以一張單都不送、
-    不登入（規格第 47 條：一啟動就擋下來），其餘照常：讀部位檔，有微台就告警「部位還在」
-    並講明原因。`discord_enabled` 見 `_discord_switch_of_broken_settings`。
+    使用者盤中改設定時打錯字（規格第 43 條預期盤中會改），出場程式不能就此不做事：帳上的
+    微台沒人平就過夜。出場程式本來就用不到設定檔裡的值——要不要平、平什麼只看部位檔，帳密在
+    `.env`——所以照常平倉，另外告警設定檔有錯：不修好的話，下一個交易日盤中程式一啟動就會被
+    擋下來（規格第 47 條）。`discord_enabled` 見 `_discord_switch_of_broken_settings`。
     """
 
     error: str
@@ -191,8 +192,10 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
         return Ending.LEFT_TO_BROKER
 
     ledger = _Ledger(record)
-    ending = _MicroExit(broker, config, ledger, today=today, now=now, clock=clock,
-                        sleep=sleep, say=say).run()
+    ending = _MicroExit(broker, ledger, today=today, now=now, clock=clock, sleep=sleep,
+                        say=say).run()
+    if isinstance(config, BrokenSettings):
+        say(messages.exit_settings_broken(at=clock(), error=config.error))
     if ledger.record != ledger.on_file:
         # 部位檔沒記到這次做的事。再執行一次出場程式，它會照舊檔把已經平掉的口數再平一次。
         logger.error("部位檔沒記到出場程式這次的平倉：實際還剩 %d 口（%s），檔裡還剩 %d 口（%s）",
@@ -324,11 +327,10 @@ class _ExitUncertain(Exception):
 class _MicroExit:
     """微台的平倉：拆單、重試、不確定時查券商紀錄（規格第 33、34、50 條）。"""
 
-    def __init__(self, broker: Broker, config: settings.Config | BrokenSettings, ledger: _Ledger,
-                 *, today: date, now: datetime, clock: Callable[[], datetime],
-                 sleep: Callable[[float], None], say: Callable[[str], bool]):
+    def __init__(self, broker: Broker, ledger: _Ledger, *, today: date, now: datetime,
+                 clock: Callable[[], datetime], sleep: Callable[[float], None],
+                 say: Callable[[str], bool]):
         self._broker = broker
-        self._config = config
         self._ledger = ledger
         self._today = today
         self._started = now
@@ -353,10 +355,6 @@ class _MicroExit:
                 self._sleep(_RETRY_INTERVAL.total_seconds())
             if self._clock() >= self._deadline:
                 break
-            if not rounds:
-                blocked = self._blocked()
-                if blocked:
-                    return self._incomplete(blocked)
             if not logged_in:
                 try:
                     self._broker.login()
@@ -402,16 +400,6 @@ class _MicroExit:
             reason = f"出場程式 {self._started:%H:%M} 才執行，{closed}，沒有送出平倉單"
         self._incomplete(reason)
         return Ending.SETTLED_BY_EXCHANGE if self._settlement_day else Ending.NOT_CLOSED
-
-    def _blocked(self) -> str:
-        """第一次送單之前：有理由完全不送的話，回傳原因（給人看）。"""
-        if isinstance(self._config, BrokenSettings):
-            return f"設定檔有錯，出場程式不送單：{self._config.error}"
-        if not self._config.auto_order_enabled:
-            # 模擬模式不寫部位檔，所以這是今天進場之後才被關掉的。關掉就是不要程式碰下單 API
-            # （規格第 42 條）——連登入都不做。但微台沒人平就過夜，一定要講。
-            return "自動下單已關閉（order.auto_enabled: false），出場程式不送單"
-        return ""
 
     def _send_round(self) -> str:
         """送一輪平倉單：還沒平的口數拆成每筆最多 10 口，依序送出（規格第 33 條）。
@@ -565,21 +553,26 @@ def _scheduled_exit(connect: Callable[[settings.Secrets], Broker], *,
     status = 0
     try:
         config: settings.Config | BrokenSettings = settings.load()
-        secrets = settings.load_secrets(config)
     except Exception as exc:  # noqa: BLE001
         # SettingsError、YAML 語法錯誤、檔案不見都一樣：這次的設定不能用（見 BrokenSettings）
         error = (str(exc) if isinstance(exc, settings.SettingsError)
                  else f"{type(exc).__name__}: {exc}")
         error = " ".join(error.split())          # YAML 的錯誤訊息有好幾行，告警裡只佔一行
-        logger.error("設定有錯，出場程式不送單：%s", error)
+        logger.error("設定檔有錯，照部位檔平倉：%s", error)
         config = BrokenSettings(error=error, discord_enabled=_discord_switch_of_broken_settings())
+        status = 1
+    try:
+        secrets = settings.load_secrets(config if isinstance(config, settings.Config) else None)
+    except settings.SettingsError as missing:
+        # 缺帳號、密碼的話登入會失敗（`LoginFailed`），有微台就告警「部位還在」；缺期貨帳號
+        # 的話平倉單送不出去，一樣告警。缺 webhook 的話告警送不出去，今天就不算處理完。
+        logger.error(".env 缺值：%s", missing)
+        status = 1
         try:
             secrets = settings.read_secrets()
-        except settings.SettingsError as missing:
-            logger.error("也讀不到 .env，連告警都發不出去：%s", missing)
+        except settings.SettingsError as absent:
+            logger.error("讀不到 .env，登入、告警都做不了：%s", absent)
             return 1
-        status = 1
-    # 設定有錯時 broker 不會被用到（不登入），帳密可能是空的
     broker = connect(secrets)
     webhook = secrets.discord_webhook
     notify = lambda text: discord.send(text, webhook)        # noqa: E731

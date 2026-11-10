@@ -8,6 +8,7 @@
 """
 
 import json
+import os
 
 import pytest
 
@@ -16,6 +17,7 @@ from broker.fake import FakeBroker
 from day_script import (DAY, at, clock, counts, make_config, minute, rally, restarted_at,
                         run_day, trade, until)
 from recording import RecordingNotifier
+import day_settings
 import exit_program
 import position_file
 
@@ -199,24 +201,96 @@ def test_after_the_restart_that_reported_it_a_further_restart_stays_quiet():
 
 # --- 交易商品與口數以部位檔為準（規格第 43、48 條）---
 
+# 08:50 起條件 1 每分鐘成立。08:51:40 當掉、08:52:50 重啟的話，08:52 那根在當掉時還沒結束
+# （筆差不知道，不判斷），重啟後 08:54、08:55 各判斷一次。
+_STRONG = rally("08:45", 10) + [trade(at("08:55:00"), 45200)]
+
 
 def test_after_a_restart_the_lots_and_product_on_file_carry_on_even_if_the_settings_changed():
     """自動下單打開、交易小台：08:50、08:51 各進一口，08:51:40 當掉。使用者趁這時把設定改成
     微台，08:52:50 盤中程式被重啟。今天已經有小台的部位：照樣看小台的行情、下小台的單，
     累計接在原來的 2 口後面（加碼上限也是）；新設定從下一個交易日起才生效。"""
-    day = rally("08:45", 10) + [trade(at("08:55:00"), 45200)]
-    first, _, _ = run_day(until(day, at("08:51:40")),
-                       config=make_config(auto_order_enabled=True, product=MTX_CODE))
+    first, _, _ = run_day(until(_STRONG, at("08:51:40")),
+                          config=make_config(auto_order_enabled=True, product=MTX_CODE))
     assert [o.contract.order_code for o in first.orders] == ["MTX11", "MTX11"]
 
-    second, sent, _ = run_day(restarted_at(day, at("08:52:50")),
-                           config=make_config(auto_order_enabled=True, product=TMF_CODE,
-                                          max_position=3))
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")),
+                              config=make_config(auto_order_enabled=True, product=TMF_CODE))
     assert second.streamed == [MTX_CODE]
-    assert [o.contract.order_code for o in second.orders] == ["MTX11"]
+    assert [o.contract.order_code for o in second.orders] == ["MTX11", "MTX11"]
     assert [m.splitlines()[0::2] for m in sent] == [
-        ["PTS 做多：買進小台 1 口 @ 45190", "累計：多單 3 口，均價 45166.67"]]
+        ["PTS 做多：買進小台 1 口 @ 45190", "累計：多單 3 口，均價 45166.67"],
+        ["PTS 做多：買進小台 1 口 @ 45200", "累計：多單 4 口，均價 45175"]]
     assert _position()["product"] == MTX_CODE
+
+
+# --- 當天的設定在第一次啟動時就定了（規格「設定」一節：改設定最快下一個交易日才生效）---
+
+
+def test_switching_auto_order_off_during_the_day_takes_effect_the_next_trading_day():
+    """自動下單打開，08:50、08:51 真實成交各 1 口，08:51:40 當掉。使用者趁這時把自動下單關掉，
+    08:52:50 被重啟。今天的設定在第一次啟動時就定了：照樣真實下單。重讀設定的話，之後的「模擬」
+    進場會疊在帳上的 2 口真單上，訊息講的累計口數就不是帳上的部位（規格第 37 條）。"""
+    on = make_config(auto_order_enabled=True)
+    run_day(until(_STRONG, at("08:51:40")), config=on)
+
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")), config=make_config())
+
+    assert len(second.orders) == 2
+    assert [m.splitlines()[0::2] for m in sent] == [
+        ["PTS 做多：買進微台 1 口 @ 45190", "累計：多單 3 口，均價 45166.67"],
+        ["PTS 做多：買進微台 1 口 @ 45200", "累計：多單 4 口，均價 45175"]]
+    assert len(_position()["entries"]) == 4
+
+
+def test_switching_auto_order_on_during_the_day_does_not_send_real_orders_today():
+    """反過來：早上是模擬模式，08:51:40 當掉時使用者把自動下單打開。重啟後照樣模擬、一張真單都
+    不送——使用者以為明天才開始的真實下單，不能因為剛好當掉就今天開始。"""
+    run_day(until(_STRONG, at("08:51:40")))
+
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")),
+                              config=make_config(auto_order_enabled=True))
+
+    assert second.orders == []
+    assert sent and all(m.startswith("【模擬】") for m in sent)
+
+
+def test_lots_and_the_position_limit_set_in_the_morning_hold_all_day():
+    """早上每次進場 1 口、加碼上限 3。當掉時使用者改成每次 2 口、上限 20：今天照早上的，
+    重啟前 2 口、重啟後再 1 口就到上限。"""
+    run_day(until(_STRONG, at("08:51:40")),
+            config=make_config(auto_order_enabled=True, max_position=3))
+
+    second, _, _ = run_day(restarted_at(_STRONG, at("08:52:50")),
+                           config=make_config(auto_order_enabled=True, lots_per_entry=2))
+
+    assert [o.lots for o in second.orders] == [1]
+
+
+def test_a_settings_snapshot_that_cannot_be_read_is_rewritten_from_the_settings_read_now():
+    """當天的設定快照被改壞（或寫到一半）：當成今天還沒有快照，照這一次讀到的設定檔，並重寫快照
+    ——和心跳記錄一樣，讀不懂不讓盤中程式停下來。之後再重啟就照重寫的那一份。"""
+    os.makedirs(os.path.dirname(day_settings.path_for(DAY)), exist_ok=True)
+    with open(day_settings.path_for(DAY), "w", encoding="utf-8") as fh:
+        fh.write("{寫到一半")
+    first, _, _ = run_day(until(_STRONG, at("08:51:40")),
+                          config=make_config(auto_order_enabled=True))
+    assert len(first.orders) == 2
+
+    second, _, _ = run_day(restarted_at(_STRONG, at("08:52:50")), config=make_config())
+    assert len(second.orders) == 2
+
+
+def test_the_discord_switch_is_not_frozen():
+    """Discord 開關不影響部位：使用者盤中關掉通知，重啟之後就不發。"""
+    on = make_config(auto_order_enabled=True)
+    run_day(until(_STRONG, at("08:51:40")), config=on)
+
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")),
+                              config=make_config(auto_order_enabled=True, discord_enabled=False))
+
+    assert len(second.orders) == 2
+    assert sent == []
 
 
 # --- 等待中的突破進場不恢復（規格第 48 條）---

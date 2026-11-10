@@ -53,6 +53,17 @@ def test_a_failed_login_is_a_login_failure_with_the_brokers_message():
         _broker(FakeSkcom(login_code=1001)).login()
 
 
+@pytest.mark.parametrize("user_id, password, missing", [("", "pw", "CAPITAL_USER_ID"),
+                                                        ("A100000000", "", "CAPITAL_PASSWORD")],
+                         ids=["沒有帳號", "沒有密碼"])
+def test_a_login_without_a_user_id_or_password_fails_and_says_which_is_missing(
+        user_id, password, missing):
+    """設定檔讀不懂時，出場程式照樣要登入平倉，帳密是從 `.env` 讀得到多少用多少（`.env` 也缺值時
+    就是空的）。空的帳號、密碼送給群益只會換來一個看不懂的代碼：先擋下來，講明是哪一個沒填。"""
+    with pytest.raises(LoginFailed, match=missing):
+        CapitalBroker(user_id, password, "F0000000000000", com=FakeSkcom()).login()
+
+
 # 群益文件裡講明是網路、主機或「稍後再試」的登入代碼（《策略王COM元件使用說明_V2.13.58》
 # 錯誤代碼表與《V2.13.45以上登入代碼定義》）。這些沒有驗證到密碼，再試不會累積密碼錯誤次數。
 _TRY_AGAIN_LATER = {

@@ -113,9 +113,9 @@ def test_the_exit_program_clears_old_logs_every_day(tmp_path, monkeypatch):
     因為某天程式出錯就延長。"""
     import exit_program
     from broker.fake import FakeBroker
-    from day_script import at, main_env, position_content, settings_yaml, write_position_file
+    from day_script import at, main_env, position_content, write_position_file
 
-    main_env(tmp_path, monkeypatch, settings_text=settings_yaml(auto="true"))
+    main_env(tmp_path, monkeypatch)
     write_position_file(position_content())         # 微台 1 口：出場程式要登入
     old = _in_logs("capital", "20261001_Center.log", days_old=31)
 
