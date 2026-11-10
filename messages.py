@@ -121,6 +121,27 @@ def position_file_unreadable(*, day: date, reason: str) -> str:
     )
 
 
+def day_settings_lost(*, day: date, reason: str, live: bool, log: str) -> str:
+    """當天的設定記錄（`day_settings`）讀不到，今天第一次啟動時的自動下單開關不知道了。
+
+    改設定最快下一個交易日才生效：照這一次的設定檔就可能今天中途開始送真單（或停掉）。所以只有
+    部位檔裡已經有今天的真實成交才照常自動下單（`live`），否則今天其餘時間只模擬。講清楚今天
+    怎麼跑、下一個交易日恢復正常；通常不必處理。`day` 而不是時刻：啟動時還沒有任何事件。
+    """
+    rest = "照常自動下單" if live else "只模擬"
+    how = ("部位檔裡已經有今天的真實成交：今天其餘時間照常自動下單。" if live
+           else "今天沒有真實成交：今天其餘時間只模擬，不送任何委託。")
+    return (
+        f"【要你處理】PTS 今天第一次啟動時的設定記錄讀不到，今天其餘時間{rest}\n"
+        f"原因：{reason}\n"
+        "改設定最快下一個交易日才生效，今天第一次啟動時的自動下單開關卻查不到。為了不在今天中途"
+        f"改成真的下單，只有部位檔裡已經有今天的真實成交才照常自動下單。{how}\n"
+        "每次進場口數、加碼上限照這一次讀到的設定檔。下一個交易日照設定檔正常啟動，不必處理；"
+        f"想知道原因請看 {log}。\n"
+        f"{day:%Y/%m/%d}"
+    )
+
+
 def login_failed(*, day: date, reason: str, marker: str) -> str:
     """盤中程式登入失敗（`broker.LoginFailed`：帳密、憑證、群益元件），今天不再自動登入。
 

@@ -34,13 +34,15 @@ def _must_not_log_in(why: str) -> AssertionError:
 
 def test_an_unreadable_position_file_is_reported_once_however_often_the_program_restarts():
     """部位檔讀不懂：盤中程式告警、今天不進場（ticket 06），行情照記。它在 10:00 當掉，排程一分鐘
-    後又叫醒它，檔案還是讀不懂——再告警一次的話，當掉幾次就講幾次同一件事。"""
+    後又叫醒它，檔案還是讀不懂——再告警一次的話，當掉幾次就講幾次同一件事。部位檔只有真實下單
+    會寫：自動下單打開的一天。"""
     write_position_file("{寫到一半")
     morning = whole_morning()
-    sent, _ = _wake([e for e in morning if e.time <= at("10:00:00")])
+    live = make_config(auto_order_enabled=True)
+    sent, _ = _wake([e for e in morning if e.time <= at("10:00:00")], config=live)
     assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場"]
 
-    sent, outcome = _wake([e for e in morning if e.time >= at("10:01:00")])
+    sent, outcome = _wake([e for e in morning if e.time >= at("10:01:00")], config=live)
     assert sent == []
     assert outcome.ending == intraday.Ending.CUTOFF
 

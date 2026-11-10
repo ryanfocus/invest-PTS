@@ -25,18 +25,33 @@
       "max_position": 20
     }
 
-寫法同部位檔：先寫暫存檔再置換（`state_files.write_json`）。讀不懂（被手改壞、被防毒鎖住）時當成
-沒有快照：照這一次讀到的設定檔，並覆寫它——和心跳記錄一樣，讀不懂不會讓盤中程式停下來；
-要同時碰上「快照壞了」與「當天改了設定」才會照新設定走。
+寫法同部位檔：先寫暫存檔再置換（`state_files.write_json`）。
+
+## 快照不見了
+
+快照讀不懂（被改壞、被防毒鎖住），或今天稍早明明跑過（`_ran_earlier_today`）卻沒有快照（第一次
+啟動時寫不進去）：今天第一次啟動時的自動下單開關不知道了。**不能照這一次的設定檔**——那正好是
+快照要擋的事：模擬的早上、中午把開關打開，剛好重啟就開始送真單。改成保守的決定：只有部位檔裡
+已經有今天的真實成交（部位檔只有真實下單會寫）才照常自動下單，否則今天其餘時間只模擬。
+每次進場口數、加碼上限照這一次的設定檔（查不回來；部位檔在的話交易商品照部位檔）。快照照這個
+決定重寫，之後再重啟不會又翻過去。這個決定和設定檔現在的開關不一樣時，呼叫端講一次
+（`Today.lost`）：今天不照使用者寫的跑，一定要讓他知道。一樣的話只記 log——今天照設定檔跑，
+沒有和使用者以為的不同，不必打擾（規格第 39 條）。
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
+import os
+from dataclasses import dataclass, replace
 from datetime import date
 
+import heartbeat
+import paths
+import position_file
+import raw_market
 import settings
+import sim_position
 import state_files
 from broker import MARKET_ORDER_LOT_CAP, PRODUCT_CODES
 
@@ -55,27 +70,70 @@ def path_for(day: date) -> str:
     return state_files.daily("day-settings", day, ".json")
 
 
-def for_today(config: settings.Config, day: date) -> settings.Config:
+@dataclass(frozen=True)
+class Today:
+    """今天要用的設定。`lost` 平常是 None；快照不見了、保守的決定又和設定檔的開關不一樣時，
+    是給人看的原因（要講一則）。"""
+
+    config: settings.Config
+    lost: str | None = None
+
+
+def for_today(config: settings.Config, day: date) -> Today:
     """今天要用的設定。今天已經有快照：`order` 區段照快照，Discord 開關照 `config`（設定檔）。
-    還沒有：`config` 就是今天的設定，寫成快照。寫不進去只記 log：這一輪照樣跑，代價是重啟時
-    會重讀設定檔。"""
+    今天第一次啟動：`config` 就是今天的設定，寫成快照。快照不見了：見模組說明「快照不見了」。"""
+    where = paths.shown_state(path_for(day))
     try:
         frozen = read(day)
+        lost = None
     except Unreadable as exc:
-        logger.error("當天的設定快照讀不懂，照這一次讀到的設定檔，並重寫快照：%s", exc)
-        frozen = None
+        frozen, lost = None, f"當天的設定記錄 {where} 讀不懂（{exc}）"
     if frozen is not None:
         today = replace(frozen, discord_enabled=config.discord_enabled)
         if today != config:
             logger.warning("設定檔的 order 區段今天改過了（%s），今天照第一次啟動時的（%s），"
                            "新設定從下一個交易日起生效", config, today)
-        return today
+        return Today(today)
+    if lost is None and _ran_earlier_today(day):
+        lost = f"今天稍早盤中程式已經跑過，卻沒有當天的設定記錄 {where}（當時寫不進去？）"
+    if lost is None:
+        _write(config, day)
+        return Today(config)
+    live = os.path.exists(position_file.path_for(day))
+    logger.error("%s。今天其餘時間%s", lost, "照常自動下單（部位檔裡有今天的真實成交）" if live
+                 else "只模擬（部位檔裡沒有今天的真實成交）")
+    safe = replace(config, auto_order_enabled=live)
+    _write(safe, day)
+    return Today(safe, lost if live != config.auto_order_enabled else None)
+
+
+def _ran_earlier_today(day: date) -> bool:
+    """今天稍早盤中程式跑過的痕跡。快照在登入之前就寫，所以沒有快照、又有這些痕跡，就是當時
+    寫不進去。看好幾樣，因為寫不進快照的那個原因（防毒鎖住、`os.replace` 失敗）多半也讓其他
+    JSON 記錄寫不進去：
+
+      * 原始行情檔：直接接著寫、不經置換。收到今天日盤的成交才建——進場一定在那之後。
+      * 心跳記錄（今天的；讀不懂也算，不知道就當成跑過）、部位檔、模擬部位。
+
+    一樣都沒有的話，稍早那一輪（如果有）還沒收到今天的成交，什麼都沒判斷過：當成今天第一次
+    啟動不會有兩套規則。
+    """
+    if any(os.path.exists(p) for p in (raw_market.path_for(day), position_file.path_for(day),
+                                       sim_position.path_for(day))):
+        return True
+    try:
+        beat = heartbeat.read()
+    except heartbeat.Unreadable:
+        return True
+    return beat is not None and beat.trading_day == day
+
+
+def _write(config: settings.Config, day: date) -> None:
+    """寫不進去只記 log：這一輪照樣跑。重啟時看到「今天跑過、卻沒有快照」，照保守的決定走。"""
     try:
         state_files.write_json(path_for(day), _to_json(config, day))
     except Exception as exc:  # noqa: BLE001
-        logger.error("當天的設定快照寫不進 %s（%s: %s）：盤中程式若重啟，會重讀設定檔",
-                     path_for(day), type(exc).__name__, exc)
-    return config
+        logger.error("當天的設定快照寫不進 %s（%s: %s）", path_for(day), type(exc).__name__, exc)
 
 
 def read(day: date) -> settings.Config | None:

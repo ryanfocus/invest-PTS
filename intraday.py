@@ -202,7 +202,12 @@ def run(broker: Broker, config: settings.Config, *, today: date,
 
     # 改設定最快下一個交易日才生效：自動下單開關、口數、加碼上限、交易商品照今天第一次啟動時的
     # （`day_settings`）。重讀的話，生效與否就看盤中程式有沒有剛好當掉重啟。
-    config = day_settings.for_today(config, today)
+    today_settings = day_settings.for_today(config, today)
+    config = today_settings.config
+    if today_settings.lost is not None:
+        _send(config, notify, messages.day_settings_lost(
+            day=today, reason=today_settings.lost, live=config.auto_order_enabled,
+            log=paths.shown_log("intraday", today)))
     pulse = _Pulse(today)
     # 當天已經有部位（盤中重啟）：交易商品、合約、口數一律以部位檔為準，不看設定檔
     # （規格第 43 條）。進場和出場就不會是不同的商品。

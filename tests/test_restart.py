@@ -268,18 +268,87 @@ def test_lots_and_the_position_limit_set_in_the_morning_hold_all_day():
     assert [o.lots for o in second.orders] == [1]
 
 
-def test_a_settings_snapshot_that_cannot_be_read_is_rewritten_from_the_settings_read_now():
-    """當天的設定快照被改壞（或寫到一半）：當成今天還沒有快照，照這一次讀到的設定檔，並重寫快照
-    ——和心跳記錄一樣，讀不懂不讓盤中程式停下來。之後再重啟就照重寫的那一份。"""
-    os.makedirs(os.path.dirname(day_settings.path_for(DAY)), exist_ok=True)
+# 當天的設定記錄讀不到時的那一則：第二行是原因（每種情況不同），其餘逐字
+def _settings_lost(rest_of_today: str, how: str) -> list[str]:
+    return [f"【要你處理】PTS 今天第一次啟動時的設定記錄讀不到，今天其餘時間{rest_of_today}",
+            "改設定最快下一個交易日才生效，今天第一次啟動時的自動下單開關卻查不到。為了不在今天中途"
+            f"改成真的下單，只有部位檔裡已經有今天的真實成交才照常自動下單。{how}",
+            "每次進場口數、加碼上限照這一次讀到的設定檔。下一個交易日照設定檔正常啟動，不必處理；"
+            "想知道原因請看 logs/intraday-20261109.log。",
+            "2026/11/09"]
+
+
+_SIMULATE_ONLY = _settings_lost("只模擬", "今天沒有真實成交：今天其餘時間只模擬，不送任何委託。")
+
+
+def _corrupt_settings_snapshot() -> None:
     with open(day_settings.path_for(DAY), "w", encoding="utf-8") as fh:
         fh.write("{寫到一半")
-    first, _, _ = run_day(until(_STRONG, at("08:51:40")),
-                          config=make_config(auto_order_enabled=True))
-    assert len(first.orders) == 2
 
-    second, _, _ = run_day(restarted_at(_STRONG, at("08:52:50")), config=make_config())
+
+def test_a_settings_snapshot_that_cannot_be_read_never_turns_a_simulation_day_live():
+    """模擬模式的早上，08:51:40 當掉；當天的設定記錄被改壞，使用者又剛好把自動下單打開。重啟時
+    不知道今天第一次啟動時開關是什麼：照這一次的設定檔就是今天中途開始送真單——當天的設定記錄就是
+    為了擋這件事。部位檔裡沒有今天的真實成交，今天其餘時間只模擬，講一次；記錄照這個決定重寫，
+    之後再重啟不會又翻過去、也不再講。"""
+    run_day(until(_STRONG, at("08:51:40")))
+    _corrupt_settings_snapshot()
+    on = make_config(auto_order_enabled=True)
+
+    second, sent, _ = run_day(until(restarted_at(_STRONG, at("08:52:50")), at("08:53:40")),
+                              config=on)
+
+    assert second.orders == [] and not second.prepared
+    lines = sent[0].splitlines()
+    assert lines[0] == _SIMULATE_ONLY[0]
+    assert lines[1].startswith("原因：當天的設定記錄 state/day-settings-20261109.json 讀不懂")
+    assert lines[2:] == _SIMULATE_ONLY[1:]
+    assert all(m.startswith("【模擬】") for m in sent[1:])
+
+    third, sent, _ = run_day(restarted_at(_STRONG, at("08:53:50")), config=on)
+    assert third.orders == []
+    assert [m.splitlines()[0] for m in sent] == ["【模擬】PTS 做多：買進微台 1 口 @ 45200"]
+
+
+def test_a_settings_snapshot_that_was_never_written_does_not_let_a_restart_turn_live(
+        monkeypatch):
+    """第一次啟動時當天的設定記錄寫不進去（防毒鎖住）。之後重啟看到的是「沒有記錄」，可是今天
+    稍早明明跑過（心跳記錄、原始行情都在）：不能當成今天第一次啟動，照樣只模擬、講一次。"""
+    replace = os.replace
+
+    def snapshot_denied(src, dst):
+        if os.path.basename(dst).startswith("day-settings-"):
+            raise PermissionError(13, "存取被拒")
+        return replace(src, dst)
+    with monkeypatch.context() as m:
+        m.setattr(os, "replace", snapshot_denied)
+        run_day(until(_STRONG, at("08:51:40")))
+
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")),
+                              config=make_config(auto_order_enabled=True))
+
+    assert second.orders == []
+    lines = sent[0].splitlines()
+    assert lines[1] == ("原因：今天稍早盤中程式已經跑過，卻沒有當天的設定記錄 "
+                        "state/day-settings-20261109.json（當時寫不進去？）")
+    assert [lines[0], *lines[2:]] == _SIMULATE_ONLY
+    assert all(m.startswith("【模擬】") for m in sent[1:])
+
+
+def test_a_settings_snapshot_lost_on_a_day_with_real_fills_keeps_trading_live():
+    """自動下單打開，08:50、08:51 真實成交各 1 口，之後當天的設定記錄被改壞。部位檔證明今天第一次
+    啟動時開關是開著的：今天其餘時間照常自動下單（就算設定檔這時改成關），講一次。"""
+    run_day(until(_STRONG, at("08:51:40")), config=make_config(auto_order_enabled=True))
+    _corrupt_settings_snapshot()
+
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")), config=make_config())
+
     assert len(second.orders) == 2
+    lines = sent[0].splitlines()
+    assert [lines[0], *lines[2:]] == _settings_lost(
+        "照常自動下單", "部位檔裡已經有今天的真實成交：今天其餘時間照常自動下單。")
+    assert [m.splitlines()[0] for m in sent[1:]] == [
+        "PTS 做多：買進微台 1 口 @ 45190", "PTS 做多：買進微台 1 口 @ 45200"]
 
 
 def test_after_a_restart_the_simulated_position_carries_on():
