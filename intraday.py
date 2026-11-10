@@ -220,7 +220,10 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     try:
         broker.login()
     except LoginFailed as exc:
+        # 寫下登入失敗記錄的同時講一則（之後被叫醒看到記錄就不再登入，也就不再講）
         _write_login_failed(today, str(exc))
+        _send(config, notify, messages.login_failed(
+            day=today, reason=str(exc), marker=paths.shown_state(login_failed_path(today))))
         raise
     # `LoginUnavailable`（網路、群益主機）不寫：往外拋、這一輪結束，下一分鐘排程叫醒時再登入
     live = config.auto_order_enabled
@@ -1243,8 +1246,11 @@ def login_failed_path(day: date) -> str:
     網路或群益主機的問題（`broker.LoginUnavailable`：斷線、取不到主機清單、「請稍後再試」）
     **不寫**：沒有驗證到密碼，不會鎖帳號；下一分鐘再登入一次，開盤時的一次斷線才不會賠掉一整天。
 
-    **不寫進心跳記錄**：這不是「收工了」。使用者要從 13:25 出場程式的「盤中程式今天沒有跑」
-    知道這件事（規格第 54 條），心跳記錄寫了「收工了」，出場程式就不講了。
+    寫下它的同時發一則 Discord（`messages.login_failed`），講原因與排除之後怎麼讓它再登入：
+    等 13:25 才知道的話，當天的進場時段已經過完了。之後被叫醒看到它就不再登入，也就不再講。
+
+    **不寫進心跳記錄**：這不是「收工了」。13:25 出場程式照樣講「盤中程式今天沒有跑」（規格
+    第 54 條），心跳記錄寫了「收工了」，出場程式就不講了。
 
     排除原因之後刪掉它，排程下一次叫醒時就會再登入；放著不管，隔一個交易日也照常登入。
     檔案存在就算數，內容只是給人看的原因（標記檔，`state_files`）。

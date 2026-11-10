@@ -10,6 +10,8 @@
 斷言送出的委託、發出的訊息，以及有沒有登入（假 broker 的登入一被呼叫就讓測試失敗）。
 """
 
+import pytest
+
 from broker import LoginFailed, LoginUnavailable
 from broker.fake import FakeBroker
 from day_script import (DAY, PREVIOUS_DAY, at, main_env, make_config, run_day, whole_morning,
@@ -62,6 +64,28 @@ def test_what_the_previous_trading_day_concluded_does_not_stop_today():
 # --- 登入失敗：今天不再登入 ---
 
 
+def test_a_failed_login_is_reported_at_once_with_how_to_get_going_again():
+    """登入失敗（帳密、憑證、群益元件）當下就講一則：等 13:25 出場程式的「盤中程式今天沒有跑」
+    才知道的話，當天的進場時段已經過完了。講原因，也講排除之後怎麼讓它再登入——今天不再自動
+    重登，是怕把帳號鎖住。下一次被叫醒不再講（也不再登入）。"""
+    notifier = RecordingNotifier()
+    with pytest.raises(LoginFailed):
+        intraday.run(FakeBroker(login_error=LoginFailed("群益登入失敗，代碼 1001：密碼錯誤")),
+                     make_config(), today=DAY, notify=notifier)
+    assert notifier.sent == [
+        "【要你處理】PTS 盤中程式登入失敗，今天不再自動登入\n"
+        "原因：群益登入失敗，代碼 1001：密碼錯誤\n"
+        "今天不判斷進場，也不記錄原始行情；已經有的部位照常由 13:25 的出場程式處理。帳密錯了還一直"
+        "重試，會把帳號鎖住，所以盤中程式今天不再自己登入。\n"
+        "排除原因（例如改好 .env 的密碼、更新憑證）之後，刪掉 state/login-failed-20261109.txt，"
+        "一分鐘內會再登入。\n"
+        "2026/11/09",
+    ]
+
+    sent, _ = _wake(login_error=_must_not_log_in("今天登入失敗過，不該再登入"))
+    assert sent == []
+
+
 def test_after_a_failed_login_the_next_wake_ups_do_not_log_in_again():
     """登入失敗要人處理（帳密、憑證、群益元件），重試沒有用（`broker.LoginFailed`）。帳密錯了
     還每分鐘再試，一天就是兩百多次錯誤的登入，可能把帳號鎖住——連使用者自己的 APP 也登不進去。"""
@@ -86,8 +110,8 @@ def test_a_login_lost_to_the_network_is_tried_again_at_the_next_wake_up():
 
 
 def test_a_failed_login_still_shows_up_at_1325_as_the_intraday_program_not_running():
-    """登入失敗時盤中程式不發 Discord（沒有進場、也沒有部位），使用者是從 13:25 出場程式的
-    「盤中程式今天沒有跑」知道的（規格第 54 條）——「不再登入」不能被寫成「收工了」。"""
+    """登入失敗當下講過一則之後，13:25 出場程式照樣講「盤中程式今天沒有跑」（規格第 54 條）：
+    使用者可能還沒排除——「不再登入」不能被寫成「收工了」。"""
     try:
         _wake(login_error=LoginFailed("群益登入失敗，代碼 1001：密碼錯誤"))
     except LoginFailed:

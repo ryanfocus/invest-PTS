@@ -121,6 +121,24 @@ def position_file_unreadable(*, day: date, reason: str) -> str:
     )
 
 
+def login_failed(*, day: date, reason: str, marker: str) -> str:
+    """盤中程式登入失敗（`broker.LoginFailed`：帳密、憑證、群益元件），今天不再自動登入。
+
+    當下就講：等 13:25 出場程式的「盤中程式今天沒有跑」才知道的話，當天的進場時段已經過完了。
+    講原因，也講排除之後怎麼讓它再登入（刪掉 `marker`，`paths.shown_state`）；以及為什麼不自己
+    重試——帳密錯了還一直試，會把使用者自己也在用的帳號鎖住。`day` 而不是時刻：登入時還沒有
+    任何事件（見 `intraday` 模組說明「時間」）。
+    """
+    return (
+        "【要你處理】PTS 盤中程式登入失敗，今天不再自動登入\n"
+        f"原因：{reason}\n"
+        "今天不判斷進場，也不記錄原始行情；已經有的部位照常由 13:25 的出場程式處理。帳密錯了還一直"
+        "重試，會把帳號鎖住，所以盤中程式今天不再自己登入。\n"
+        f"排除原因（例如改好 .env 的密碼、更新憑證）之後，刪掉 {marker}，一分鐘內會再登入。\n"
+        f"{day:%Y/%m/%d}"
+    )
+
+
 def fill_not_on_file(*, at: datetime, product: str, direction: str, lots: int, price: float,
                      order_seq: str, total_lots: int, on_file_lots: int, reason: str) -> str:
     """成交了，部位檔卻寫不進去（規格第 38、41 條：「部位還在」）。盤中程式今天不再進場。
