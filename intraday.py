@@ -68,6 +68,10 @@
 盯價——剛設下的突破進場也要看這一筆。13:20 收工時，等待中的那一筆一併取消（規格第 26 條），
 報價中斷告警時也是（`_QuoteWatch`）；它不寫進任何檔案，重啟後也不恢復（規格第 48 條）。
 
+13:20 之後不能有任何新成交，所以每一筆進場單都帶著截止時刻（`OrderRequest.deadline`）：13:20 前
+被觸發、送出那一刻 broker 的本機時鐘已經過了的，不送，只記 log（`PastDeadline`）。為了不讓這種
+事常發生，自動下單打開時在訂閱行情之前就做好下單準備（`_prepare_orders`）。
+
 ## 時間
 
 盤中程式的「現在」**一律取自事件上的時間**，不讀系統時鐘（規格「時間」一節）。
@@ -112,8 +116,8 @@ import sim_position
 import state_files
 import strategy
 from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
-                    FillUnknown, LoginFailed, OrderFailed, OrderRequest, ProductTrade, TxTrade,
-                    TxTradeCounts)
+                    FillUnknown, LoginFailed, OrderFailed, OrderRequest, PastDeadline,
+                    ProductTrade, TxTrade, TxTradeCounts)
 from raw_market import RawMarketWriter
 
 logger = logging.getLogger(__name__)
@@ -229,6 +233,8 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     # 前查好；查不到不中止，每分鐘再查（`_Lookups`）
     lookups = _Lookups(broker, trading, today, product=product,
                        need_contract=live and record is None and not unreadable)
+    if live and not trading.stopped:
+        _prepare_orders(broker)
     end_at = datetime.combine(today, ENTRY_CUTOFF)
     # 盤中重啟：今天稍早收到的行情在原始行情檔裡，K 棒與筆差從那裡接著組（見 `_Restored`）
     restored = _Restored(raw_market.read(today))
@@ -417,6 +423,19 @@ class _Restored:
                 return False
             self._left -= 1
         return True
+
+
+def _prepare_orders(broker: Broker) -> None:
+    """自動下單打開：訂閱行情之前就做好下單準備（讀憑證、連回報、等回報補送完）。
+
+    留到第一筆委託才做的話要多等幾秒到幾十秒：盤中重啟後的第一筆可能是 13:19 觸發的突破進場，
+    準備完已經過了 13:20（規格第 26 條）。失敗只記 log：還沒有任何委託，不必打擾人；第一筆委託
+    送出時 broker 會再準備一次，那時還不行才是「委託沒有送出去」。
+    """
+    try:
+        broker.prepare_orders()
+    except BrokerError as exc:
+        logger.warning("下單準備沒有做好，第一筆委託時再試：%s", exc)
 
 
 def _stop_for_unreadable_position_file(config: settings.Config, notify: Callable[[str], bool],
@@ -668,8 +687,11 @@ class _Orders:
           * `_FillNotOnFile`：成交了卻寫不進部位檔；檔裡還是送單前記下的「不確定」，
             `self.record` 維持送單前那一份。
         """
+        # 13:20 進場截止之後不能有任何新成交（規格第 26 條）：決定送單的是事件上的時間，送出的那一刻
+        # 由 broker 用本機時鐘再比一次（`OrderRequest.deadline`）
         request = OrderRequest(contract=self._contract, side=_ENTRY_SIDE[direction], lots=lots,
-                               trading_day=self._today)
+                               trading_day=self._today,
+                               deadline=datetime.combine(self._today, ENTRY_CUTOFF))
         self._mark_sending(direction, lots)
         try:
             result = self._broker.place_order(request)
@@ -836,6 +858,11 @@ class _Trading:
             self._stopped = True
             return None
 
+    @property
+    def stopped(self) -> bool:
+        """今天已經停止進場了沒有。"""
+        return self._stopped
+
     def report_uncertain_entry_left_by_last_run(self, now: datetime) -> None:
         """重啟前那一輪送出進場單之後、告警之前就停了：替它發「委託送出去了，但…」的告警
         （規格第 50 條），並寫下停止進場記錄——之後再重啟就不再講一次。
@@ -954,6 +981,10 @@ class _Trading:
             return
         try:
             fill = self.orders.enter(decision.direction, decision.lots)
+        except PastDeadline as exc:
+            # 13:20 前觸發、送出時已經過了截止：沒有送出，確定沒有部位，也不必使用者做什麼——只記 log
+            logger.info("%s 的委託沒有送出：%s", decision.condition.value, exc)
+            return
         except OrderFailed as exc:
             self._not_sent(decision, exc, now)
             return

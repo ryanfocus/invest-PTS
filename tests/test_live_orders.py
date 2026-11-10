@@ -14,7 +14,8 @@ from datetime import timedelta
 
 import pytest
 
-from broker import BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, ProductListUnavailable
+from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, OrderFailed,
+                    ProductListUnavailable)
 from broker.fake import FakeBroker
 from day_script import (DAY, DROP, PREVIOUS_DAY, SENDING_MARKER, at, calm_history, clock,
                         contracts, lock_position_file, lock_position_file_once_sent, make_config,
@@ -75,8 +76,65 @@ def test_with_auto_order_off_the_same_day_sends_nothing_and_writes_no_position_f
     broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
                         config=make_config())
     assert broker.orders == []
+    assert not broker.prepared
     assert not os.path.exists(position_file.path_for(DAY))
     assert sent[0].splitlines()[0] == "【模擬】PTS 做多：買進微台 1 口 @ 45150"
+
+
+# --- 13:20 之後不送任何進場單（規格第 26 條）---
+
+
+class _PreparedFirst(FakeBroker):
+    """記下訂閱行情的那一刻，下單準備做好了沒有。"""
+
+    def events(self, product):
+        self.prepared_when_subscribed = self.prepared
+        return super().events(product)
+
+
+def test_orders_are_prepared_before_the_market_is_subscribed():
+    """自動下單打開：讀憑證、連回報、等回報補送完（第一筆委託要的那幾秒到幾十秒）在訂閱行情之前
+    就做好。留到第一筆委託才做的話，盤中重啟後的第一筆可能是 13:19 觸發的突破進場，準備完已經
+    過了 13:20。"""
+    broker = _PreparedFirst(events=rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
+                            contracts=contracts(),
+                            minute_bars={PREVIOUS_DAY: calm_history(45000)})
+    intraday.run(broker, LIVE, today=DAY, notify=RecordingNotifier())
+    assert broker.prepared_when_subscribed
+    assert len(broker.orders) == 1
+
+
+def test_a_failed_preparation_is_only_logged_and_the_first_order_tries_again():
+    """準備下單失敗（例如回報主機一時連不上）：還沒有任何委託，不必打擾人，只記 log；第一筆委託
+    送出時 broker 會再準備一次，那時還不行才是「委託沒有送出去」。"""
+    broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
+                        prepare_error=OrderFailed("回報連線失敗，群益訊息3021"))
+    assert len(broker.orders) == 1
+    assert [m.splitlines()[0] for m in sent] == ["PTS 做多：買進微台 1 口 @ 45150"]
+
+
+def _late_breakout_day() -> list:
+    """08:50 條件 1 進一口，之後到 13:15 平盤（45150）、筆差 500。13:16 那根筆差跳到 1600、
+    最高 45180：13:17:00 設下突破進場（觸發價 45180）。13:19:59 大台成交在 45180，碰到了。"""
+    return (rally("08:45", 5) + rally("08:50", 266, open_=45150, step=0, bichai=500)
+            + minute("13:16", 45150, 45180, bichai=1600)
+            + minute("13:17", 45170, 45175, bichai=1600)
+            + minute("13:18", 45175, 45175, bichai=1600)
+            + [clock(at("13:19:59")), trade(at("13:19:59"), 45180), clock(at("13:20:00"))])
+
+
+@pytest.mark.parametrize("delay, orders", [(timedelta(0), 2), (timedelta(seconds=2), 1)],
+                         ids=["當下送出", "送出時已經過了 13:20"])
+def test_an_entry_order_is_not_sent_once_the_cutoff_has_passed(delay, orders):
+    """突破進場在 13:19:59 被觸發，但送出那一刻（broker 的本機時鐘）已經 13:20:01——例如盤中
+    重啟後的第一筆委託要先準備下單元件。13:20 之後不能有任何新成交（規格第 26 條）：不送。
+    確定沒有部位、也不必使用者做什麼，所以只記 log，不發「委託沒有送出去」（規格第 39 條）；
+    部位檔改回送單前的樣子。"""
+    broker, sent = _run(_late_breakout_day(), order_delay=delay)
+    assert len(broker.orders) == orders
+    assert len(sent) == orders
+    assert _file()["status"] == "CONFIRMED"
+    assert len(_file()["entries"]) == orders
 
 
 # --- 委託參數：市價 IOC、倉別自動、當沖註記依商品（規格第 27、28 條）---

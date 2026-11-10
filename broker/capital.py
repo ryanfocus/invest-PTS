@@ -58,6 +58,7 @@ from broker import (
     TxTrade,
     TxTradeCounts,
     TX_CODE,
+    ensure_before_deadline,
     ensure_sendable,
 )
 from broker.capital_wire import (FillSummary, ReportUnreadable, build_future_order_fields,
@@ -694,6 +695,21 @@ class CapitalBroker:
                            "回報連線可能異常，送出的委託可能收不到成交回報",
                            self._connect_timeout)
 
+    def prepare_orders(self) -> None:
+        """做好下單的準備（契約見 `broker.Broker.prepare_orders`）。失敗一律是 `OrderFailed`：
+        還沒送任何單，確定沒有部位。"""
+        if self._center is None:
+            raise OrderFailed("尚未登入")
+        if not self._account:
+            raise OrderFailed("未設定期貨帳號（.env 的 CAPITAL_FUTURES_ACCOUNT）")
+        try:
+            self._ensure_order_ready()
+        except OrderFailed:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise OrderFailed(
+                f"準備下單時元件發生錯誤（{type(exc).__name__}）：{exc}") from exc
+
     def place_order(self, request: OrderRequest) -> OrderResult:
         """送出市價 IOC 委託，等到它確定結束，回傳**實際**成交的口數與均價。
 
@@ -722,6 +738,8 @@ class CapitalBroker:
             raise OrderFailed(
                 f"準備送單時元件發生錯誤（{type(exc).__name__}）：{exc}") from exc
 
+        # 準備下單元件、重連回報可能花了幾秒到幾十秒：送出的這一刻再比一次期限
+        ensure_before_deadline(request, self._now())
         before = len(self._reply_events.rows)
         try:
             message, code = self._order.SendFutureOrderCLR(self._user_id, False, order)

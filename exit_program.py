@@ -416,7 +416,7 @@ class _MicroExit:
             try:
                 result = self._broker.place_order(OrderRequest(
                     contract=record.contract, side=_EXIT_SIDE[record.direction], lots=chunk,
-                    trading_day=self._today))
+                    trading_day=self._today, deadline=self._deadline))
             except OrderFailed as exc:
                 # 確定沒有送出去，也就確定沒有成交：重試是安全的
                 logger.warning("平倉委託沒有送出去：%s", exc)

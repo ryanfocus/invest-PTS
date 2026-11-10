@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Iterable, Iterator
 
 from broker import (
@@ -22,6 +22,7 @@ from broker import (
     OrderRequest,
     OrderResult,
     ProductTrade,
+    ensure_before_deadline,
     ensure_sendable,
 )
 
@@ -40,6 +41,10 @@ class FakeBroker:
       ——「第一次斷線、一分鐘後好了」就是 `[LoginUnavailable(...), None]`。
     - `fill_queries`：成交查詢（`query_fills`）的答案，逐次消耗。**沒安排卻被查就是
       AssertionError**：查詢只該出現在出場單不確定之後，測試沒預期到它就是流程走錯路。
+    - `prepare_error`：準備下單（`prepare_orders`）時要拋的例外。
+    - `order_delay`：從決定送單到真的送出要多久（真 broker 第一筆委託要先準備下單元件）。假 broker
+      的本機時鐘是劇本裡**已經回放過的**最後一個事件的時間，送出的那一刻就是它加上 `order_delay`，
+      拿來比委託的期限（`OrderRequest.deadline`）。還沒回放過任何事件時不比。
     """
 
     def __init__(
@@ -55,6 +60,8 @@ class FakeBroker:
         contracts_error: Exception | list[Exception | None] | None = None,
         minute_bars_error: Exception | list[Exception | None] | None = None,
         fill_queries: Iterable[FillQuery] = (),
+        prepare_error: Exception | None = None,
+        order_delay: timedelta = timedelta(0),
     ):
         self._contracts = contracts or {}
         self._events = list(events)
@@ -67,6 +74,11 @@ class FakeBroker:
         self._contracts_error = _Failures(contracts_error)
         self._minute_bars_error = _Failures(minute_bars_error)
         self._fill_queries = list(fill_queries)
+        self._prepare_error = prepare_error
+        self._order_delay = order_delay
+        self._last_event_at: datetime | None = None
+        # 準備過下單了沒有（`prepare_orders`）。自動下單關閉時要是 False：準備下單也是下單 API。
+        self.prepared = False
         # 被查過的委託，依序：(委託序號, 交易日, 委託口數)。出場單不確定時查的必須是
         # **那一張出場單**——拿進場單的序號去查，查到的是早上的成交，看起來就像已經平倉。
         self.queries: list[tuple[str, date, int]] = []
@@ -98,10 +110,18 @@ class FakeBroker:
         for event in self._events:
             if isinstance(event, ProductTrade):
                 self._last_product_price = event.price
+            self._last_event_at = event.time
             yield event
+
+    def prepare_orders(self) -> None:
+        if self._prepare_error is not None:
+            raise self._prepare_error
+        self.prepared = True
 
     def place_order(self, request: OrderRequest) -> OrderResult:
         ensure_sendable(request)
+        if self._last_event_at is not None:
+            ensure_before_deadline(request, self._last_event_at + self._order_delay)
         self.orders.append(request)
         seq = f"{2315610000000 + len(self.orders):013d}"
 

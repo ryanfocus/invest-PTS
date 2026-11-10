@@ -6,16 +6,16 @@
 
 import logging
 import os
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
 import paths
 from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, FillUnknown,
-                    LoginFailed, LoginUnavailable, OrderFailed, OrderRequest,
+                    LoginFailed, LoginUnavailable, OrderFailed, OrderRequest, PastDeadline,
                     ProductListUnavailable)
 from broker.capital import CapitalBroker
-from day_script import order_request
+from day_script import contracts, order_request
 from fake_skcom import (FakeSkcom, capital_broker, fills, full_fill, no_sequence,
                         refused_at_send, rejected, reply_row, silence)
 
@@ -162,6 +162,36 @@ def test_logging_in_and_listing_products_never_touch_the_order_side():
     touched = [(lib, method) for lib, method, _ in skcom.calls
                if lib in ("SKOrderLib", "SKReplyLib")]
     assert touched == []
+
+
+def _order_side(skcom: FakeSkcom) -> list[str]:
+    return [method for lib, method, _ in skcom.calls if lib in ("SKOrderLib", "SKReplyLib")]
+
+
+def test_orders_can_be_prepared_before_the_first_order():
+    """自動下單打開時，盤中程式在訂閱行情之前就做好下單準備（`prepare_orders`）：下單元件、
+    憑證、回報連線、帳號。之後的第一筆委託直接送出，不再準備一次。"""
+    skcom = FakeSkcom(on_send=full_fill(45000.0))
+    broker = _broker(skcom)
+    broker.login()
+    broker.prepare_orders()
+    prepared = _order_side(skcom)
+    assert "SKOrderLib_Initialize" in prepared and "ReadCertByID" in prepared
+    assert skcom.sent == []
+
+    broker.place_order(order_request())
+    assert _order_side(skcom).count("SKOrderLib_Initialize") == 1
+
+
+def test_an_order_past_its_deadline_when_it_would_go_out_is_not_sent():
+    """委託帶著期限（盤中程式是 13:20 進場截止）。準備下單元件、重連回報要時間：送出的那一刻
+    用本機時鐘再比一次，過了就不送（`PastDeadline`，確定沒有部位）。"""
+    skcom = FakeSkcom(on_send=full_fill(45000.0))
+    request = OrderRequest(contract=contracts()[TMF_CODE], side=BUY, lots=1,
+                           trading_day=date(2026, 11, 9), deadline=datetime(2026, 11, 9, 13, 20))
+    with pytest.raises(PastDeadline):
+        _place(skcom, request, now=lambda: datetime(2026, 11, 9, 13, 20, 1))
+    assert skcom.sent == []
 
 
 # --- 委託欄位（規格第 27、28 條）---

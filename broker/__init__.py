@@ -94,6 +94,14 @@ class OrderFailed(BrokerError):
     """
 
 
+class PastDeadline(OrderFailed):
+    """委託帶的期限（`OrderRequest.deadline`）在送出的那一刻已經過了，沒有送出。**確定沒有部位。**
+
+    是 `OrderFailed` 的一種（不認得它的呼叫端照「委託沒有送出去」處理，也是對的），但盤中程式
+    分開處理：13:20 進場截止之後不送，是規則不是出事，只記 log、不告警（規格第 26、39 條）。
+    """
+
+
 class FillUnknown(BrokerError):
     """**委託已經送出，但不知道成交幾口。** 回報沒回來、認不出是哪一筆、送出後元件出錯。
 
@@ -158,12 +166,18 @@ class OrderRequest:
 
     `trading_day` 是送單當天的交易日，用來擋過期合約。由呼叫端傳入而不是 broker
     自己讀時鐘：盤中程式的「現在」一律取自事件（規格「時間」一節）。
+
+    `deadline` 是「過了這一刻就不送」（本機時鐘；None 是沒有期限）：盤中程式的進場截止 13:20、
+    出場程式的收盤。事件上的時間只說得出**決定送單**的那一刻；broker 準備下單元件、等回報連線
+    可能還要幾秒到幾十秒，所以送出的那一刻由 broker 用自己的本機時鐘再比一次
+    （`ensure_before_deadline`）。
     """
 
     contract: ContractInfo
     side: str               # BUY / SELL
     lots: int
     trading_day: date
+    deadline: datetime | None = None
 
     def __post_init__(self) -> None:
         """這幾種錯誤是呼叫端寫錯了，不是市場狀況，所以在建立委託時就擋下。"""
@@ -228,6 +242,15 @@ def ensure_sendable(request: OrderRequest) -> None:
             f"今天是 {request.trading_day:%Y/%m/%d}，不送單。"
             "群益會把過期月份自動改送隔年同月，送出去就是另一個合約。"
         )
+
+
+def ensure_before_deadline(request: OrderRequest, now: datetime) -> None:
+    """送出的那一刻（`now`，broker 的本機時鐘）還沒過委託的期限。過了就是 `PastDeadline`，不送。
+    兩個 broker 都在真正送出之前呼叫它。"""
+    if request.deadline is not None and now >= request.deadline:
+        raise PastDeadline(
+            f"送出時已經 {now:%H:%M:%S}，過了這筆委託的期限 {request.deadline:%H:%M:%S}，"
+            "沒有送出")
 
 
 # ── 行情：事件串流與 1 分 K ──────────────────────────────────────────────
@@ -325,8 +348,18 @@ class Broker(Protocol):
         真 broker 的串流不會自己結束，由呼叫端在 13:20 停止取用。
         """
 
+    def prepare_orders(self) -> None:
+        """做好下單的準備：初始化下單元件、讀憑證、連上回報主機並等它補送完、查過帳號。
+
+        自動下單打開時，盤中程式在訂閱行情之前呼叫它：這些要幾秒到幾十秒，留到第一筆委託才做的話，
+        13:20 前最後幾秒觸發的突破進場會在 13:20 之後才送出（規格第 26 條）。失敗是 `OrderFailed`；
+        沒準備好也不要緊，`place_order` 送單前會自己再準備一次。
+        """
+
     def place_order(self, request: OrderRequest) -> OrderResult:
-        """送出市價 IOC，等到委託確定結束，回傳實際成交。"""
+        """送出市價 IOC，等到委託確定結束，回傳實際成交。
+
+        送出的那一刻已經過了 `request.deadline` 就不送，拋 `PastDeadline`。"""
 
     def query_fills(self, order_seq: str, trading_day: date,
                     requested_lots: int) -> FillQuery:
