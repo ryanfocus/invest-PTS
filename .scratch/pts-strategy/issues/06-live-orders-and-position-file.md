@@ -4,7 +4,7 @@
 
 **Blocked by:** 04
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] 送出的委託：市價、IOC、倉別「自動」；大台、小台標當沖，微台不標（規格第 27、28 條）。
 - [x] 交易近月；結算日當天交易當天到期的合約（規格第 9 條）。
@@ -69,3 +69,8 @@
   （`OrderRequest.deadline`），broker 送出那一刻用本機時鐘再比一次，過了就不送、只記 log
   （`PastDeadline`）。原本重啟後第一筆委託要先準備 2～30 幾秒，13:19 觸發的突破進場會在 13:20 之後
   成交（SPEC-B-1）。**待實機**：在訂閱行情之前連回報主機、等 OnComplete，看 log 確認之後的行情照常。
+
+**2026-11-10（orchestrator）：完成，關閉。**
+
+- 程式在整合分支 `claude/pts-impl`，這張的 commit：`427aece`、`0451050`（合併後整合分支在 `1c634dd`）。
+- 整合分支 code review 之後的修正在 `cb081d7..39b573b`，最後 656 個測試全過。

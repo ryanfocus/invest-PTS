@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [x] 在沒有群益元件、沒有帳號的機器上，全部測試都能跑（規格第 59 條）。
 - [x] 設定檔能讀出交易商品、每次進場口數、加碼上限、自動下單開關、Discord 開關。缺任何一個鍵就啟動失敗並講明原因；開關必須是真正的布林值；版控裡的設定，自動下單是關閉的（規格第 42–47 條）。
@@ -30,3 +30,9 @@
    元件會不會在 `logs/capital/` 底下再建一層子資料夾，文件沒寫；ticket 10 的清除要能處理兩種情況。
 3. 這支工具不碰下單元件，所以回報連線（`OnSolaceReplyConnection` 成功時的代碼、`OnComplete`）
    要等第一次真的送單（ticket 06／11）才看得到。程式只記錄那個代碼、不判斷成敗，看到之後可以回來釘死。
+
+**2026-11-10（orchestrator）：完成，關閉。**
+
+- 程式在整合分支 `claude/pts-impl`，這張的 commit：`1f0abe8`、`23198b7`、`9c570df`、`6e21e8f`（合併後整合分支在 `6e21e8f`）。
+- 整合分支 code review 之後的修正在 `cb081d7..39b573b`，最後 656 個測試全過。
+- 標「實機」的驗收條件維持未勾選，已併入 ticket 11 的清單。
