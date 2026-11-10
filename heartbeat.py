@@ -9,10 +9,10 @@
     {
       "trading_day": "2026-11-09",              交易日
       "last_alive": "2026-11-09T10:00:00",      最後存活時刻：盤中程式最後一次寫心跳時，
-                                                收到的本機時鐘事件。還沒收到任何事件是 null
-      "finished": false                         盤中程式自己走到了結局（13:20 收工、臨時休市、
-                                                部位檔讀不懂而不進場）。false 而且出場程式
-                                                已經在跑，就是半路停了（當掉、被關掉）
+                                                收到的本機時鐘事件。null 只出現在舊版的記錄
+      "finished": false                         盤中程式自己走到了結局（13:20 收工、臨時休市）。
+                                                false 而且出場程式已經在跑，就是半路停了
+                                                （當掉、被關掉）
     }
 
 寫入方式同部位檔：先寫暫存檔再置換（`state_files.write_json`），讀不懂就拋 `Unreadable`——
@@ -86,7 +86,7 @@ def _from_json(data: object) -> Heartbeat:
     if not isinstance(finished, bool):
         raise ValueError(f"finished 應該是 true 或 false，目前是 {finished!r}")
     if alive is None and not finished:
-        # 盤中程式在第一個時鐘事件才寫心跳；沒有存活時刻的只有「還沒登入就結束」那一種
+        # 盤中程式在第一個時鐘事件才寫心跳。null 只有舊版寫過（部位檔讀不懂時沒登入就收工）
         raise ValueError("last_alive 是 null，finished 卻是 false：盤中程式不會寫出這樣的記錄")
     return Heartbeat(trading_day=date.fromisoformat(day),
                      last_alive=None if alive is None else datetime.fromisoformat(alive),

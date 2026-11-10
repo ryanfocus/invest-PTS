@@ -141,8 +141,6 @@ class Ending(enum.Enum):
     """盤中程式為什麼結束。寫進 log，給人看的。"""
 
     NOT_A_TRADING_DAY = "非交易日，沒有登入"
-    # 今天的部位檔存在卻讀不懂：已經發了 Discord，沒有登入、不進場。
-    POSITION_FILE_UNREADABLE = "部位檔讀不懂，今天不進場"
     # 到 13:20 都沒有今天日盤的成交，收過的卻是別的交易日的（臨時休市，規格第 10 條）。
     # 結論為什麼要等到 13:20，見 `run()` 裡的說明。
     QUOTES_FROM_ANOTHER_DAY = "報價屬於前一個交易日，不判斷"
@@ -203,14 +201,10 @@ def run(broker: Broker, config: settings.Config, *, today: date,
     # （規格第 43 條）。進場和出場就不會是不同的商品。
     try:
         record = position_file.read(today)
+        unreadable = False
     except position_file.Unreadable as exc:
-        # 讀不懂的檔可能記著今天已經成交的口數：當成「沒有部位」照常進場的話，口數、
-        # 均價、加碼上限甚至商品都會錯。這一天不進場；檔案原封不動，留給人工處理。
-        logger.error("部位檔讀不懂，今天不進場：%s", exc)
-        _send(config, notify, messages.position_file_unreadable(day=today, reason=str(exc)))
-        # 這是盤中程式自己下的結論，不是當掉：出場程式不必再講一次「盤中程式沒有跑」
-        pulse.gave_up()
-        return SessionOutcome(Ending.POSITION_FILE_UNREADABLE)
+        record, unreadable = None, True
+        _stop_for_unreadable_position_file(config, notify, today, exc)
     product = config.product if record is None else record.product
     if record is not None and product != config.product:
         logger.warning("設定檔的交易商品是 %s，但今天已經有 %s 的部位，今天照部位檔交易 %s",
@@ -223,7 +217,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         raise
     # `LoginUnavailable`（網路、群益主機）不寫：往外拋、這一輪結束，下一分鐘排程叫醒時再登入
     orders = None
-    if config.auto_order_enabled:
+    if config.auto_order_enabled and not unreadable:
         # 近月合約（結算日當天就是當天到期的那個，規格第 9 條）在開盤前查好：查不到是
         # ProductListUnavailable，盤中程式在 08:40 就中止，而不是等到條件成立才發現。
         # 已經有部位時照部位檔的合約下單，和出場程式平的是同一個。
@@ -231,7 +225,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         orders = _Orders(broker, today, contract, record)
     trading = _Trading(config, notify, _load_history(broker, today),
                        _load_settlement_day(broker, today), orders,
-                       today=today, product=product, record=record)
+                       today=today, product=product, record=record, stopped=unreadable)
     end_at = datetime.combine(today, ENTRY_CUTOFF)
     # 盤中重啟：今天稍早收到的行情在原始行情檔裡，K 棒與筆差從那裡接著組（見 `_Restored`）
     restored = _Restored(raw_market.read(today))
@@ -419,6 +413,25 @@ class _Restored:
                 return False
             self._left -= 1
         return True
+
+
+def _stop_for_unreadable_position_file(config: settings.Config, notify: Callable[[str], bool],
+                                       today: date, exc: position_file.Unreadable) -> None:
+    """今天的部位檔讀不懂：今天不進場，告警一次。
+
+    讀不懂的檔可能記著今天已經成交的口數：當成「沒有部位」照常進場的話，口數、均價、加碼上限
+    甚至商品都會錯。檔案原封不動，留給人工處理。盤中程式**照樣登入、收行情**：原始行情每個交易日
+    都要記（規格第 58 條），心跳照寫、13:20 照常收工，出場程式就不會多講一則「沒有跑」。
+
+    告警之前寫下停止進場記錄：當掉重啟後看到它就不再講一次（記錄已經在的話，今天稍早就講過，
+    或因為別的原因停止進場、那一則已經發過——出場程式 13:25 也會講部位檔讀不懂）。
+    """
+    logger.error("部位檔讀不懂，今天不進場（行情照記）：%s", exc)
+    if state_files.read_marker(stop_path(today)) is not None:
+        logger.info("今天稍早已經停止進場（%s），不再告警", stop_path(today))
+        return
+    _write_stop(today, f"{today:%Y/%m/%d} 部位檔讀不懂：{exc}")
+    _send(config, notify, messages.position_file_unreadable(day=today, reason=str(exc)))
 
 
 def _missing_bars(previous: datetime, t: datetime) -> set[datetime]:
@@ -700,7 +713,7 @@ class _Trading:
     def __init__(self, config: settings.Config, notify: Callable[[str], bool],
                  history: _History | None, settlement_day: date | None,
                  orders: _Orders | None, *, today: date, product: str,
-                 record: position_file.PositionRecord | None):
+                 record: position_file.PositionRecord | None, stopped: bool = False):
         self._config = config
         self._notify = notify
         self._history = history
@@ -728,6 +741,8 @@ class _Trading:
             if earlier is not None:
                 self._stopped = True
                 logger.warning("今天稍早已經停止進場，重啟後照樣不進場：%s", earlier)
+        # 部位檔讀不懂（`_stop_for_unreadable_position_file`）：一開始就不進場
+        self._stopped = self._stopped or stopped
         # 交易商品的現價：部位不虧用它，模擬也成交在它
         self.product_price: float | None = None
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
@@ -1076,11 +1091,6 @@ class _Pulse:
             return
         self._write(now, finished=True)
 
-    def gave_up(self) -> None:
-        """還沒登入就自己下了結論、今天不進場（部位檔讀不懂）。那時還沒有任何事件。
-        不是當掉：出場程式不必再講一次「盤中程式沒有跑」。"""
-        self._write(None, finished=True)
-
     def _write(self, now: datetime | None, *, finished: bool) -> None:
         try:
             heartbeat.write(heartbeat.Heartbeat(self._today, now, finished))
@@ -1093,8 +1103,8 @@ def _finished_earlier(today: date) -> bool:
     """今天稍早那一輪已經走到結局了沒有（心跳記錄寫了「收工了」）。
 
     排程從 08:40 起每分鐘叫醒盤中程式一次，直到進場截止（ticket 10），所以正常結束之後
-    還會再被叫醒：部位檔讀不懂而不進場的那天，每一次都會再告警一次。結局只有自己走到的
-    那幾種會寫「收工了」（`_Pulse.finish`、`gave_up`），當掉、被關掉的不會——那正是要重啟的。
+    還會再被叫醒。只有 13:20 收工（臨時休市那天也是）會寫「收工了」（`_Pulse.finish`），
+    當掉、被關掉的不會——那正是要重啟的。
 
     心跳記錄讀不懂就當成還沒收工：照常跑，它會被這一輪的心跳覆寫掉。
     """

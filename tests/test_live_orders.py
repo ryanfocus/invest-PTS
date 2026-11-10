@@ -458,10 +458,10 @@ DAMAGE = {
 
 
 @pytest.mark.parametrize("text", DAMAGE.values(), ids=DAMAGE.keys())
-def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text):
+def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text, market_dir):
     """讀不懂的部位檔可能記著今天已經成交的口數。當成「沒有部位」照常進場的話，
     口數、均價、加碼上限、甚至商品都會錯；這一天不進場，發 Discord 請人看帳戶。
-    檔案原封不動——那是人工處理時唯一的線索。"""
+    檔案原封不動——那是人工處理時唯一的線索。原始行情照樣記（規格第 58 條）。"""
     write_position_file(text)
     broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
     assert broker.orders == []
@@ -469,6 +469,7 @@ def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text):
     assert sent[0].startswith("【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場\n")
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:
         assert fh.read() == text
+    assert (market_dir / "TX-20261109.csv").exists()
 
 
 # --- 部位不確定：當天不再進場（規格第 50 條）---

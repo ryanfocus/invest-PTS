@@ -4,7 +4,7 @@
 這就是「失敗時自動重啟」：當掉、被關掉、電腦重開之後，一分鐘內就會被叫回來（規格第 48 條）。
 代價是**正常結束之後也會再被叫醒**，所以盤中程式自己要知道今天是不是已經不必再跑：
 
-  * 今天已經走到結局（13:20 收工、部位檔讀不懂而不進場）：不登入、不再告警。
+  * 今天已經走到結局（13:20 收工）：不登入、不再告警。
   * 今天登入失敗過：不再登入。帳密錯了的話，每分鐘再試一次就是一天兩百多次錯誤的登入。
 
 斷言送出的委託、發出的訊息，以及有沒有登入（假 broker 的登入一被呼叫就讓測試失敗）。
@@ -30,15 +30,17 @@ def _must_not_log_in(why: str) -> AssertionError:
     return AssertionError(why)
 
 
-def test_after_giving_up_on_an_unreadable_position_file_the_next_wake_up_stays_quiet():
-    """部位檔讀不懂：盤中程式告警、今天不進場（ticket 06）。一分鐘後排程又叫醒它，檔案
-    還是讀不懂——再告警一次的話，到 13:20 就是兩百多則同樣的訊息。"""
+def test_an_unreadable_position_file_is_reported_once_however_often_the_program_restarts():
+    """部位檔讀不懂：盤中程式告警、今天不進場（ticket 06），行情照記。它在 10:00 當掉，排程一分鐘
+    後又叫醒它，檔案還是讀不懂——再告警一次的話，當掉幾次就講幾次同一件事。"""
     write_position_file("{寫到一半")
-    sent, _ = _wake(login_error=_must_not_log_in("部位檔讀不懂時不該登入"))
+    morning = whole_morning()
+    sent, _ = _wake([e for e in morning if e.time <= at("10:00:00")])
     assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場"]
 
-    sent, _ = _wake(login_error=_must_not_log_in("今天已經下過結論，不該再登入"))
+    sent, outcome = _wake([e for e in morning if e.time >= at("10:01:00")])
     assert sent == []
+    assert outcome.ending == intraday.Ending.CUTOFF
 
 
 def test_after_the_1320_cutoff_the_next_wake_up_does_not_log_in_again():

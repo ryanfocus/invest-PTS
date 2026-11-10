@@ -142,14 +142,16 @@ def test_a_day_off_found_only_by_the_quotes_is_not_reported_as_the_program_not_r
     assert sent == []
 
 
-def test_when_the_position_file_stops_the_intraday_program_only_that_is_reported():
-    """部位檔讀不懂：盤中程式一開始就告警、今天不進場（ticket 06），不登入、也收不到任何事件。
-    那是它自己下的結論，不是當掉——出場程式照樣講部位檔讀不懂（它自己也讀不懂），但不再多講
-    一則「盤中程式沒有跑」，同一件事講兩次，第二則還講錯原因。"""
+def test_when_the_position_file_cannot_be_read_the_intraday_program_still_runs_to_the_cutoff():
+    """部位檔讀不懂：盤中程式一開始就告警、今天不進場（ticket 06），但照樣登入、收行情、記原始
+    行情（規格第 58 條每個交易日都要記）、寫心跳，13:20 正常收工。出場程式照樣講部位檔讀不懂
+    （它自己也讀不懂），但不會多講一則「盤中程式沒有跑」——那不是事實。"""
     write_position_file("{寫到一半")
-    _, sent = _intraday([], login_error=AssertionError("部位檔讀不懂時不該登入"))
+    _, sent = _intraday(whole_morning())
     assert [m.splitlines()[0] for m in sent] == [
         "【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場"]
+    assert _heartbeat() == {"trading_day": "2026-11-09", "last_alive": "2026-11-09T13:20:00",
+                            "finished": True}
 
     _, sent = _exit()
     assert [m.splitlines()[0] for m in sent] == [
