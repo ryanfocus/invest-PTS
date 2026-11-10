@@ -486,25 +486,35 @@ def _end(ending: Ending) -> ExitOutcome:
     return ExitOutcome(ending)
 
 
-def main() -> int:
+def main(*, connect: Callable[[settings.Secrets], Broker] | None = None,
+         clock: Callable[[], datetime] = datetime.now,
+         sleep: Callable[[float], None] = time_module.sleep) -> int:
     """排程的進入點（ticket 10 建排程）。
 
     **這裡是唯一建立真實 broker 與 Discord 連線的地方**：`run()` 不知道自己拿到的是
-    真的還是假的。告警過的結局也回 0（理由見模組說明「給排程」）；回 1 代表程式本身
-    出錯，或設定有錯——那時也盡量發一則告警，因為微台可能就這樣過夜，而平常沒有例行訊息
-    能讓人發現。
+    真的還是假的。`connect` 用 `.env` 的帳密建立 broker（預設是群益），`clock`／`sleep` 見
+    模組說明「時間」——測試換掉的就是這兩個接縫：broker 與時間。
+
+    告警過的結局也回 0（理由見模組說明「給排程」）；回 1 代表程式本身出錯，或設定有錯——
+    那時也盡量發一則告警，因為微台可能就這樣過夜，而平常沒有例行訊息能讓人發現。
     """
-    _setup_logging(date.today())
+    _setup_logging(clock().date())
     try:
-        return _scheduled_exit()
+        return _scheduled_exit(connect or _capital, clock=clock, sleep=sleep)
     finally:
         # 收尾：log 保留 30 天（ticket 10）。出場程式的排程每天都會叫醒它，正事出錯也照清——
         # 個資的保存期限不該因為某天程式出錯就延長。永遠不拋例外。
         housekeeping.purge_old_logs()
 
 
-def _scheduled_exit() -> int:
+def _capital(secrets: settings.Secrets) -> Broker:
+    """真的群益 broker。延到這裡才 import：沒有群益元件的機器也要能載入這個模組。"""
     from broker.capital import CapitalBroker
+    return CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
+
+
+def _scheduled_exit(connect: Callable[[settings.Secrets], Broker], *,
+                    clock: Callable[[], datetime], sleep: Callable[[float], None]) -> int:
     from notifiers import discord
 
     status = 0
@@ -525,14 +535,14 @@ def _scheduled_exit() -> int:
             return 1
         status = 1
     # 設定有錯時 broker 不會被用到（不登入），帳密可能是空的
-    broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
+    broker = connect(secrets)
     webhook = secrets.discord_webhook
     notify = lambda text: discord.send(text, webhook)        # noqa: E731
     try:
-        run(broker, config, notify=notify)
+        run(broker, config, notify=notify, clock=clock, sleep=sleep)
     except Exception as exc:  # noqa: BLE001
         logger.exception("出場程式意外中止")
-        now = datetime.now()
+        now = clock()
         _send(config, notify, messages.exit_crashed(
             at=now, reason=f"{type(exc).__name__}: {exc}",
             closed=now.time() >= DAY_SESSION_CLOSE))

@@ -1158,18 +1158,20 @@ def _send(config: settings.Config, notify: Callable[[str], bool], text: str) -> 
     notify(text)
 
 
-def main() -> int:
+def main(*, connect: Callable[[settings.Secrets], Broker] | None = None,
+         today: Callable[[], date] = date.today) -> int:
     """排程的進入點（ticket 10 建排程）。登入、收行情、判斷進場、13:20 結束。
 
     **這裡是唯一建立真實 broker 與 Discord 連線的地方**：`run()` 不知道自己拿到的是
-    真的還是假的，測試因此能在沒有群益元件的機器上跑完整個流程。
+    真的還是假的，測試因此能在沒有群益元件的機器上跑完整個流程。`connect` 用 `.env` 的帳密
+    建立 broker（預設是群益），`today` 回答今天是哪一天（預設讀系統日期）——測試換掉的就是
+    這兩個接縫：broker 與時間。
     """
-    from broker.capital import CapitalBroker
     from notifiers import discord
 
     # 今天是哪一天：**只在這裡讀一次系統時鐘**（見模組說明「時間」）
-    today = date.today()
-    _setup_logging(today)
+    day = today()
+    _setup_logging(day)
 
     with _alone() as alone:
         if not alone:
@@ -1177,14 +1179,20 @@ def main() -> int:
             return 0
         config = settings.load()
         secrets = settings.load_secrets(config)
-        broker = CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
+        broker = (connect or _capital)(secrets)
         webhook = secrets.discord_webhook
         try:
-            run(broker, config, today=today, notify=lambda text: discord.send(text, webhook))
+            run(broker, config, today=day, notify=lambda text: discord.send(text, webhook))
         except BrokerError as exc:
             logger.error("盤中程式中止：%s", exc)
             return 1
         return 0
+
+
+def _capital(secrets: settings.Secrets) -> Broker:
+    """真的群益 broker。延到這裡才 import：沒有群益元件的機器也要能載入這個模組。"""
+    from broker.capital import CapitalBroker
+    return CapitalBroker(secrets.user_id, secrets.password, secrets.futures_account)
 
 
 def _lock_path() -> str:

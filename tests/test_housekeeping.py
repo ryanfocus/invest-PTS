@@ -112,20 +112,13 @@ def test_the_exit_program_clears_old_logs_every_day(tmp_path, monkeypatch):
     （失敗重啟），所以由出場程式在做完正事之後清。正事出錯也照清：個資的保存期限不該
     因為某天程式出錯就延長。"""
     import exit_program
+    from broker.fake import FakeBroker
+    from day_script import at, main_env, position_content, settings_yaml, write_position_file
 
-    env = tmp_path / ".env"
-    env.write_text("CAPITAL_USER_ID=A100000000\nCAPITAL_PASSWORD=pw\n"
-                   "DISCORD_WEBHOOK_URL=https://discord.invalid/api/webhooks/1/x\n",
-                   encoding="utf-8")
-    monkeypatch.setattr(paths, "env_path", lambda: str(env))
-    monkeypatch.setattr(exit_program, "_setup_logging", lambda today: None)
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("意料之外的錯誤")
-    monkeypatch.setattr(exit_program, "run", broken)
-    from notifiers import discord
-    monkeypatch.setattr(discord, "send", lambda text, webhook: True)
+    main_env(tmp_path, monkeypatch, settings_text=settings_yaml(auto="true"))
+    write_position_file(position_content())         # 微台 1 口：出場程式要登入
     old = _in_logs("capital", "20261001_Center.log", days_old=31)
 
-    assert exit_program.main() == 1
+    broken = FakeBroker(login_error=RuntimeError("意料之外的錯誤"))   # 程式本身出錯
+    assert exit_program.main(connect=lambda secrets: broken, clock=lambda: at("13:25:00")) == 1
     assert not os.path.exists(old)

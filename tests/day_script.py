@@ -282,3 +282,49 @@ def lock_position_file_once_sent(m) -> None:
         lock_position_file(m)
         return place_order(self, request)
     m.setattr(FakeBroker, "place_order", locking)
+
+
+# ── 兩支程式的 main()：排程叫醒的樣子 ────────────────────────────────────────
+
+
+class PostedToDiscord:
+    """`notifiers.discord.send` 的替身：記下每一則訊息與送去的 webhook，回報送出成功。"""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.webhooks: list[str] = []
+
+    def __call__(self, text: str, webhook: str) -> bool:
+        self.sent.append(text)
+        self.webhooks.append(webhook)
+        return True
+
+
+WEBHOOK = "https://discord.invalid/api/webhooks/1/x"
+
+
+def settings_yaml(*, auto: str = "false", product: str = "TMF", discord: str = "true") -> str:
+    """設定檔（`config/settings.yaml`）的原始內容，值照字面寫進去（寫錯的值也可以）。"""
+    return (f"order:\n  auto_enabled: {auto}\n  product: {product}\n  lots_per_entry: 1\n"
+            f"  max_position: 20\ndiscord:\n  enabled: {discord}\n")
+
+
+def main_env(tmp_path, monkeypatch, *, settings_text: str | None = None) -> PostedToDiscord:
+    """`intraday.main()`／`exit_program.main()` 的外部環境：暫存的 `.env`（四個值都有，webhook
+    是連不到的網址）、設定檔（預設是版控裡那一份，`settings_text` 換成別的內容），Discord 換成
+    記錄器。broker 與時間由呼叫 `main()` 的測試自己給。回傳 Discord 的記錄器。"""
+    import paths
+    from notifiers import discord
+
+    env = tmp_path / ".env"
+    env.write_text("CAPITAL_USER_ID=A100000000\nCAPITAL_PASSWORD=pw\n"
+                   "CAPITAL_FUTURES_ACCOUNT=F0000000000\n"
+                   f"DISCORD_WEBHOOK_URL={WEBHOOK}\n", encoding="utf-8")
+    monkeypatch.setattr(paths, "env_path", lambda: str(env))
+    if settings_text is not None:
+        config = tmp_path / "settings.yaml"
+        config.write_text(settings_text, encoding="utf-8")
+        monkeypatch.setattr(paths, "config_path", lambda: str(config))
+    posted = PostedToDiscord()
+    monkeypatch.setattr(discord, "send", posted)
+    return posted

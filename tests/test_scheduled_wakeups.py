@@ -12,7 +12,8 @@
 
 from broker import LoginFailed, LoginUnavailable
 from broker.fake import FakeBroker
-from day_script import DAY, PREVIOUS_DAY, at, make_config, run_day, whole_morning, write_position_file
+from day_script import (DAY, PREVIOUS_DAY, at, main_env, make_config, run_day, whole_morning,
+                        write_position_file)
 from recording import RecordingNotifier
 import exit_program
 import heartbeat
@@ -110,36 +111,25 @@ def test_a_failed_login_on_the_previous_trading_day_does_not_stop_today():
 # --- 同一時間只有一個盤中程式 ---
 
 
-def _main_env(tmp_path, monkeypatch) -> None:
-    """`intraday.main()` 的外部環境：暫存的 `.env`、版控裡的設定檔、不寫 log 檔。"""
-    import paths
-
-    env = tmp_path / ".env"
-    env.write_text("CAPITAL_USER_ID=A100000000\nCAPITAL_PASSWORD=pw\n"
-                   "DISCORD_WEBHOOK_URL=https://discord.invalid/api/webhooks/1/x\n",
-                   encoding="utf-8")
-    monkeypatch.setattr(paths, "env_path", lambda: str(env))
-    monkeypatch.setattr(intraday, "_setup_logging", lambda today: None)
-
-
 def test_a_second_intraday_program_started_while_one_is_running_does_nothing(tmp_path,
                                                                              monkeypatch):
     """兩個盤中程式同時跑，同一分鐘就會進兩次場（ticket 09）。排程設了「已經在跑就不啟動新的」，
     但那只管得到排程自己叫醒的；有人在命令列手動再跑一次、或排程以為它已經停了（只砍掉了
-    外層的行程），第二個就起來了。所以盤中程式自己也要擋：第一個還在跑，第二個什麼都不做。"""
-    _main_env(tmp_path, monkeypatch)
-    sessions, second = [], []
+    外層的行程），第二個就起來了。所以盤中程式自己也要擋：第一個還在跑，第二個什麼都不做——
+    不登入（它的 broker 一登入就讓測試失敗），正常結束。第一個結束之後再啟動就照常登入。"""
+    main_env(tmp_path, monkeypatch)
+    second = []
 
-    def session(broker, config, *, today, notify):
-        sessions.append(today)
-        if len(sessions) == 1:
-            second.append(intraday.main())     # 第一個還在跑的時候，又被啟動一次
-        return intraday.SessionOutcome(intraday.Ending.CUTOFF)
-    monkeypatch.setattr(intraday, "run", session)
+    class _FirstOne(FakeBroker):
+        def login(self) -> None:
+            super().login()
+            # 第一個還在跑的時候，又被啟動一次
+            locked_out = FakeBroker(login_error=AssertionError("另一個盤中程式在跑，不該登入"))
+            second.append(intraday.main(connect=lambda secrets: locked_out, today=lambda: DAY))
 
-    assert intraday.main() == 0
+    assert intraday.main(connect=lambda secrets: _FirstOne(), today=lambda: DAY) == 0
     assert second == [0]
-    assert len(sessions) == 1
 
-    intraday.main()                             # 第一個結束之後再啟動：照常跑
-    assert len(sessions) == 2
+    # 第一個結束之後再啟動：照常登入（這次的登入因網路失敗，`main()` 回 1，下一分鐘再試）
+    offline = FakeBroker(login_error=LoginUnavailable("群益登入沒有成功（網路或群益主機），代碼 1108"))
+    assert intraday.main(connect=lambda secrets: offline, today=lambda: DAY) == 1

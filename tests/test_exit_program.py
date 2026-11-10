@@ -17,8 +17,8 @@ import pytest
 
 from broker import BUY, SELL, TMF_CODE, FillQuery, FillUnknown, LoginFailed, OrderFailed
 from broker.fake import FakeBroker
-from day_script import (DAY, SETTLEMENT_DAY, make_config, position_content,
-                        position_on_file as _file, write_position_file)
+from day_script import (DAY, SETTLEMENT_DAY, WEBHOOK, main_env, make_config, position_content,
+                        position_on_file as _file, settings_yaml, write_position_file)
 from recording import RecordingNotifier
 import exit_program
 import heartbeat
@@ -851,33 +851,51 @@ def test_an_uncertain_exit_that_cannot_be_written_warns_against_running_again(
 
 
 # --- 排程的進入點：程式本身出錯時也要講 ---
+#
+# `main()` 從 `.env` 建立連線、讀設定檔；測試換掉的只有 broker（`connect`）與時間（`clock`、
+# `sleep`），Discord 換成記錄器（`main_env`）。
+
+
+class _BreaksAt(FakeBroker):
+    """程式本身出錯：登入時拋出一個 broker 契約以外的例外。`time` 是出場程式的時鐘，出錯的那一刻
+    它走到 `at`（例如登入卡了很久）。"""
+
+    def __init__(self, time: "_Time", at: datetime, **options):
+        super().__init__(**options)
+        self._time, self._at = time, at
+
+    def login(self) -> None:
+        self._time.now = self._at
+        raise RuntimeError("意料之外的錯誤")
+
+
+def _main(*, at: datetime | None = None, broker: FakeBroker | None = None,
+          time: "_Time | None" = None, **broker_options) -> tuple[int, list[FakeBroker]]:
+    """排程叫醒出場程式（`main()`）：13:25（或 `at`），broker 是 `broker` 或照 `broker_options`
+    新建的假 broker。回傳 (main 的結束代碼, main 建立的 broker)。"""
+    time = time or _Time(at or _at("13:25"))
+    broker_options.setdefault("fill_price", 45200.0)
+    connected: list[FakeBroker] = []
+
+    def connect(secrets) -> FakeBroker:
+        connected.append(broker or FakeBroker(**broker_options))
+        return connected[-1]
+    return exit_program.main(connect=connect, clock=time.clock, sleep=time.sleep), connected
 
 
 def test_when_the_program_itself_breaks_main_still_raises_the_alarm(tmp_path, monkeypatch):
     """出場程式是微台唯一的出場。它自己出錯中止的話，部位可能就這樣過夜，而平常沒有例行
     訊息能讓人發現——所以 `main()` 盡量發一則告警，並回 1 讓排程記錄留下痕跡。"""
-    import paths
-    from notifiers import discord
+    posted = main_env(tmp_path, monkeypatch, settings_text=_settings())
+    _on_file()
+    time = _Time(_at("13:25"))
 
-    env = tmp_path / ".env"
-    env.write_text("CAPITAL_USER_ID=A100000000\nCAPITAL_PASSWORD=pw\n"
-                   "DISCORD_WEBHOOK_URL=https://discord.invalid/api/webhooks/1/x\n",
-                   encoding="utf-8")
-    monkeypatch.setattr(paths, "env_path", lambda: str(env))
-    monkeypatch.setattr(exit_program, "_setup_logging", lambda today: None)
+    code, _ = _main(time=time, broker=_BreaksAt(time, _at("13:25")))
 
-    def broken(*args, **kwargs):
-        raise RuntimeError("意料之外的錯誤")
-    monkeypatch.setattr(exit_program, "run", broken)
-    posted = []
-    monkeypatch.setattr(discord, "send", lambda text, webhook: posted.append((text, webhook)))
-
-    assert exit_program.main() == 1
-    assert len(posted) == 1
-    text, webhook = posted[0]
-    assert webhook == "https://discord.invalid/api/webhooks/1/x"
-    assert text.splitlines()[:2] == ["【要你處理】PTS 出場程式意外中止",
-                                     "原因：RuntimeError: 意料之外的錯誤"]
+    assert code == 1
+    assert posted.webhooks == [WEBHOOK]
+    assert posted.sent[0].splitlines()[:2] == ["【要你處理】PTS 出場程式意外中止",
+                                              "原因：RuntimeError: 意料之外的錯誤"]
 
 
 CRASH_DEADLINES = {
@@ -900,71 +918,24 @@ def test_when_the_program_breaks_the_alarm_gives_the_deadline_that_applies(
         hhmm, todo, tmp_path, monkeypatch):
     """出場程式當掉時不知道部位檔裡是什麼，也就不知道今天是不是結算日：兩種期限都講；
     13:45 之後才當掉，要人做的是夜盤（規格第 41、55 條）。收盤前還要講不要重跑：
-    使用者自己平掉之後再執行一次，它會照部位檔再平一次。"""
-    from notifiers import discord
+    使用者自己平掉之後再執行一次，它會照部位檔再平一次。
+    13:25 起跑，登入卡到 `hhmm` 才出錯。"""
+    posted = main_env(tmp_path, monkeypatch, settings_text=_settings())
+    _on_file()
+    time = _Time(_at("13:25"))
 
-    _main_env(tmp_path, monkeypatch)
-    crashed_at = _at(hhmm)
+    code, _ = _main(time=time, broker=_BreaksAt(time, _at(hhmm)))
 
-    class _Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return crashed_at
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("意料之外的錯誤")
-    monkeypatch.setattr(exit_program, "run", broken)
-    monkeypatch.setattr(exit_program, "datetime", _Clock)
-    posted = []
-    monkeypatch.setattr(discord, "send", lambda text, webhook: posted.append(text))
-
-    assert exit_program.main() == 1
-    assert posted[0].splitlines()[2:] == [*todo, f"2026/11/09 {hhmm}:00"]
-
-
-def _main_env(tmp_path, monkeypatch, *, settings_text: str | None = None) -> None:
-    """`main()` 的外部環境：暫存的 `.env`（含 webhook）、設定檔（預設是版控裡那一份）、
-    不寫 log 檔。"""
-    import paths
-
-    env = tmp_path / ".env"
-    env.write_text("CAPITAL_USER_ID=A100000000\nCAPITAL_PASSWORD=pw\n"
-                   "CAPITAL_FUTURES_ACCOUNT=F0000000000\n"
-                   "DISCORD_WEBHOOK_URL=https://discord.invalid/api/webhooks/1/x\n",
-                   encoding="utf-8")
-    monkeypatch.setattr(paths, "env_path", lambda: str(env))
-    if settings_text is not None:
-        config = tmp_path / "settings.yaml"
-        config.write_text(settings_text, encoding="utf-8")
-        monkeypatch.setattr(paths, "config_path", lambda: str(config))
-    monkeypatch.setattr(exit_program, "_setup_logging", lambda today: None)
+    assert code == 1
+    assert posted.sent[0].splitlines()[2:] == [*todo, f"2026/11/09 {hhmm}:00"]
 
 
 # --- 設定檔寫錯：出場程式不送單，但不能安靜（規格第 43、47 條）---
 
 
-def _settings(*, product="TMF", auto="true", discord="true") -> str:
-    return (f"order:\n  auto_enabled: {auto}\n  product: {product}\n  lots_per_entry: 1\n"
-            f"  max_position: 20\ndiscord:\n  enabled: {discord}\n")
-
-
-def _main_at_1325(monkeypatch) -> tuple[list[str], list[FakeBroker]]:
-    """`main()` 照常建立連線，`run()` 換成 13:25 的劇本（假 broker、假時鐘）。
-    回傳 (Discord 發出的訊息, 用到的假 broker)。"""
-    from notifiers import discord
-
-    real_run = exit_program.run
-    brokers = []
-
-    def scripted(broker, config, *, notify):
-        brokers.append(FakeBroker(fill_price=45200.0,
-                                  login_error=AssertionError("設定有錯不該登入")))
-        return real_run(brokers[-1], config, notify=notify, clock=lambda: _at("13:25"),
-                        sleep=lambda seconds: None)
-    monkeypatch.setattr(exit_program, "run", scripted)
-    posted = []
-    monkeypatch.setattr(discord, "send", lambda text, webhook: posted.append(text))
-    return posted, brokers
+def _settings(**values: str) -> str:
+    """今天的設定檔：自動下單打開（今天進場了），換掉 `values` 那幾個值。"""
+    return settings_yaml(**{"auto": "true", **values})
 
 
 BROKEN_SETTINGS = {
@@ -981,13 +952,14 @@ def test_settings_that_cannot_be_read_still_raise_the_alarm_for_the_micro_positi
     """使用者盤中改設定時打錯字（規格第 43 條預期盤中會改）。出場程式讀不懂設定，就不知道
     自動下單是不是開著，一張單都不送（規格第 47 條：一啟動就擋下來）——但微台沒人平就過夜，
     所以照樣讀部位檔，告警「部位還在」並講明原因。回 1，排程記錄留下痕跡。"""
-    _main_env(tmp_path, monkeypatch, settings_text=settings_text)
+    posted = main_env(tmp_path, monkeypatch, settings_text=settings_text)
     content = _on_file()
-    posted, brokers = _main_at_1325(monkeypatch)
 
-    assert exit_program.main() == 1
+    code, brokers = _main(login_error=AssertionError("設定有錯不該登入"))
+
+    assert code == 1
     assert brokers[0].orders == []
-    lines = posted[0].splitlines()
+    lines = posted.sent[0].splitlines()
     assert lines[0] == "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口"
     assert lines[1].startswith("原因：設定檔有錯，出場程式不送單：")
     if error:
@@ -998,18 +970,19 @@ def test_settings_that_cannot_be_read_still_raise_the_alarm_for_the_micro_positi
 
 def test_settings_that_cannot_be_read_without_a_position_stay_quiet(tmp_path, monkeypatch):
     """沒有部位的日子不發訊息（規格第 39 條）：設定錯了照樣回 1，留在排程記錄與 log。"""
-    _main_env(tmp_path, monkeypatch, settings_text=_settings(product="TMX"))
-    posted, brokers = _main_at_1325(monkeypatch)
-    assert exit_program.main() == 1
-    assert posted == []
+    posted = main_env(tmp_path, monkeypatch, settings_text=_settings(product="TMX"))
+    code, _ = _main(login_error=AssertionError("沒有部位不該登入"))
+    assert code == 1
+    assert posted.sent == []
 
 
 def test_settings_that_cannot_be_read_but_say_discord_is_off_send_nothing(tmp_path, monkeypatch):
     """設定檔有錯，但 Discord 開關本身讀得到、寫的是 false：使用者明白關掉了，照樣不發
     （規格第 45 條）。開關本身讀不到時才當成開著——那時不講，微台就安靜地過夜。"""
-    _main_env(tmp_path, monkeypatch, settings_text=_settings(product="TMX", discord="false"))
+    posted = main_env(tmp_path, monkeypatch,
+                      settings_text=_settings(product="TMX", discord="false"))
     _on_file()
-    posted, brokers = _main_at_1325(monkeypatch)
-    assert exit_program.main() == 1
+    code, brokers = _main(login_error=AssertionError("設定有錯不該登入"))
+    assert code == 1
     assert brokers[0].orders == []
-    assert posted == []
+    assert posted.sent == []
