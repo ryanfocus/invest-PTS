@@ -824,7 +824,6 @@ class _Trading:
         self.orders: _Orders | None = None
         self._today = today
         self._product = product
-        self.position = _held(record) if live else self._simulated_so_far()
         # 當天不再進場。部位不確定時，帳上的口數不知道，部位不虧、加碼上限都算不了
         # （規格第 50 條）——啟動時讀到「不確定」、或今天這裡送出的委託變成不確定
         # （`_fill_unknown`）；委託被拒（`_not_sent`）、成交寫不進部位檔（`_not_on_file`）
@@ -846,6 +845,8 @@ class _Trading:
                 logger.warning("今天稍早已經停止進場，重啟後照樣不進場：%s", earlier)
         # 部位檔讀不懂（`_stop_for_unreadable_position_file`）：一開始就不進場
         self._stopped = self._stopped or stopped
+        # 排在停止進場的判斷之後：模擬部位讀不懂時，`_simulated_so_far` 會再把它打開
+        self.position = _held(record) if live else self._simulated_so_far()
         # 交易商品的現價：部位不虧用它，模擬也成交在它
         self.product_price: float | None = None
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）

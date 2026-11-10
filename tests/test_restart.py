@@ -20,6 +20,7 @@ from recording import RecordingNotifier
 import day_settings
 import exit_program
 import position_file
+import sim_position
 
 
 def _bichai(outcome) -> list[tuple]:
@@ -294,6 +295,20 @@ def test_after_a_restart_the_simulated_position_carries_on():
     assert second.orders == []
     assert [m.splitlines()[0::2] for m in sent] == [
         ["【模擬】PTS 做多：買進微台 1 口 @ 45190", "累計：多單 3 口，均價 45166.67"]]
+
+
+def test_a_simulated_position_that_cannot_be_read_stops_simulated_entries_for_the_day():
+    """模擬部位檔讀不懂（被改壞、寫到一半）：今天模擬了幾口不知道，累計口數與加碼上限都算不了。
+    今天不再模擬進場——從 0 重算的話，訊息講的累計口數是錯的、上限也會被突破。檔案原封不動。"""
+    run_day(until(_STRONG, at("08:51:40")))
+    with open(sim_position.path_for(DAY), "w", encoding="utf-8") as fh:
+        fh.write("{寫到一半")
+
+    _, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")))
+
+    assert sent == []
+    with open(sim_position.path_for(DAY), encoding="utf-8") as fh:
+        assert fh.read() == "{寫到一半"
 
 
 def test_the_exit_program_never_takes_a_simulated_position_for_a_real_one():
