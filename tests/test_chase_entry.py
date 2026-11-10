@@ -275,7 +275,25 @@ def test_in_the_settlement_week_only_conditions_1_and_2_enter(events, last_tradi
 
 
 def test_without_the_product_list_conditions_3_and_4_are_off_but_1_and_2_are_not():
-    """商品清單查不到，就不知道今天是不是結算週：條件 3、4 停用，條件 1、2 照常。"""
+    """商品清單查不到，就不知道今天是不是結算週：條件 3、4 停用（寧可少做），條件 1、2 照常。
+    每分鐘再查一次；到 08:50 還沒有，講一則今天哪些條件判斷不了。"""
     _, sent, _ = run_day(_breakout_day(),
                          contracts_error=ProductListUnavailable("10 秒內未取得完整商品清單"))
-    assert sent == [FIRST_LOT]
+    assert sent == [
+        "【要你處理】PTS 到 08:50 還有資料查不到，今天的進場判斷不完整\n"
+        "查不到商品清單裡大台近月的結算日：不知道今天是不是結算週，條件 3、4 停用。\n"
+        "盤中程式每分鐘再查一次，查到之後就照常判斷，不另外通知。原始行情照常記錄，"
+        "已經有的部位照常了結。\n"
+        "通常不必處理（多半是群益主機一時查不到）；想知道原因請看 logs/intraday-20261109.log。\n"
+        "2026/11/09 08:50:00",
+        FIRST_LOT,
+    ]
+
+
+def test_a_product_list_that_failed_at_first_is_fetched_again_a_minute_later():
+    """08:40 查商品清單失敗，下一分鐘再查就有了：條件 3、4 照常，突破進場照樣觸發。"""
+    _, sent, _ = run_day(_breakout_day(),
+                         contracts_error=[ProductListUnavailable("10 秒內未取得完整商品清單")])
+    assert sent[0] == FIRST_LOT
+    assert [m.splitlines()[1] for m in sent[1:]] == [
+        "觸發：條件 3（追多加碼），突破進場（觸發價 45180）"]

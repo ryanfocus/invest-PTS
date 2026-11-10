@@ -232,14 +232,43 @@ def test_the_rsi_is_carried_over_from_the_previous_day_session():
     assert sent == []
 
 
-def test_without_bars_of_the_previous_day_it_records_the_market_but_never_enters(market_dir):
+_BLIND = (
+    "【要你處理】PTS 到 08:50 還有資料查不到，今天的進場判斷不完整\n"
+    "查不到前一個交易日的大台 1 分 K（昨收、RSI 暖身）：條件 1～4 都判斷不了。\n"
+    "盤中程式每分鐘再查一次，查到之後就照常判斷，不另外通知。原始行情照常記錄，"
+    "已經有的部位照常了結。\n"
+    "通常不必處理（多半是群益主機一時查不到）；想知道原因請看 logs/intraday-20261109.log。\n"
+    "2026/11/09 08:50:00")
+
+
+def test_without_bars_of_the_previous_day_it_records_the_market_and_says_it_cannot_judge(
+        market_dir):
     """查不到昨收與暖身，就判斷不了開高開低與 RSI：今天不進場。但原始行情照樣要記
-    （ticket 03 要一週的資料），盤中程式不能因此中止。"""
-    _, sent, outcome = run_day(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
+    （ticket 03 要一週的資料），盤中程式不能因此中止。每分鐘再查一次；到 08:50 還沒有，就講
+    一則——不講的話，使用者分不出「今天沒有訊號」和「今天程式是瞎的」。只講一次。"""
+    _, sent, outcome = run_day(rally("08:45", 8) + [trade(at("08:53:00"), 45180)],
                                minute_bars_error=QuoteUnavailable("群益訊息3022"))
-    assert sent == []
-    assert len(outcome.bars) == 6
+    assert sent == [_BLIND]
+    assert len(outcome.bars) == 8
     assert (market_dir / "TX-20261109.csv").exists()
+
+
+def test_bars_of_the_previous_day_that_failed_at_first_are_fetched_again_a_minute_later():
+    """08:40 查前一交易日的 1 分 K 逾時（群益主機一時忙）：一次失敗不能賠掉一整天。下一分鐘
+    再查就拿到了，08:50 起照常判斷，不打擾人。"""
+    _, sent, _ = run_day(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
+                         minute_bars_error=[QuoteUnavailable("群益訊息3022")])
+    assert _times(sent) == ["08:50:00", "08:51:00"]
+
+
+def test_once_the_bars_arrive_after_0850_it_judges_from_that_moment_on():
+    """一直查不到，08:50 講了一則；08:51 終於查到：從那一刻起照常判斷（08:51 判斷 08:50 那根）。
+    之前那幾分鐘的機會就沒了，不補。"""
+    failures = [QuoteUnavailable("群益訊息3022")] * 6      # 啟動時、08:46–08:50 每分鐘一次
+    _, sent, _ = run_day(rally("08:45", 8) + [trade(at("08:53:00"), 45180)],
+                         minute_bars_error=failures)
+    assert sent[0] == _BLIND
+    assert _times(sent[1:]) == ["08:51:00", "08:52:00", "08:53:00"]
 
 
 # --- 晚啟動或重啟：回補的舊成交不判斷 ---

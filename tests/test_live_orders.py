@@ -14,7 +14,7 @@ from datetime import timedelta
 
 import pytest
 
-from broker import BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo
+from broker import BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, ProductListUnavailable
 from broker.fake import FakeBroker
 from day_script import (DAY, DROP, PREVIOUS_DAY, SENDING_MARKER, at, calm_history, clock,
                         contracts, lock_position_file, lock_position_file_once_sent, make_config,
@@ -310,6 +310,34 @@ def test_after_a_fill_that_could_not_be_written_a_restart_enters_nothing(monkeyp
     assert broker.orders == []
     assert sent == []
     assert _file() == dict(content, status="UNCERTAIN", uncertain=SENDING_MARKER)
+
+
+def test_without_the_product_list_it_records_the_market_and_enters_once_the_list_arrives(
+        market_dir):
+    """自動下單打開，08:40 查商品清單失敗（不知道微台近月的下單代碼）。不再在訂閱行情之前就中止
+    整輪：照樣訂閱、記原始行情、寫心跳，進場停用到查到為止。08:46 再查就有了，08:50 照常下單。"""
+    broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
+                        contracts_error=[ProductListUnavailable("10 秒內未取得完整商品清單")])
+    assert [o.contract.order_code for o in broker.orders] == ["TM2611"]
+    assert [m.splitlines()[0] for m in sent] == ["PTS 做多：買進微台 1 口 @ 45150"]
+    assert (market_dir / "TX-20261109.csv").exists()
+
+
+def test_a_product_list_that_never_arrives_means_no_orders_and_one_alert(market_dir):
+    """商品清單一直查不到：不知道下單代碼就不能下單（也不知道是不是結算週）。行情照記，08:50
+    講一則，條件成立也一筆都不送——不是模擬，自動下單是開著的。"""
+    broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
+                        contracts_error=ProductListUnavailable("10 秒內未取得完整商品清單"))
+    assert broker.orders == []
+    assert sent == [
+        "【要你處理】PTS 到 08:50 還有資料查不到，今天的進場判斷不完整\n"
+        "查不到商品清單裡大台近月的結算日：不知道今天是不是結算週，條件 3、4 停用。\n"
+        "查不到微台的近月合約（下單代碼）：條件成立也不能下單。\n"
+        "盤中程式每分鐘再查一次，查到之後就照常判斷，不另外通知。原始行情照常記錄，"
+        "已經有的部位照常了結。\n"
+        "通常不必處理（多半是群益主機一時查不到）；想知道原因請看 logs/intraday-20261109.log。\n"
+        "2026/11/09 08:50:00"]
+    assert (market_dir / "TX-20261109.csv").exists()
 
 
 def test_the_fill_is_on_file_even_with_discord_switched_off():

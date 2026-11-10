@@ -52,6 +52,9 @@
     啟動時的快照（`day_settings`：改設定最快下一個交易日才生效）；今天已經過去的
     1 分 K 與每根的筆差從原始行情檔讀回，群益回補的成交裡重啟前就處理過的不再處理。
     當機期間記不到的筆差是不知道，不會被拿去算筆差跳增。
+  * **開盤前該查好的資料查不到**（`_Lookups`）：前一交易日的 1 分 K（昨收、RSI 暖身）、大台近月的
+    結算日、下單合約。不中止、行情照記，每分鐘再查，查到就從那一刻起照常判斷；到 08:50 還缺就
+    告警一次，講明今天哪些條件判斷不了。
   * **排程每分鐘叫醒**（ticket 10，`tools/schedule.py`）：這就是失敗時的自動重啟，所以正常結束
     之後也會再被叫醒。今天已經走到結局（心跳記錄寫了「收工了」）就什麼都不做
     （`_finished_earlier`）；今天登入失敗過就不再登入（`login_failed_path`）——網路、群益主機的
@@ -216,16 +219,16 @@ def run(broker: Broker, config: settings.Config, *, today: date,
         _write_login_failed(today, str(exc))
         raise
     # `LoginUnavailable`（網路、群益主機）不寫：往外拋、這一輪結束，下一分鐘排程叫醒時再登入
-    orders = None
-    if config.auto_order_enabled and not unreadable:
-        # 近月合約（結算日當天就是當天到期的那個，規格第 9 條）在開盤前查好：查不到是
-        # ProductListUnavailable，盤中程式在 08:40 就中止，而不是等到條件成立才發現。
-        # 已經有部位時照部位檔的合約下單，和出場程式平的是同一個。
-        contract = broker.get_contracts()[product] if record is None else record.contract
-        orders = _Orders(broker, today, contract, record)
-    trading = _Trading(config, notify, _load_history(broker, today),
-                       _load_settlement_day(broker, today), orders,
-                       today=today, product=product, record=record, stopped=unreadable)
+    live = config.auto_order_enabled
+    trading = _Trading(config, notify, live=live, today=today, product=product, record=record,
+                       stopped=unreadable)
+    if live and record is not None:
+        # 已經有部位時照部位檔的合約下單，和出場程式平的是同一個
+        trading.orders = _Orders(broker, today, record.contract, record)
+    # 昨收與 RSI 暖身、結算日、下單合約（近月，結算日當天就是當天到期的那個，規格第 9 條）在開盤
+    # 前查好；查不到不中止，每分鐘再查（`_Lookups`）
+    lookups = _Lookups(broker, trading, today, product=product,
+                       need_contract=live and record is None and not unreadable)
     end_at = datetime.combine(today, ENTRY_CUTOFF)
     # 盤中重啟：今天稍早收到的行情在原始行情檔裡，K 棒與筆差從那裡接著組（見 `_Restored`）
     restored = _Restored(raw_market.read(today))
@@ -302,6 +305,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 break
             if isinstance(event, Clock):
                 pulse.beat(event.time)
+                lookups.on_clock(event.time)
                 outage = watch.check(event.time)
                 if outage is not None:
                     # 告警講「報價恢復之前不會進場」：只停了累計筆數時成交照常，等待中的
@@ -477,12 +481,88 @@ class _History:
         return self.bars[-1].bar.close
 
 
-def _load_history(broker: Broker, today: date) -> _History | None:
-    """往前找最近一個有 1 分 K 的交易日。查不到就是 None：今天不判斷，但照常收行情。
+class _Lookups:
+    """開盤前要查好的三樣東西，查不到不中止，每分鐘再查（規格第 4、24、58 條）：
 
-    查詢失敗不中止盤中程式：原始行情照樣要記（ticket 03 要一週的資料），只是今天沒有
-    昨收與暖身，任何條件都判斷不了。
+      * **前一交易日的大台 1 分 K**：昨收與 RSI 暖身。沒有它，條件 1～4 都判斷不了。
+      * **大台近月的結算日**（商品清單）：不知道今天是不是結算週，條件 3、4 停用（寧可少做）。
+      * **下單合約**（自動下單打開、今天還沒有部位時，商品清單裡交易商品的近月）：沒有它不能下單。
+
+    查不到時盤中程式照樣訂閱、記原始行情、寫心跳——原始行情每個交易日都要記，而一次 08:40 的
+    逾時不能安靜地賠掉一整天：在之後的時鐘事件上每分鐘再查一次（時間取自事件），查到就從那一刻
+    起照常判斷；到 08:50（條件 1、2 開始判斷）還缺，就講**一則**哪些條件判斷不了。不講的話，
+    使用者分不出「今天沒有訊號」和「今天程式是瞎的」，程式又正常收工，排程的重啟、13:25 的出場
+    程式都不會接手。盤中程式當掉重啟、還是查不到的話，重啟後那一輪會再講一次。
     """
+
+    def __init__(self, broker: Broker, trading: "_Trading", today: date, *, product: str,
+                 need_contract: bool):
+        self._broker = broker
+        self._trading = trading
+        self._today = today
+        self._product = product
+        self._have_history = False
+        self._have_settlement_day = False
+        self._have_contract = not need_contract
+        self._next_try: datetime | None = None
+        self._told = False
+        self._look_up()                         # 啟動時查第一次（還沒有任何事件）
+
+    def on_clock(self, now: datetime) -> None:
+        """本機時鐘走到 `now`：缺的每分鐘再查一次；到 08:50 還缺就講一次。"""
+        if self._complete:
+            return
+        minute = now.replace(second=0, microsecond=0)
+        if self._next_try is None:
+            # 第一個時鐘：啟動時剛查過，下一分鐘再查
+            self._next_try = minute + timedelta(minutes=1)
+        elif now >= self._next_try:
+            self._next_try = minute + timedelta(minutes=1)
+            self._look_up()
+        if not self._complete and not self._told and now.time() >= strategy.EARLY_START:
+            self._told = True
+            logger.error("到 %s 還有資料查不到（有沒有查到：前一交易日 1 分 K %s、結算日 %s、"
+                         "下單合約 %s）", f"{strategy.EARLY_START:%H:%M}", self._have_history,
+                         self._have_settlement_day, self._have_contract)
+            self._trading.say(messages.entries_not_fully_judged(
+                at=now, no_history=not self._have_history,
+                no_settlement_day=not self._have_settlement_day,
+                no_contract_for=None if self._have_contract else self._product,
+                log=paths.shown_log("intraday", self._today)))
+
+    @property
+    def _complete(self) -> bool:
+        return self._have_history and self._have_settlement_day and self._have_contract
+
+    def _look_up(self) -> None:
+        if not self._have_history:
+            history = _load_history(self._broker, self._today)
+            if history is not None:
+                self._have_history = True
+                self._trading.history = history
+        if self._have_settlement_day and self._have_contract:
+            return
+        try:
+            contracts = self._broker.get_contracts()
+        except BrokerError as exc:
+            logger.error("查商品清單失敗，一分鐘後再查：%s", exc)
+            return
+        if not self._have_settlement_day:
+            day = _settlement_day(contracts.get(TX_CODE), self._today)
+            if day is not None:
+                self._have_settlement_day = True
+                self._trading.settlement_day = day
+        if not self._have_contract:
+            contract = contracts.get(self._product)
+            if contract is None:
+                logger.error("商品清單裡沒有 %s 的近月，還不能下單，一分鐘後再查", self._product)
+            else:
+                self._have_contract = True
+                self._trading.orders = _Orders(self._broker, self._today, contract, None)
+
+
+def _load_history(broker: Broker, today: date) -> _History | None:
+    """往前找最近一個有 1 分 K 的交易日。查詢失敗、或都查不到就是 None（`_Lookups` 一分鐘後再查）。"""
     day = today
     for _ in range(_HISTORY_LOOKBACK):
         day -= timedelta(days=1)
@@ -491,7 +571,7 @@ def _load_history(broker: Broker, today: date) -> _History | None:
         try:
             bars = broker.minute_bars(day)
         except BrokerError as exc:
-            logger.error("取 %s 的大台 1 分 K 失敗，今天不判斷進場：%s", day, exc)
+            logger.error("取 %s 的大台 1 分 K 失敗，還不能判斷進場，一分鐘後再查：%s", day, exc)
             return None
         if bars:
             history = _History(day, tuple(indicators.ClosedBar(b, None) for b in bars))
@@ -499,25 +579,20 @@ def _load_history(broker: Broker, today: date) -> _History | None:
                         history.close, day, f"{bars[-1].start:%H:%M}", len(bars))
             return history
         logger.info("%s 查不到大台 1 分 K（臨時休市？），再往前一個交易日", day)
-    logger.error("往前 %d 個交易日都查不到大台 1 分 K，沒有昨收，今天不判斷進場",
+    logger.error("往前 %d 個交易日都查不到大台 1 分 K，沒有昨收，還不能判斷進場，一分鐘後再查",
                  _HISTORY_LOOKBACK)
     return None
 
 
-def _load_settlement_day(broker: Broker, today: date) -> date | None:
+def _settlement_day(contract: ContractInfo | None, today: date) -> date | None:
     """近月合約的結算日：商品清單裡大台近月的最後交易日（規格第 24 條）。
 
     看大台，因為結算週停用條件 3、4 是為了大台近月的筆差（GLOSSARY「結算週」）。
-    查不到就是 None：策略判斷因此停用條件 3、4（不知道是不是結算週，寧可少做），
-    條件 1、2 照常判斷、原始行情照記。
+    沒有大台近月就是 None：策略判斷因此停用條件 3、4（不知道是不是結算週，寧可少做），
+    條件 1、2 照常判斷。
     """
-    try:
-        contract = broker.get_contracts().get(TX_CODE)
-    except BrokerError as exc:
-        logger.error("查商品清單失敗，不知道今天是不是結算週，條件 3、4 今天停用：%s", exc)
-        return None
     if contract is None:
-        logger.error("商品清單裡沒有大台近月，不知道今天是不是結算週，條件 3、4 今天停用")
+        logger.error("商品清單裡沒有大台近月，不知道今天是不是結算週，條件 3、4 先停用")
         return None
     day = contract.last_trading_day
     if strategy.in_settlement_week(today, day):
@@ -707,21 +782,24 @@ class _Trading:
 
     自動下單關閉時是模擬模式（規格第 42 條）：成交價是交易商品**當下的價格**（最新一筆
     成交），部位記在模擬部位（`sim_position`）——**不寫部位檔**。出場程式看的是部位檔，模擬的
-    口數不能讓它以為今天有部位。打開時才有 `orders`，那是唯一會呼叫下單函式的路徑。
+    口數不能讓它以為今天有部位。打開時（`live`）才有 `orders`，那是唯一會呼叫下單函式的路徑；
+    下單合約還沒查到（`_Lookups`）的時候 `orders` 是 None，條件成立也不進場——不是模擬。
+
+    `history`（昨收與暖身）、`settlement_day`、`orders` 由 `_Lookups` 查到時放進來。
     """
 
-    def __init__(self, config: settings.Config, notify: Callable[[str], bool],
-                 history: _History | None, settlement_day: date | None,
-                 orders: _Orders | None, *, today: date, product: str,
-                 record: position_file.PositionRecord | None, stopped: bool = False):
+    def __init__(self, config: settings.Config, notify: Callable[[str], bool], *, live: bool,
+                 today: date, product: str, record: position_file.PositionRecord | None,
+                 stopped: bool = False):
         self._config = config
         self._notify = notify
-        self._history = history
-        self._settlement_day = settlement_day
-        self._orders = orders
+        self._live = live
+        self.history: _History | None = None
+        self.settlement_day: date | None = None
+        self.orders: _Orders | None = None
         self._today = today
         self._product = product
-        self.position = _held(record) if orders is not None else self._simulated_so_far()
+        self.position = _held(record) if live else self._simulated_so_far()
         # 當天不再進場。部位不確定時，帳上的口數不知道，部位不虧、加碼上限都算不了
         # （規格第 50 條）——啟動時讀到「不確定」、或今天這裡送出的委託變成不確定
         # （`_fill_unknown`）；委託被拒（`_not_sent`）、成交寫不進部位檔（`_not_on_file`）
@@ -773,19 +851,19 @@ class _Trading:
         self._stop(now, f"委託 {u.order_seq or '（沒有序號）'} 送出去了，但不知道成交幾口：{why}")
         logger.error("今天稍早送出的委託 %s（%d 口）不知道成交幾口，送出它的那一輪沒來得及告警",
                      u.order_seq or "（沒有序號）", u.requested_lots)
-        self._send(messages.fill_unknown(
+        self.say(messages.fill_unknown(
             at=now, product=record.product, direction=record.direction, lots=u.requested_lots,
             order_seq=u.order_seq, known_filled=u.known_filled, reason=why,
             held_lots=record.entered_lots, file_error=None))
 
     def rsi(self, today: list[indicators.ClosedBar]) -> float | None:
-        if self._history is None:
+        if self.history is None:
             return None
-        return strategy.rsi(self._history.bars + tuple(today))
+        return strategy.rsi(self.history.bars + tuple(today))
 
     def on_bar(self, today: list[indicators.ClosedBar], now: datetime) -> None:
         """一根 K 棒剛結束（`now` 是讓它結束的那個事件的時間）。"""
-        if self._history is None or self._stopped:
+        if self.history is None or self._stopped:
             return
         first = today[0].bar
         # 開盤價是 08:45 那根的開盤價。今天第一根不是 08:45（開盤時報價斷了），
@@ -795,16 +873,16 @@ class _Trading:
             logger.warning("今天第一根 1 分 K 是 %s 不是 08:45，不知道開盤價，條件 1、2 今天不判斷",
                            f"{first.start:%H:%M}")
         decision = strategy.decide(strategy.Situation(
-            bars=self._history.bars + tuple(today),
+            bars=self.history.bars + tuple(today),
             today_open=today_open,
-            yesterday_close=self._history.close,
+            yesterday_close=self.history.close,
             now=now,
             position=self.position,
             product_price=self.product_price,
             lots_per_entry=self._config.lots_per_entry,
             max_position=self._config.max_position,
             breakout=self.breakout,
-            settlement_day=self._settlement_day,
+            settlement_day=self.settlement_day,
         ))
         if isinstance(decision, strategy.Breakout):
             self.breakout = decision
@@ -845,8 +923,11 @@ class _Trading:
                  trigger: float | None = None) -> None:
         """進場：自動下單打開就真的下單，關閉就模擬。立刻進場與突破進場被觸發都走這裡，
         真實下單才不會只接到其中一種。`trigger` 是突破進場的觸發價（立刻進場是 None）。"""
-        if self._orders is None:
+        if not self._live:
             self._simulate(decision, now, trigger=trigger)
+        elif self.orders is None:
+            logger.warning("%s 成立，但還沒查到下單合約（商品清單），這一次不進場",
+                           decision.condition.value)
         else:
             self._enter(decision, now, trigger=trigger)
 
@@ -872,7 +953,7 @@ class _Trading:
         if self._against_position(decision):
             return
         try:
-            fill = self._orders.enter(decision.direction, decision.lots)
+            fill = self.orders.enter(decision.direction, decision.lots)
         except OrderFailed as exc:
             self._not_sent(decision, exc, now)
             return
@@ -884,12 +965,12 @@ class _Trading:
             return
         if fill is None:
             return
-        record = self._orders.record
+        record = self.orders.record
         self.position = _held(record)
         logger.info("進場成交：%s %s %d 口 @ %g（委託 %s），累計 %d 口，均價 %.2f",
                     decision.condition.value, record.direction, fill.lots, fill.price,
                     fill.order_seq, record.entered_lots, record.avg_price)
-        self._send(messages.entry(
+        self.say(messages.entry(
             at=now, product=record.product, direction=record.direction,
             condition=decision.condition, lots=fill.lots, price=fill.price,
             total_lots=record.entered_lots, avg_price=record.avg_price, simulated=False,
@@ -903,7 +984,7 @@ class _Trading:
         """
         self._stop(now, f"委託沒有送出去：{exc}")
         logger.error("%s 的委託沒有送出去，今天不再進場：%s", decision.condition.value, exc)
-        self._send(messages.order_not_sent(
+        self.say(messages.order_not_sent(
             at=now, product=self._product, direction=decision.direction, lots=decision.lots,
             reason=str(exc), held_lots=self.position.lots if self.position else 0))
 
@@ -926,7 +1007,7 @@ class _Trading:
         else:
             logger.error("這筆的序號寫不進部位檔，檔裡是送單前記下的「不確定」：%s",
                          exc.file_error)
-        self._send(messages.fill_unknown(
+        self.say(messages.fill_unknown(
             at=now, product=self._product, direction=decision.direction,
             lots=exc.requested_lots, order_seq=exc.order_seq, known_filled=exc.known_filled,
             reason=str(exc), held_lots=self.position.lots if self.position else 0,
@@ -946,7 +1027,7 @@ class _Trading:
         logger.error("成交 %s %d 口 @ %g（委託 %s）寫不進部位檔，帳上共 %d 口、檔裡 %d 口，"
                      "今天不再進場：%s", record.direction, fill.lots, fill.price,
                      fill.order_seq, record.entered_lots, on_file, exc)
-        self._send(messages.fill_not_on_file(
+        self.say(messages.fill_not_on_file(
             at=now, product=record.product, direction=record.direction, lots=fill.lots,
             price=fill.price, order_seq=fill.order_seq, total_lots=record.entered_lots,
             on_file_lots=on_file, reason=str(exc)))
@@ -973,7 +1054,7 @@ class _Trading:
             # 只是模擬：記 log、照樣發訊息。代價是重啟後從檔裡那一份接著累計。
             logger.error("模擬部位寫不進 %s（%s: %s）", sim_position.path_for(self._today),
                          type(exc).__name__, exc)
-        self._send(messages.entry(
+        self.say(messages.entry(
             at=now, product=self._product, direction=decision.direction,
             condition=decision.condition, lots=decision.lots, price=price,
             total_lots=total, avg_price=avg, simulated=True, trigger=trigger))
@@ -983,7 +1064,8 @@ class _Trading:
         self._stopped = True
         _write_stop(self._today, f"{now:%Y/%m/%d %H:%M:%S} {why}")
 
-    def _send(self, text: str) -> None:
+    def say(self, text: str) -> None:
+        """發一則 Discord（開關在 `_send` 把關）。"""
         _send(self._config, self._notify, text)
 
 

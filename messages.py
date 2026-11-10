@@ -175,6 +175,32 @@ def quote_outage(*, at: datetime, trade_at: datetime | None, counts_at: datetime
     )
 
 
+def entries_not_fully_judged(*, at: datetime, no_history: bool, no_settlement_day: bool,
+                             no_contract_for: str | None, log: str) -> str:
+    """到 08:50（條件 1、2 開始判斷）還有開盤前該查好的東西查不到（`intraday._Lookups`）。
+
+    講清楚今天**哪些條件判斷不了**：不講的話，使用者分不出「今天沒有訊號」和「今天程式是瞎的」。
+    通常什麼都不必做（多半是群益主機一時查不到，盤中程式每分鐘再查），所以先講這一點，再指出
+    想查原因時去哪裡看（`log`）。`no_contract_for` 是查不到近月合約的交易商品（自動下單打開時）。
+    """
+    missing = []
+    if no_history:
+        missing.append("查不到前一個交易日的大台 1 分 K（昨收、RSI 暖身）：條件 1～4 都判斷不了。")
+    if no_settlement_day:
+        missing.append("查不到商品清單裡大台近月的結算日：不知道今天是不是結算週，條件 3、4 停用。")
+    if no_contract_for is not None:
+        missing.append(f"查不到{_PRODUCT_TEXT[no_contract_for]}的近月合約（下單代碼）："
+                       "條件成立也不能下單。")
+    return (
+        f"【要你處理】PTS 到 {strategy.EARLY_START:%H:%M} 還有資料查不到，今天的進場判斷不完整\n"
+        + "".join(f"{line}\n" for line in missing)
+        + "盤中程式每分鐘再查一次，查到之後就照常判斷，不另外通知。原始行情照常記錄，"
+        "已經有的部位照常了結。\n"
+        f"通常不必處理（多半是群益主機一時查不到）；想知道原因請看 {log}。\n"
+        f"{at:%Y/%m/%d %H:%M:%S}"
+    )
+
+
 def _points(price: float) -> str:
     """台指期報價是整數點位：45150.0 寫成 45150。均價才可能有小數，留到兩位。"""
     return f"{round(price, 2):.2f}".rstrip("0").rstrip(".")
