@@ -306,7 +306,7 @@ def test_the_settlement_day_itself_is_not_expired():
     assert len(skcom.sent) == 1
 
 
-def test_a_certificate_that_cannot_be_read_stops_before_anyorder_request():
+def test_a_certificate_that_cannot_be_read_stops_before_any_order():
     """少了憑證，送出去只會被回 1038「Cert Not Verified」，要人自己猜是哪一步漏了。"""
     skcom = FakeSkcom(cert_code=1038)
     with pytest.raises(OrderFailed, match="憑證"):
@@ -328,7 +328,7 @@ def test_an_unexpected_error_before_the_send_is_order_failed():
     assert skcom.sent == []
 
 
-def test_no_futures_account_stops_before_anyorder_request():
+def test_no_futures_account_stops_before_any_order():
     skcom = FakeSkcom()
     with pytest.raises(OrderFailed, match="期貨帳號"):
         _place(skcom, order_request(), account="")
@@ -459,7 +459,7 @@ def test_a_reply_link_known_to_be_down_stops_the_order_before_it_is_sent(caplog)
     assert any("中斷" in m and "3002" in m for m in _reply_problems(caplog))
 
 
-def test_a_reply_link_that_drops_during_the_session_is_checked_before_everyorder_request():
+def test_a_reply_link_that_drops_during_the_session_is_checked_before_every_order():
     """盤中才斷線的話，第一筆送單前那次檢查早就過了。每一筆都要再看一次，
     先試著重新連線，連不回來就不送。"""
     skcom = FakeSkcom()
@@ -516,7 +516,7 @@ def test_replies_replayed_before_the_order_are_not_saved_with_it():
     assert "OLDREPLY" not in _saved_replies()
 
 
-def test_a_failed_save_never_masks_what_happened_to_theorder_request(monkeypatch, tmp_path):
+def test_a_failed_save_never_masks_what_happened_to_the_order(monkeypatch, tmp_path):
     """存檔跑在 `finally` 裡，而 `finally` 拋出的例外會**取代**正在傳遞的那個——
     使用者會收到「寫檔失敗」而不是「不知道成交」。成交了的也不可以變成失敗。"""
     blocked = tmp_path / "blocked"

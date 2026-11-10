@@ -121,7 +121,7 @@ def test_the_fake_can_fill_part_of_an_order():
     assert (nothing.filled_lots, nothing.avg_price) == (0, None)
 
 
-def test_the_fake_plays_back_both_kinds_of_failure_inorder_request():
+def test_the_fake_plays_back_both_kinds_of_failure_in_order():
     """「拒單之後當天停止」「不確定之後當天停止」這類流程測試靠它（ticket 07）。"""
     fake = FakeBroker(contracts=contracts(), fill_price=45000.0, order_errors=[
         OrderFailed("保證金不足"),
@@ -146,7 +146,7 @@ def test_a_fake_without_a_price_refuses_to_invent_one():
 # --- 假 broker：照劇本回放一個交易日 ---
 
 
-def test_the_fake_replays_the_days_events_inorder_request():
+def test_the_fake_replays_the_days_events_in_order():
     t = datetime(2026, 11, 9, 8, 45)
     script = [Clock(t), TxTrade(t, 45000.0), TxTradeCounts(t, buy_count=10, sell_count=12),
               ProductTrade(t, 45001.0)]
