@@ -371,7 +371,7 @@ def test_after_three_retries_the_lots_still_open_are_reported():
     assert time.slept == [60, 60, 60]
     assert sent == [
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口\n"
-        "原因：委託沒有送出去，重試 3 次仍然失敗（最後一次：保證金不足）\n"
+        "原因：平倉單重試 3 次都沒能送出（最後一次：保證金不足）\n"
         "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。\n"
         "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 3 口再賣出一次，開出反向新倉。\n"
         "2026/11/09 13:28:00",
@@ -432,7 +432,7 @@ def test_retries_stop_when_the_day_session_closes():
     broker, sent, _ = _run(at=_at("13:44"), order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 1
     assert sent[0].splitlines()[1:3] == [
-        "原因：委託沒有送出去（最後一次：保證金不足），重試到日盤 13:45 收盤仍未完成",
+        "原因：平倉單沒能送出（最後一次：保證金不足），重試到日盤 13:45 收盤仍未完成",
         "請在夜盤自行賣出微台 3 口（TM2611）。",
     ]
 
@@ -502,7 +502,7 @@ def test_on_the_settlement_day_retries_stop_at_1330():
                            order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 1
     assert sent[0].splitlines()[1:4] == [
-        "原因：委託沒有送出去（最後一次：保證金不足），重試到近月 13:30 停止交易仍未完成",
+        "原因：平倉單沒能送出（最後一次：保證金不足），重試到近月 13:30 停止交易仍未完成",
         _SETTLED_BY_EXCHANGE,
         "2026/11/18 13:30:00",
     ]
@@ -785,6 +785,37 @@ def test_tx_and_mtx_on_a_missed_day_were_closed_by_the_broker_and_need_no_word(p
     _on_file(product=product, order_code=order_code)
     _, sent, _ = _run(at=datetime(2026, 11, 10, 8, 10))
     assert sent == []
+
+
+# --- 三種處境，三種固定的說法（規格第 41 條）---
+
+# 「委託沒有送出去」＝確定沒有部位、「委託送出去了，但…」＝可能有部位、「部位還在」＝確定有部位
+FIXED_PHRASES = ("委託沒有送出去", "委託送出去了，但", "部位還在")
+
+EXIT_ALERTS = {
+    "重試用完": dict(order_errors=[OrderFailed("保證金不足")] * 4),
+    "重試到收盤": dict(at=_at("13:44"), order_errors=[OrderFailed("保證金不足")] * 4),
+    "只成交一部分": dict(fills=[1, 1, 0, 0]),
+    "收盤後才跑": dict(at=_at("13:50")),
+    "登入失敗": dict(login_error=LoginFailed("群益登入失敗，代碼 1001：密碼錯誤")),
+    "平倉單不確定": dict(order_errors=[_SENT_BUT_UNKNOWN], fill_queries=[FillQuery(lots=None)]),
+    "前一天沒平": dict(at=datetime(2026, 11, 10, 8, 10)),
+}
+
+
+@pytest.mark.parametrize("situation", EXIT_ALERTS.values(), ids=EXIT_ALERTS.keys())
+def test_each_exit_alert_uses_only_its_own_fixed_wording(situation):
+    """出場程式的告警和盤中程式一樣守三分法：使用者看到其中一種說法，就知道帳上是哪一種處境，
+    要做的事完全不同（「委託沒有送出去」那一則還說不必看帳戶）。所以每一則全文只出現自己那一種，
+    原因那一行也不借用另外兩種的說法。"""
+    _on_file()
+    _, sent, _ = _run(**situation)
+
+    assert sent
+    for message in sent:
+        used = [p for p in FIXED_PHRASES if p in message]
+        assert len(used) <= 1, message
+        assert used == [p for p in FIXED_PHRASES if p in message.splitlines()[0]], message
 
 
 # --- Discord 關閉（規格第 45 條）---

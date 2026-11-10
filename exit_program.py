@@ -355,7 +355,7 @@ class _MicroExit:
 
         if rounds > _RETRIES:
             return self._incomplete(
-                f"委託沒有送出去，重試 {_RETRIES} 次仍然失敗（最後一次：{problem}）" if problem
+                f"平倉單重試 {_RETRIES} 次都沒能送出（最後一次：{problem}）" if problem
                 else f"市價 IOC 沒有全部成交，重試 {_RETRIES} 次仍有剩餘")
         # 過了期限：日盤收盤（之後只能在夜盤平），或結算日近月停止交易（之後由交易所以最後
         # 結算價現金了結，損益和回測有落差，規格第 35 條）。兩種都還剩口數，都要告警——
@@ -367,7 +367,7 @@ class _MicroExit:
             close = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 收盤"
             closed = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 已經收盤"
         if rounds:
-            reason = ((f"委託沒有送出去（最後一次：{problem}），" if problem
+            reason = ((f"平倉單沒能送出（最後一次：{problem}），" if problem
                        else "市價 IOC 沒有全部成交，") + f"重試到{close}仍未完成")
         else:
             reason = f"出場程式 {self._started:%H:%M} 才執行，{closed}，沒有送出平倉單"
