@@ -53,6 +53,15 @@ def test_a_failed_login_is_a_login_failure_with_the_brokers_message():
         _broker(FakeSkcom(login_code=1001)).login()
 
 
+def test_a_login_that_is_already_done_counts_as_logged_in():
+    """同一個行程裡第二次登入（出場程式遇到網路類的登入失敗，一分鐘後再登入一次），群益可能回
+    2003「ID已登入，無需重覆登入」（文件 6 代碼定義表）。那是已經登入了，不是登入失敗：當成失敗的話，
+    出場程式立刻告警「部位還在」，重試就白做了。"""
+    broker = _broker(FakeSkcom(login_code=2003))
+    broker.login()
+    assert broker.get_contracts()
+
+
 @pytest.mark.parametrize("user_id, password, missing", [("", "pw", "CAPITAL_USER_ID"),
                                                         ("A100000000", "", "CAPITAL_PASSWORD")],
                          ids=["沒有帳號", "沒有密碼"])
@@ -312,6 +321,14 @@ def test_a_certificate_that_cannot_be_read_stops_before_any_order():
     with pytest.raises(OrderFailed, match="憑證"):
         _place(skcom, order_request())
     assert skcom.sent == []
+
+
+def test_a_certificate_already_verified_counts_as_read():
+    """下單準備做到一半失敗（例如回報連線失敗）的話，第一筆委託會再準備一次、再讀一次憑證，群益
+    可能回 2005「驗章已過，無需重覆驗章」（文件 6 代碼定義表）。那是憑證已經好了：照常送出。"""
+    skcom = FakeSkcom(cert_code=2005)
+    _place(skcom, order_request())
+    assert len(skcom.sent) == 1
 
 
 class _CertExplodes(FakeSkcom):

@@ -93,6 +93,12 @@ _LOGIN_TRY_AGAIN_LATER = frozenset({
     2029,   # SK_WARNING_SHOULD_CHECK_NETWORK
 })
 
+# 「已經做過了」的警告（文件 6 代碼定義表），不是失敗：同一個行程裡第二次登入（出場程式網路類的
+# 登入失敗之後每分鐘重登）、下單準備做到一半失敗之後第一筆委託再讀一次憑證，都可能拿到它們。
+# 當成失敗的話，出場程式立刻告警、重試就白做了；第一筆委託變成「委託沒有送出去」。
+_LOGIN_ALREADY = 2003           # SK_WARNING_LOGIN_ALREADY：ID已登入，無需重覆登入
+_CERT_VERIFIED_ALREADY = 2005   # SK_WARNING_CERT_VERIFIED_ALREADY：驗章已過，無需重覆驗章
+
 # 報價連線斷了的代碼（文件 4-4-a、6 代碼表）。斷了之後成交與筆數都不會再來，時鐘照樣每秒
 # 一個：盤中程式靠它發現報價中斷並告警（規格第 53 條）。這裡只記 log——斷線之後群益會不會
 # 自己重連、要不要由程式重新訂閱，文件沒寫，待實機觀察（ticket 09 Comments）。
@@ -467,9 +473,12 @@ class CapitalBroker:
         code = self._center.SKCenterLib_LoginSetQuote(self._user_id, self._password, "Y")
         if code in _LOGIN_TRY_AGAIN_LATER:
             raise LoginUnavailable(f"群益登入沒有成功（網路或群益主機），{self._message(code)}")
-        if code != 0:
+        if code == _LOGIN_ALREADY:
+            logger.info("群益回報已經登入過（%s），當成登入成功", self._message(code))
+        elif code != 0:
             raise LoginFailed(f"群益登入失敗，{self._message(code)}")
-        logger.info("群益登入成功")
+        else:
+            logger.info("群益登入成功")
         # 聲明書狀態是登入後非同步查回來的，沒等它就連報價主機會拿到 2018
         self._center.SKCenterLib_RequestAgreement(self._user_id)
         self._pump_for(self._settle_seconds)
@@ -659,7 +668,9 @@ class CapitalBroker:
         #    看報價、查商品清單都不需要憑證，只有送單需要——所以這個洞在真的下單之前
         #    不可能浮出來。在這裡失敗，訊息可以直接講「憑證讀取失敗」。
         code = self._order.ReadCertByID(self._user_id)
-        if code != 0:
+        if code == _CERT_VERIFIED_ALREADY:
+            logger.info("群益回報憑證已經驗過（%s），照常下單", self._message(code))
+        elif code != 0:
             raise OrderFailed(f"憑證讀取失敗，{self._message(code)}")
 
         self._connect_reply()
