@@ -11,19 +11,18 @@ from datetime import date
 import pytest
 
 import paths
-from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo, FillUnknown,
+from broker import (BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, FillUnknown,
                     LoginFailed, LoginUnavailable, OrderFailed, OrderRequest,
                     ProductListUnavailable)
 from broker.capital import CapitalBroker
-from fake_skcom import (FakeSkcom, fills, full_fill, no_sequence, refused_at_send, rejected,
-                        reply_row, silence)
+from day_script import order_request
+from fake_skcom import (FakeSkcom, capital_broker, fills, full_fill, no_sequence,
+                        refused_at_send, rejected, reply_row, silence)
 
 
 def _broker(skcom: FakeSkcom, **kwargs) -> CapitalBroker:
-    kwargs.setdefault("account", "F0000000000000")
     kwargs.setdefault("fill_timeout", 0.3)
-    kwargs.setdefault("settle_seconds", 0)
-    return CapitalBroker("A100000000", "pw", com=skcom, **kwargs)
+    return capital_broker(skcom, **kwargs)
 
 
 # --- 群益元件自己的 log（規格第 60 條）---
@@ -156,18 +155,6 @@ def test_logging_in_and_listing_products_never_touch_the_order_side():
 
 # --- 委託欄位（規格第 27、28 條）---
 
-TRADING_DAY = date(2026, 11, 9)
-CONTRACTS = {
-    TX_CODE: ContractInfo(TX_CODE, date(2026, 11, 18), "TX11"),
-    MTX_CODE: ContractInfo(MTX_CODE, date(2026, 11, 18), "MTX11"),
-    TMF_CODE: ContractInfo(TMF_CODE, date(2026, 11, 18), "TM2611"),
-}
-
-
-def _order(code=TMF_CODE, *, side=BUY, lots=1, day=TRADING_DAY) -> OrderRequest:
-    return OrderRequest(contract=CONTRACTS[code], side=side, lots=lots, trading_day=day)
-
-
 def _place(skcom: FakeSkcom, request: OrderRequest, **kwargs):
     broker = _broker(skcom, **kwargs)
     broker.login()
@@ -190,7 +177,7 @@ def test_every_field_of_the_order_sent_to_the_broker(code, order_code, day_trade
       bstrStockNo     下單代碼（TX11），不是報價代碼（TX00AM）
     """
     skcom = FakeSkcom()
-    _place(skcom, _order(code, side=SELL, lots=3))
+    _place(skcom, order_request(code, side=SELL, lots=3))
     assert vars(skcom.sent[0]) == {
         "bstrFullAccount": "F0000000000000",
         "bstrStockNo": order_code,
@@ -207,7 +194,7 @@ def test_every_field_of_the_order_sent_to_the_broker(code, order_code, day_trade
 def test_buy_is_zero_on_the_wire():
     """群益的 sBuySell：0 買進、1 賣出。寫反就是開出完全相反的部位。"""
     skcom = FakeSkcom()
-    _place(skcom, _order(side=BUY))
+    _place(skcom, order_request(side=BUY))
     assert skcom.sent[0].sBuySell == 0
 
 
@@ -215,25 +202,25 @@ def test_buy_is_zero_on_the_wire():
 
 
 def test_a_full_fill_reports_the_sequence_lots_and_price():
-    result = _place(FakeSkcom(on_send=full_fill(45123.0)), _order(lots=2))
+    result = _place(FakeSkcom(on_send=full_fill(45123.0)), order_request(lots=2))
     assert (result.filled_lots, result.avg_price) == (2, 45123.0)
     assert len(result.order_seq) == 13, "13 碼委託序號：出場查詢與人工對帳都靠它"
 
 
 def test_a_partial_fill_reports_only_what_was_filled():
     """IOC 只成交一部分時，剩下的被取消。記委託口數的話，出場就平錯量。"""
-    result = _place(FakeSkcom(on_send=fills((1, 45000.0), cancel=2)), _order(lots=3))
+    result = _place(FakeSkcom(on_send=fills((1, 45000.0), cancel=2)), order_request(lots=3))
     assert (result.filled_lots, result.avg_price) == (1, 45000.0)
 
 
 def test_nothing_filled_is_a_result_not_a_failure():
     """市價 IOC 當下沒有對手價：委託結束、0 口。確定沒有部位，但也不是被拒。"""
-    result = _place(FakeSkcom(on_send=fills(cancel=1)), _order(lots=1))
+    result = _place(FakeSkcom(on_send=fills(cancel=1)), order_request(lots=1))
     assert (result.filled_lots, result.avg_price) == (0, None)
 
 
 def test_fills_at_several_prices_report_the_lot_weighted_average():
-    result = _place(FakeSkcom(on_send=fills((1, 45000.0), (2, 45003.0))), _order(lots=3))
+    result = _place(FakeSkcom(on_send=fills((1, 45000.0), (2, 45003.0))), order_request(lots=3))
     assert (result.filled_lots, result.avg_price) == (3, 45002.0)
 
 
@@ -245,7 +232,7 @@ def test_old_replies_replayed_on_connect_are_not_counted():
                                                     "onnewdata-crossing-zero-2026-08-24.txt"),
                                        encoding="utf-8")
         if line.strip() and not line.startswith("#"))
-    result = _place(FakeSkcom(replayed_rows=replayed, on_send=full_fill(45000.0)), _order())
+    result = _place(FakeSkcom(replayed_rows=replayed, on_send=full_fill(45000.0)), order_request())
     assert result.filled_lots == 1
 
 
@@ -254,35 +241,35 @@ def test_old_replies_replayed_on_connect_are_not_counted():
 
 def test_a_send_refused_by_the_broker_is_order_failed_with_the_reason():
     with pytest.raises(OrderFailed, match="保證金不足"):
-        _place(FakeSkcom(on_send=refused_at_send(1037, "保證金不足")), _order())
+        _place(FakeSkcom(on_send=refused_at_send(1037, "保證金不足")), order_request())
 
 
 def test_a_rejection_reported_after_the_send_is_order_failed_with_the_reason():
     """交易所收下之後才被拒（回報 OrderErr = Y）、沒有任何成交——確定沒有部位。"""
     with pytest.raises(OrderFailed, match="價格超出漲跌停"):
-        _place(FakeSkcom(on_send=rejected("價格超出漲跌停")), _order())
+        _place(FakeSkcom(on_send=rejected("價格超出漲跌停")), order_request())
 
 
 def test_an_expired_contract_is_never_sent():
     """**過期合約絕不送單。** 群益會把過期月份自動改送隔年同月，而且不報錯。"""
     skcom = FakeSkcom()
     with pytest.raises(OrderFailed, match="最後交易日"):
-        _place(skcom, _order(day=date(2026, 11, 19)))
+        _place(skcom, order_request(day=date(2026, 11, 19)))
     assert skcom.sent == []
 
 
 def test_the_settlement_day_itself_is_not_expired():
     """結算日當天交易當天到期的合約，13:30 才停止交易（規格第 9 條）。"""
     skcom = FakeSkcom()
-    _place(skcom, _order(day=date(2026, 11, 18)))
+    _place(skcom, order_request(day=date(2026, 11, 18)))
     assert len(skcom.sent) == 1
 
 
-def test_a_certificate_that_cannot_be_read_stops_before_any_order():
+def test_a_certificate_that_cannot_be_read_stops_before_anyorder_request():
     """少了憑證，送出去只會被回 1038「Cert Not Verified」，要人自己猜是哪一步漏了。"""
     skcom = FakeSkcom(cert_code=1038)
     with pytest.raises(OrderFailed, match="憑證"):
-        _place(skcom, _order())
+        _place(skcom, order_request())
     assert skcom.sent == []
 
 
@@ -296,14 +283,14 @@ def test_an_unexpected_error_before_the_send_is_order_failed():
     這是「沒送出去」還是「不知道」——而 broker 只該讓這兩類失敗出去。"""
     skcom = _CertExplodes()
     with pytest.raises(OrderFailed, match="COM 物件已失效"):
-        _place(skcom, _order())
+        _place(skcom, order_request())
     assert skcom.sent == []
 
 
-def test_no_futures_account_stops_before_any_order():
+def test_no_futures_account_stops_before_anyorder_request():
     skcom = FakeSkcom()
     with pytest.raises(OrderFailed, match="期貨帳號"):
-        _place(skcom, _order(), account="")
+        _place(skcom, order_request(), account="")
     assert skcom.sent == []
 
 
@@ -312,7 +299,7 @@ def test_no_futures_account_stops_before_any_order():
 
 def test_no_reply_after_the_send_is_fill_unknown_with_the_sequence():
     with pytest.raises(FillUnknown) as exc:
-        _place(FakeSkcom(on_send=silence()), _order())
+        _place(FakeSkcom(on_send=silence()), order_request())
     assert len(exc.value.order_seq) == 13, "序號要帶出去：出場查詢與人工對帳都靠它"
     assert exc.value.known_filled == 0
 
@@ -320,7 +307,7 @@ def test_no_reply_after_the_send_is_fill_unknown_with_the_sequence():
 def test_a_partial_fill_that_never_ends_carries_the_known_lots():
     """成交了一部分、剩下的沒有下文。**這不等於只成交這些**——但至少有這些。"""
     with pytest.raises(FillUnknown) as exc:
-        _place(FakeSkcom(on_send=fills((1, 45000.0))), _order(lots=3))
+        _place(FakeSkcom(on_send=fills((1, 45000.0))), order_request(lots=3))
     assert exc.value.known_filled == 1
 
 
@@ -332,7 +319,7 @@ def test_a_fill_we_cannot_read_is_fill_unknown_not_a_confident_zero():
                         reply_row("D", seq=seq, qty=1, price=0.0),
                         reply_row("C", seq=seq, qty=2)]
     with pytest.raises(FillUnknown, match="看不懂") as exc:
-        _place(FakeSkcom(on_send=on_send), _order(lots=3))
+        _place(FakeSkcom(on_send=on_send), order_request(lots=3))
     assert exc.value.order_seq
 
 
@@ -341,7 +328,7 @@ def test_more_fills_than_were_ordered_is_fill_unknown():
     出場就照 2 口平倉。不可能的數字只能說不知道。"""
     fills_twice = fills((1, 45000.0), (1, 45000.0))
     with pytest.raises(FillUnknown, match="超過委託") as exc:
-        _place(FakeSkcom(on_send=fills_twice), _order(lots=1))
+        _place(FakeSkcom(on_send=fills_twice), order_request(lots=1))
     assert exc.value.known_filled <= 1, "說不通的口數不可以當成「至少成交」帶出去"
 
 
@@ -354,7 +341,7 @@ def test_any_failure_after_the_send_is_fill_unknown_never_order_failed(error):
     """**單已經在市場上了**，這些意外都不代表「沒有部位」。說錯的後果是不寫部位檔，
     出場程式以為今天沒進場，部位直接過夜。三種例外是為了抓「漏掉某一類」。"""
     with pytest.raises(FillUnknown) as exc:
-        _place(FakeSkcom(on_send=silence(), pump_error=error), _order())
+        _place(FakeSkcom(on_send=silence(), pump_error=error), order_request())
     assert exc.value.order_seq
     assert exc.value.__cause__ is error, "原始原因要留著，否則無從排查"
 
@@ -364,7 +351,7 @@ def test_an_error_raised_by_the_send_call_itself_is_fill_unknown():
     def explode(order, seq):
         raise OSError("RPC 伺服器無法使用")
     with pytest.raises(FillUnknown):
-        _place(FakeSkcom(on_send=explode), _order())
+        _place(FakeSkcom(on_send=explode), order_request())
 
 
 @pytest.mark.parametrize("message", ["", "   ", None])
@@ -372,7 +359,7 @@ def test_a_send_without_a_sequence_number_is_fill_unknown_at_once(message):
     """送出成功（code 0）卻沒有序號：回報認不出來，等下去只會等到別人的回報。
     `None` 要特別小心——`str(None)` 是 "None"，看起來是個正常的序號。"""
     with pytest.raises(FillUnknown, match="人工確認"):
-        _place(FakeSkcom(on_send=no_sequence(message)), _order(), fill_timeout=30)
+        _place(FakeSkcom(on_send=no_sequence(message)), order_request(), fill_timeout=30)
 
 
 # --- 回報連線（invest-os 掛錯事件名稱的修正）---
@@ -395,7 +382,7 @@ def _reply_problems(caplog) -> list[str]:
 def test_a_reply_link_that_finishes_its_replay_is_trusted_whatever_code_it_connected_with(
         code, caplog):
     """不可以把某個代碼寫死成「成功」：猜錯的話，每天都會報一個假的連線失敗。"""
-    _place(FakeSkcom(reply_connection_code=code), _order())
+    _place(FakeSkcom(reply_connection_code=code), order_request())
     assert _reply_problems(caplog) == []
 
 
@@ -403,7 +390,7 @@ def test_the_code_the_reply_link_connects_with_is_logged(caplog):
     """成功連線時的代碼文件沒寫，第一次實機就是靠這一行看出它是多少（ticket 01 Comments）。
     也守著事件名稱：掛回 invest-os 的舊名 `OnConnect` 的話，這一行永遠不會出現。"""
     caplog.set_level(logging.INFO, logger="broker.capital")
-    _place(FakeSkcom(reply_connection_code=3001), _order())
+    _place(FakeSkcom(reply_connection_code=3001), order_request())
     assert any("回報連線通知" in m and "3001" in m for m in caplog.messages)
 
 
@@ -414,7 +401,7 @@ def test_a_reply_link_that_never_finishes_its_replay_is_reported(caplog):
     沒有舊回報可補送時它還會不會來，實機還沒看過（2026-11-07 那次補送了 7 則）。
     在這個假設上擋單，猜錯的話是每天都進不了場。"""
     skcom = FakeSkcom(reply_completes=False)
-    _place(skcom, _order(), connect_timeout=0.2)
+    _place(skcom, order_request(), connect_timeout=0.2)
     assert any("OnComplete" in m for m in _reply_problems(caplog))
     assert len(skcom.sent) == 1
 
@@ -426,21 +413,21 @@ def test_a_reply_link_known_to_be_down_stops_the_order_before_it_is_sent(caplog)
     微台那一口要靠人手動處理才不會過夜。不送則是「委託沒有送出去」：確定沒有部位。"""
     skcom = FakeSkcom(reply_drop_code=3002, on_send=silence())
     with pytest.raises(OrderFailed, match="3002"):
-        _place(skcom, _order(), connect_timeout=0.2)
+        _place(skcom, order_request(), connect_timeout=0.2)
     assert skcom.sent == []
     assert any("中斷" in m and "3002" in m for m in _reply_problems(caplog))
 
 
-def test_a_reply_link_that_drops_during_the_session_is_checked_before_every_order():
+def test_a_reply_link_that_drops_during_the_session_is_checked_before_everyorder_request():
     """盤中才斷線的話，第一筆送單前那次檢查早就過了。每一筆都要再看一次，
     先試著重新連線，連不回來就不送。"""
     skcom = FakeSkcom()
     broker = _broker(skcom, connect_timeout=0.2)
     broker.login()
-    broker.place_order(_order())
+    broker.place_order(order_request())
     skcom.drop_reply_link(3002, reconnects=False)
     with pytest.raises(OrderFailed, match="回報連線"):
-        broker.place_order(_order())
+        broker.place_order(order_request())
     assert len(skcom.sent) == 1
 
 
@@ -450,9 +437,9 @@ def test_a_reply_link_that_reconnects_lets_the_next_order_through():
     skcom = FakeSkcom()
     broker = _broker(skcom, connect_timeout=0.2)
     broker.login()
-    broker.place_order(_order())
+    broker.place_order(order_request())
     skcom.drop_reply_link(3002, reconnects=True)
-    assert broker.place_order(_order()).filled_lots == 1
+    assert broker.place_order(order_request()).filled_lots == 1
     assert len(skcom.sent) == 2
 
 
@@ -470,31 +457,31 @@ def _saved_replies() -> str:
 
 
 def test_the_replies_received_for_an_order_are_saved_under_logs():
-    _place(FakeSkcom(on_send=full_fill(45000.0)), _order())
+    _place(FakeSkcom(on_send=full_fill(45000.0)), order_request())
     assert "45000.000000" in _saved_replies()
 
 
 def test_replies_are_saved_even_when_the_fill_is_unknown():
     """**收不到回報那天最需要原始資料**——那正是要回頭查的時候。"""
     with pytest.raises(FillUnknown):
-        _place(FakeSkcom(on_send=fills((1, 45001.0))), _order(lots=2))
+        _place(FakeSkcom(on_send=fills((1, 45001.0))), order_request(lots=2))
     assert "45001.000000" in _saved_replies()
 
 
 def test_replies_replayed_before_the_order_are_not_saved_with_it():
     """連線時補送的舊回報與這筆委託無關，存進來只會讓排查的人以為它們有關聯。"""
     old = "9999999999999,TF,N,N,F000000,0000000," + ",".join([""] * 40) + ",OLDREPLY"
-    _place(FakeSkcom(replayed_rows=(old,)), _order())
+    _place(FakeSkcom(replayed_rows=(old,)), order_request())
     assert "OLDREPLY" not in _saved_replies()
 
 
-def test_a_failed_save_never_masks_what_happened_to_the_order(monkeypatch, tmp_path):
+def test_a_failed_save_never_masks_what_happened_to_theorder_request(monkeypatch, tmp_path):
     """存檔跑在 `finally` 裡，而 `finally` 拋出的例外會**取代**正在傳遞的那個——
     使用者會收到「寫檔失敗」而不是「不知道成交」。成交了的也不可以變成失敗。"""
     blocked = tmp_path / "blocked"
     blocked.write_text("我是檔案不是目錄", encoding="utf-8")
     monkeypatch.setattr(paths, "logs_dir", lambda: str(blocked / "logs"))
 
-    assert _place(FakeSkcom(), _order()).filled_lots == 1
+    assert _place(FakeSkcom(), order_request()).filled_lots == 1
     with pytest.raises(FillUnknown):
-        _place(FakeSkcom(on_send=silence()), _order())
+        _place(FakeSkcom(on_send=silence()), order_request())

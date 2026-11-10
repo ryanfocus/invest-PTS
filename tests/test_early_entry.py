@@ -14,32 +14,21 @@ import pytest
 
 from broker import (MTX_CODE, TMF_CODE, Clock, MinuteBar, ProductTrade,
                     QuoteUnavailable)
-from broker.fake import FakeBroker
 from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, counts,
-                        history as history_bars, minute, rally, replayed, trade, whole_morning)
-from recording import RecordingNotifier
-import intraday
+                        history as history_bars, make_config, minute, rally, replayed, run_day,
+                        trade, whole_morning)
 import paths
-import settings
 
 SATURDAY = date(2026, 11, 7)
 
 
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=False, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
-
-
 def _run(events, *, history=None, config=None, today: date = DAY):
-    """跑一天，回傳 (broker, 發出的訊息)。前一個交易日預設是平淡的一天、收 45000。"""
-    broker = FakeBroker(events=events,
-                        minute_bars={PREVIOUS_DAY: calm_history(45000) if history is None
-                                     else history})
-    notifier = RecordingNotifier()
-    intraday.run(broker, config or _config(), today=today, notify=notifier)
-    return broker, notifier.sent
+    """跑一天（`run_day`），回傳 (broker, 發出的訊息)。`history` 是前一個交易日的 1 分 K，
+    預設是平淡的一天、收 45000。"""
+    broker, sent, _ = run_day(events, config=config, today=today,
+                              minute_bars={PREVIOUS_DAY: calm_history(45000) if history is None
+                                           else history})
+    return broker, sent
 
 
 def test_a_strong_open_enters_long_once_a_minute_from_0850_as_simulation():
@@ -70,7 +59,7 @@ def test_while_the_conditions_hold_it_enters_once_a_minute_until_0945():
     """08:45 到 09:50 一路強勢。08:50（判斷 08:49 那根）到 09:45（判斷 09:44 那根）每分鐘一口，
     共 56 口；09:46 之後條件 1 不再判斷。加碼上限調高到 100，才看得到 09:45 這條線。"""
     broker, sent = _run(rally("08:45", 66) + [trade(at("09:51:00"), 45760)],
-                        config=_config(max_position=100))
+                        config=make_config(max_position=100))
     times = _times(sent)
     assert len(sent) == 56
     assert (times[0], times[1], times[-1]) == ("08:50:00", "08:51:00", "09:45:00")
@@ -81,7 +70,7 @@ def test_while_the_conditions_hold_it_enters_once_a_minute_until_0945():
 def test_entries_stop_at_the_position_cap():
     """加碼上限 3：08:50、08:51、08:52 各一口，之後條件仍然成立也不再進。"""
     _, sent = _run(rally("08:45", 10) + [trade(at("08:55:00"), 45200)],
-                   config=_config(max_position=3))
+                   config=make_config(max_position=3))
     assert _times(sent) == ["08:50:00", "08:51:00", "08:52:00"]
     assert sent[-1].splitlines()[2] == "累計：多單 3 口，均價 45160"
 
@@ -90,7 +79,7 @@ def test_several_lots_per_entry_are_cut_to_what_is_left_under_the_cap():
     """每次 3 口、加碼上限 5：08:50 進 3 口；08:51 只剩 2 口的空間，進 2 口；之後滿了。
     均價照口數加權：(45150 × 3 + 45160 × 2) ÷ 5 = 225770 ÷ 5 = 45154。"""
     _, sent = _run(rally("08:45", 7) + [trade(at("08:52:00"), 45170)],
-                   config=_config(lots_per_entry=3, max_position=5))
+                   config=make_config(lots_per_entry=3, max_position=5))
     assert sent == [
         "【模擬】PTS 做多：買進微台 3 口 @ 45150\n"
         "觸發：條件 1（早盤做多）\n"
@@ -144,7 +133,7 @@ def test_a_weak_open_enters_short_with_condition_2():
 
 def test_with_discord_switched_off_nothing_is_sent_even_when_entering():
     _, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
-                   config=_config(discord_enabled=False))
+                   config=make_config(discord_enabled=False))
     assert sent == []
 
 
@@ -190,7 +179,7 @@ def test_the_trading_product_does_not_change_when_it_enters(product, name):
         if isinstance(event, ProductTrade):
             event = ProductTrade(event.time, 22000.0)      # 和大台完全不像的價格
         events.append(event)
-    _, sent = _run(events, config=_config(product=product))
+    _, sent = _run(events, config=make_config(product=product))
     assert _times(sent) == ["08:50:00", "08:51:00"]
     assert sent[0].splitlines()[0] == f"【模擬】PTS 做多：買進{name} 1 口 @ 22000"
 
@@ -220,12 +209,11 @@ def test_a_trading_day_without_bars_is_skipped_when_looking_for_yesterday():
     今天開 45100：週四收 45099 → 開高、進場。拿錯成週三（收 45100，開盤價等於昨收）
     或因為週五是空的就放棄，都不會進場。"""
     thursday, wednesday = date(2026, 11, 5), date(2026, 11, 4)
-    broker = FakeBroker(events=rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
-                        minute_bars={PREVIOUS_DAY: [], thursday: calm_history(45099, thursday),
-                                     wednesday: calm_history(45100, wednesday)})
-    notifier = RecordingNotifier()
-    intraday.run(broker, _config(), today=DAY, notify=notifier)
-    assert _times(notifier.sent) == ["08:50:00", "08:51:00"]
+    _, sent, _ = run_day(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
+                         minute_bars={PREVIOUS_DAY: [],
+                                      thursday: calm_history(45099, thursday),
+                                      wednesday: calm_history(45100, wednesday)})
+    assert _times(sent) == ["08:50:00", "08:51:00"]
 
 
 def test_the_rsi_is_carried_over_from_the_previous_day_session():
@@ -247,11 +235,9 @@ def test_the_rsi_is_carried_over_from_the_previous_day_session():
 def test_without_bars_of_the_previous_day_it_records_the_market_but_never_enters(market_dir):
     """查不到昨收與暖身，就判斷不了開高開低與 RSI：今天不進場。但原始行情照樣要記
     （ticket 03 要一週的資料），盤中程式不能因此中止。"""
-    broker = FakeBroker(events=rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
-                        minute_bars_error=QuoteUnavailable("群益訊息3022"))
-    notifier = RecordingNotifier()
-    outcome = intraday.run(broker, _config(), today=DAY, notify=notifier)
-    assert notifier.sent == []
+    _, sent, outcome = run_day(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
+                               minute_bars_error=QuoteUnavailable("群益訊息3022"))
+    assert sent == []
     assert len(outcome.bars) == 6
     assert (market_dir / "TX-20261109.csv").exists()
 

@@ -11,7 +11,7 @@ import time
 import paths
 from housekeeping import purge_old_logs
 
-DAY = 86400
+SECONDS_PER_DAY = 86400
 
 
 def _aged(path: str, *, days_old: float) -> str:
@@ -19,7 +19,7 @@ def _aged(path: str, *, days_old: float) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("x")
-    stamp = time.time() - days_old * DAY
+    stamp = time.time() - days_old * SECONDS_PER_DAY
     os.utime(path, (stamp, stamp))
     return path
 
@@ -57,10 +57,10 @@ def test_a_log_is_kept_for_exactly_30_days_and_removed_one_second_later():
     path = _in_logs("exit-20260921.log", days_old=0)
     os.utime(path, (written, written))
 
-    purge_old_logs(now=written + 30 * DAY)
+    purge_old_logs(now=written + 30 * SECONDS_PER_DAY)
     assert os.path.exists(path), "剛好 30 天的 log 要留著"
 
-    purge_old_logs(now=written + 30 * DAY + 1)
+    purge_old_logs(now=written + 30 * SECONDS_PER_DAY + 1)
     assert not os.path.exists(path), "超過 30 天的 log 要刪掉"
 
 

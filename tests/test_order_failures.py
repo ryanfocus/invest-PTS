@@ -17,15 +17,15 @@ import os
 import pytest
 
 from broker import FillUnknown, OrderFailed
-from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, rally, restarted_at, trade,
-                        until)
-from recording import RecordingNotifier
-from test_live_orders import (_MARKER, CONTRACTS, _config, _file, _locked_once_sent, _on_file,
-                              _run)
+from day_script import (DAY, SENDING_MARKER, at, lock_position_file_once_sent, make_config,
+                        position_content, position_on_file as _file, rally, restarted_at,
+                        run_day, trade, until, write_position_file)
 import intraday
 import paths
 import position_file
+
+# 這個檔的每一輪都打開自動下單
+LIVE = make_config(auto_order_enabled=True)
 
 
 def _all_morning():
@@ -33,13 +33,27 @@ def _all_morning():
     return rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
 
 
+def _run(events, *, config=None, **broker_options):
+    """跑一天（`run_day`，預設自動下單打開），回傳 (broker, 發出的訊息)。"""
+    broker, sent, _ = run_day(events, config=config or LIVE, **broker_options)
+    return broker, sent
+
+
 def _run_outcome(events, **broker_options):
     """同 `_run`，但回傳 (盤中程式的結局, 發出的訊息)：要斷言它跑到劇本結束、沒有中止。"""
-    broker = FakeBroker(contracts=CONTRACTS, events=events,
-                        minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
-    notifier = RecordingNotifier()
-    outcome = intraday.run(broker, _config(), today=DAY, notify=notifier)
-    return outcome, notifier.sent
+    _, sent, outcome = run_day(events, config=LIVE, **broker_options)
+    return outcome, sent
+
+
+def _on_file(**overrides) -> dict:
+    """今天稍早寫下的部位檔：預設是小台多單 2 口 @ 45100（同 test_live_orders），
+    換掉 `overrides` 那幾欄。"""
+    content = position_content(**{
+        "product": "MTX00AM", "order_code": "MTX11",
+        "entries": [{"order_seq": "2315619999999", "lots": 2, "price": 45100.0}],
+        **overrides})
+    write_position_file(content)
+    return content
 
 
 # --- 委託沒有送出去（規格第 51 條）---
@@ -165,7 +179,7 @@ def test_an_uncertain_order_after_earlier_fills_keeps_them_and_says_what_is_know
     成交 1 口。確認過的 2 口照留在明細裡（它們是真的），不確定的這一筆另外記，連同
     已知的 1 口。小台標了當沖，券商 13:30 會強平，所以這則不叫人自己平。"""
     _on_file()
-    broker, sent = _run(_all_morning(), config=_config(lots_per_entry=2), order_errors=[
+    broker, sent = _run(_all_morning(), config=make_config(auto_order_enabled=True, lots_per_entry=2), order_errors=[
         FillUnknown("30 秒內沒等到委託 2315610000001 結束（目前已知成交 1 口，委託 2 口）",
                     order_seq="2315610000001", known_filled=1)])
 
@@ -202,12 +216,12 @@ def test_when_the_order_seq_cannot_be_written_the_file_still_says_uncertain_from
     所以這則要人自己平的是 PTS 今天**全部**的微台部位，和寫進去的時候一樣。委託序號告警裡有，
     對帳用它。今天照樣不再進場，盤中程式也不因此中止。"""
     content = _on_file(product="TM0000AM", order_code="TM2611")
-    _locked_once_sent(monkeypatch)
+    lock_position_file_once_sent(monkeypatch)
     broker, sent = _run(_all_morning(), order_errors=[
         FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
 
     assert len(broker.orders) == 1
-    assert _file() == dict(content, status="UNCERTAIN", uncertain=_MARKER)
+    assert _file() == dict(content, status="UNCERTAIN", uncertain=SENDING_MARKER)
     assert len(sent) == 1
     assert sent[0].splitlines()[3:5] == [
         "部位檔已記為「不確定」（這筆的委託序號沒寫進去：PermissionError: [Errno 13] 存取被拒）："
@@ -223,25 +237,23 @@ def test_when_the_uncertain_state_cannot_be_written_a_restart_still_enters_nothi
     盤中程式重啟。帳上可能已經多了這一筆、口數不知道，告警也說了今天不再進場：重啟後照常加碼
     的話，部位不虧和加碼上限都在少算的口數上判斷。告警當時發過了，重啟不再發。"""
     content = _on_file(product="TM0000AM", order_code="TM2611")
-    replace = os.replace
-    _locked_once_sent(monkeypatch)
-    _run(until(_all_morning(), at("08:50:40")), order_errors=[
-        FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
-    # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
-    monkeypatch.setattr(os, "replace", replace)
+    with monkeypatch.context() as m:        # 重啟時檔案已經不鎖了
+        lock_position_file_once_sent(m)
+        _run(until(_all_morning(), at("08:50:40")), order_errors=[
+            FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")])
 
     broker, sent = _run(restarted_at(_all_morning(), at("08:51:10")))
 
     assert broker.orders == []
     assert sent == []
-    assert _file() == dict(content, status="UNCERTAIN", uncertain=_MARKER)
+    assert _file() == dict(content, status="UNCERTAIN", uncertain=SENDING_MARKER)
 
 
 def test_when_the_first_order_is_uncertain_and_cannot_be_written_the_file_still_says_uncertain(
         monkeypatch):
     """今天第一筆就不確定、序號又寫不進去：部位檔是送單前記下的「不確定」、還沒有成交。出場程式
     看到它不平倉、會告警；這筆要人自己平。"""
-    _locked_once_sent(monkeypatch)
+    lock_position_file_once_sent(monkeypatch)
     outcome, sent = _run_outcome(_all_morning(), order_errors=[FillUnknown("回報斷了")])
 
     assert outcome.ending is intraday.Ending.STREAM_ENDED
@@ -267,7 +279,7 @@ def test_each_situation_is_told_by_its_own_fixed_wording_and_never_the_others(
     完全不同。所以每一則的標題帶著自己的說法，全文也不會出現另外兩種的說法。"""
     options = dict(SITUATIONS[phrase])
     if options.pop("locked", False):
-        _locked_once_sent(monkeypatch)
+        lock_position_file_once_sent(monkeypatch)
     _, sent = _run(_all_morning(), **options)
 
     assert len(sent) == 1

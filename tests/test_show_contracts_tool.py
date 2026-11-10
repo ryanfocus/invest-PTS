@@ -8,11 +8,10 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import date
 
 import pytest
 
-from broker import MTX_CODE, TMF_CODE, TX_CODE, ContractInfo
+from day_script import contracts
 from conftest import REPO_ROOT
 
 TOOL = os.path.join(REPO_ROOT, "tools", "show_contracts.py")
@@ -65,12 +64,7 @@ def test_a_tampered_tool_refuses_to_start_before_doing_anything_else(tmp_path):
 
 
 def test_the_printout_shows_each_products_order_code_and_last_trading_day():
-    contracts = {
-        TX_CODE: ContractInfo(TX_CODE, date(2026, 11, 18), "TX11"),
-        MTX_CODE: ContractInfo(MTX_CODE, date(2026, 11, 18), "MTX11"),
-        TMF_CODE: ContractInfo(TMF_CODE, date(2026, 11, 18), "TM2611"),
-    }
-    lines = show_contracts.format_contracts(contracts).splitlines()
+    lines = show_contracts.format_contracts(contracts()).splitlines()
     for name, code in (("大台", "TX11"), ("小台", "MTX11"), ("微台", "TM2611")):
         line = next(ln for ln in lines if name in ln)
         assert code in line and "2026/11/18" in line

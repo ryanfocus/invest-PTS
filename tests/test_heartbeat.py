@@ -13,22 +13,13 @@ from datetime import date
 
 import pytest
 
-from broker import SELL, TMF_CODE, Clock
+from broker import SELL, Clock
 from broker.fake import FakeBroker
-from day_script import DAY, PREVIOUS_DAY, at, calm_history, clock, rally, trade, whole_morning
+from day_script import (DAY, PREVIOUS_DAY, at, clock, make_config, position_content, rally,
+                        run_day, trade, whole_morning, write_position_file)
 from recording import RecordingNotifier
 import exit_program
-import intraday
 import paths
-import position_file
-import settings
-
-
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=True, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
 
 
 def _exit(when: str = "13:25", day: date = DAY, **broker_options) -> tuple[FakeBroker, list[str]]:
@@ -37,33 +28,20 @@ def _exit(when: str = "13:25", day: date = DAY, **broker_options) -> tuple[FakeB
     broker = FakeBroker(**broker_options)
     notifier = RecordingNotifier()
     now = at(f"{when}:00", day)
-    exit_program.run(broker, _config(), notify=notifier, clock=lambda: now,
+    exit_program.run(broker, make_config(auto_order_enabled=True), notify=notifier,
+                     clock=lambda: now,
                      sleep=lambda seconds: None)
     return broker, notifier.sent
 
 
 def _intraday(events, *, config=None, **broker_options) -> tuple[FakeBroker, list[str]]:
-    broker = FakeBroker(events=events, minute_bars={PREVIOUS_DAY: calm_history(45000)},
-                        **broker_options)
-    notifier = RecordingNotifier()
-    intraday.run(broker, config or _config(auto_order_enabled=False), today=DAY,
-                 notify=notifier)
-    return broker, notifier.sent
+    broker, sent, _ = run_day(events, config=config, **broker_options)
+    return broker, sent
 
 
 def _micro_on_file() -> None:
-    """盤中程式今天寫下的部位檔：微台多單 1 口。"""
-    content = {
-        "trading_day": "2026-11-09", "product": "TM0000AM", "order_code": "TM2611",
-        "contract_month": "202611", "direction": "LONG", "last_trading_day": "2026-11-18",
-        "status": "CONFIRMED",
-        "entries": [{"order_seq": "2315609990001", "lots": 1, "price": 45100.0}],
-        "exits": [], "uncertain": None,
-    }
-    path = position_file.path_for(DAY)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(content, fh, ensure_ascii=False)
+    """盤中程式今天寫下的部位檔：微台多單 1 口（`position_content` 的預設）。"""
+    write_position_file(position_content())
 
 
 # --- 盤中程式今天沒有跑 ---
@@ -169,7 +147,7 @@ def test_when_the_position_file_stops_the_intraday_program_only_that_is_reported
     """部位檔讀不懂：盤中程式一開始就告警、今天不進場（ticket 06），不登入、也收不到任何事件。
     那是它自己下的結論，不是當掉——出場程式照樣講部位檔讀不懂（它自己也讀不懂），但不再多講
     一則「盤中程式沒有跑」，同一件事講兩次，第二則還講錯原因。"""
-    _write_position_file("{寫到一半")
+    write_position_file("{寫到一半")
     _, sent = _intraday([], login_error=AssertionError("部位檔讀不懂時不該登入"))
     assert [m.splitlines()[0] for m in sent] == [
         "【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場"]
@@ -208,23 +186,14 @@ def test_a_heartbeat_write_that_fails_midway_leaves_the_previous_one_intact(step
     _intraday(_morning_until("10:00:30"))
     before = _heartbeat()
 
-    original = getattr(os, step)
-    monkeypatch.setattr(os, step, _denied)
-    _intraday([e for e in whole_morning() if at("10:05:00") <= e.time <= at("10:07:30")])
-    # 出場程式時已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
-    monkeypatch.setattr(os, step, original)
+    with monkeypatch.context() as m:        # 出場程式時已經不鎖了
+        m.setattr(os, step, _denied)
+        _intraday([e for e in whole_morning() if at("10:05:00") <= e.time <= at("10:07:30")])
 
     assert _heartbeat() == before
     assert [n for n in os.listdir(paths.state_dir()) if n.endswith(".tmp")] == []
     _, sent = _exit()
     assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 盤中程式今天 10:00 之後就沒有再跑"]
-
-
-def _write_position_file(text: str) -> None:
-    path = position_file.path_for(DAY)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
 
 
 def _morning_until(hhmmss: str) -> list:

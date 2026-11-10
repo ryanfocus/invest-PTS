@@ -17,13 +17,12 @@ import pytest
 
 from broker import BUY, SELL, TMF_CODE, FillQuery, FillUnknown, LoginFailed, OrderFailed
 from broker.fake import FakeBroker
+from day_script import (DAY, SETTLEMENT_DAY, make_config, position_content,
+                        position_on_file as _file, write_position_file)
 from recording import RecordingNotifier
 import exit_program
 import heartbeat
 import position_file
-import settings
-
-DAY = date(2026, 11, 9)          # 週一，一般交易日；近月 11/18 結算
 
 
 def _intraday_ran(day: date) -> None:
@@ -40,11 +39,8 @@ def intraday_ran_today(state_dir):
     _intraday_ran(DAY)
 
 
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=True, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
+# 今天進場用的設定：自動下單打開（部位檔只有真實下單才會寫）
+LIVE = make_config(auto_order_enabled=True)
 
 
 class _Time:
@@ -72,37 +68,20 @@ def _run(*, at: datetime | None = None, config=None, **broker_options):
     broker = FakeBroker(**broker_options)
     notifier = RecordingNotifier()
     time = _Time(at or _at("13:25"))
-    exit_program.run(broker, config or _config(), notify=notifier, clock=time.clock,
+    exit_program.run(broker, config or LIVE, notify=notifier, clock=time.clock,
                      sleep=time.sleep)
     return broker, notifier.sent, time
 
 
 def _on_file(day: date = DAY, **overrides) -> dict:
-    """盤中程式今天寫下的部位檔：微台多單 3 口（兩筆委託：2 口 @ 45100、1 口 @ 45150）。"""
-    content = {
-        "trading_day": f"{day:%Y-%m-%d}",
-        "product": "TM0000AM",
-        "order_code": "TM2611",
-        "contract_month": "202611",
-        "direction": "LONG",
-        "last_trading_day": "2026-11-18",
-        "status": "CONFIRMED",
+    """盤中程式今天寫下的部位檔：微台多單 3 口（兩筆委託：2 口 @ 45100、1 口 @ 45150），
+    換掉 `overrides` 那幾欄。回傳內容。"""
+    content = position_content(day, **{
         "entries": [{"order_seq": "2315609990001", "lots": 2, "price": 45100.0},
                     {"order_seq": "2315609990002", "lots": 1, "price": 45150.0}],
-        "exits": [],
-        "uncertain": None,
-    }
-    content.update(overrides)
-    path = position_file.path_for(day)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(content, fh, ensure_ascii=False)
+        **overrides})
+    write_position_file(content, day)
     return content
-
-
-def _file(day: date = DAY) -> dict:
-    with open(position_file.path_for(day), encoding="utf-8") as fh:
-        return json.load(fh)
 
 
 def _orders(broker: FakeBroker) -> list[tuple]:
@@ -193,7 +172,7 @@ def test_the_settings_say_tx_but_the_file_says_micro_so_micro_is_closed():
     """使用者盤中把設定改成大台。今天的部位是微台，照部位檔平微台。
     照設定檔的話，微台什麼都不平就過夜了。"""
     _on_file()
-    broker, _, _ = _run(config=_config(product="TX00AM"))
+    broker, _, _ = _run(config=make_config(auto_order_enabled=True, product="TX00AM"))
     assert _orders(broker) == [("TM2611", SELL, 3, False, DAY)]
 
 
@@ -201,7 +180,7 @@ def test_the_settings_say_micro_but_the_file_says_mtx_so_nothing_is_sent():
     """反過來：設定改成微台，今天的部位是小台。照設定檔的話，會對一個沒有部位的微台送
     賣單——開出一口空單過夜；同時小台又被券商強平。"""
     content = _on_file(product="MTX00AM", order_code="MTX11")
-    broker, sent, _ = _run(config=_config(product=TMF_CODE))
+    broker, sent, _ = _run(config=make_config(auto_order_enabled=True, product=TMF_CODE))
     assert broker.orders == []
     assert sent == []
     assert _file() == content
@@ -240,13 +219,6 @@ def test_on_a_non_trading_day_it_does_not_log_in_and_does_nothing():
 # --- 部位檔讀不懂：不送單，告警（規格第 38 條）---
 
 
-def _damaged(text: str) -> None:
-    path = position_file.path_for(DAY)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-
-
 @pytest.mark.parametrize("text", [
     '{"trading_day": "2026-11-09", "product": "TM00',
     "",
@@ -255,7 +227,7 @@ def _damaged(text: str) -> None:
 def test_a_position_file_that_cannot_be_read_sends_nothing_and_says_so(text):
     """讀不懂就不知道帳上有沒有部位、有幾口、是哪個商品。照猜的口數平倉，平多了就是反向
     新倉；當成沒有部位，微台就過夜。所以一張單都不送，請人看帳戶；檔案原封不動。"""
-    _damaged(text)
+    write_position_file(text)
     broker, sent, _ = _run(login_error=AssertionError("讀不懂部位檔不該登入"))
     assert broker.orders == []
     assert len(sent) == 1
@@ -275,7 +247,7 @@ def test_a_position_file_that_cannot_be_read_sends_nothing_and_says_so(text):
 def test_a_position_file_that_cannot_be_read_after_the_close_points_to_the_night_session():
     """13:50 才補跑、部位檔又讀不懂：日盤已經收盤，要人做的事是夜盤（規格第 55 條）。
     讀不懂就不知道今天是不是結算日，兩種都講。"""
-    _damaged("")
+    write_position_file("")
     broker, sent, _ = _run(at=_at("13:50"))
     assert broker.orders == []
     assert sent[0].splitlines()[2] == (
@@ -477,23 +449,20 @@ def test_tx_and_mtx_are_quiet_even_after_the_close(product, order_code):
 
 # --- 結算日的微台：近月 13:30 停止交易，之後由交易所以最後結算價了結 ---
 
-SETTLEMENT = date(2026, 11, 18)
-
-
 def test_on_the_settlement_day_the_micro_position_is_closed_before_1330():
-    _intraday_ran(SETTLEMENT)
-    _on_file(SETTLEMENT, last_trading_day="2026-11-18")
-    broker, sent, _ = _run(at=_at("13:25", SETTLEMENT))
-    assert _orders(broker) == [("TM2611", SELL, 3, False, SETTLEMENT)]
+    _intraday_ran(SETTLEMENT_DAY)
+    _on_file(SETTLEMENT_DAY, last_trading_day="2026-11-18")
+    broker, sent, _ = _run(at=_at("13:25", SETTLEMENT_DAY))
+    assert _orders(broker) == [("TM2611", SELL, 3, False, SETTLEMENT_DAY)]
     assert sent == []
 
 
 def test_on_the_settlement_day_the_alert_gives_1330_as_the_deadline():
     """結算日 13:28 重試用完。近月 13:30 就停止交易：告警照一般日寫「日盤 13:45 收盤」的話，
     使用者以為還有 17 分鐘，其實只剩 2 分鐘，13:30 之後 TM2611 就不能交易了。"""
-    _intraday_ran(SETTLEMENT)
-    _on_file(SETTLEMENT, last_trading_day="2026-11-18")
-    broker, sent, _ = _run(at=_at("13:25", SETTLEMENT),
+    _intraday_ran(SETTLEMENT_DAY)
+    _on_file(SETTLEMENT_DAY, last_trading_day="2026-11-18")
+    broker, sent, _ = _run(at=_at("13:25", SETTLEMENT_DAY),
                            order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 4
     assert sent[0].splitlines()[2] == (
@@ -510,9 +479,9 @@ def test_on_the_settlement_day_after_1330_the_exchange_settles_what_is_left():
     """結算日 13:30 之後近月已經停止交易，送出去只會被拒，所以不送。PTS 的微台還是沒有平掉
     （規格第 34、38 條：最後仍有剩餘就告警）：講明還剩幾口、為什麼不必也不能自己平，
     以及結算後要確認什麼——損益照最後結算價算，和回測有落差。部位檔原封不動。"""
-    _intraday_ran(SETTLEMENT)
-    content = _on_file(SETTLEMENT, last_trading_day="2026-11-18")
-    broker, sent, _ = _run(at=_at("13:35", SETTLEMENT),
+    _intraday_ran(SETTLEMENT_DAY)
+    content = _on_file(SETTLEMENT_DAY, last_trading_day="2026-11-18")
+    broker, sent, _ = _run(at=_at("13:35", SETTLEMENT_DAY),
                            login_error=AssertionError("近月停止交易後不該登入"))
     assert broker.orders == []
     assert sent == [
@@ -521,15 +490,15 @@ def test_on_the_settlement_day_after_1330_the_exchange_settles_what_is_left():
         f"{_SETTLED_BY_EXCHANGE}\n"
         "2026/11/18 13:35:00",
     ]
-    assert _file(SETTLEMENT) == content
+    assert _file(SETTLEMENT_DAY) == content
 
 
 def test_on_the_settlement_day_retries_stop_at_1330():
     """13:29 第一次被拒，一分鐘後已經 13:30：近月停止交易，不再重試。沒平掉的照樣告警——
     同一個失敗，13:25 開始的話 13:28 會告警，晚兩分鐘開始就不講，是說不通的。"""
-    _intraday_ran(SETTLEMENT)
-    _on_file(SETTLEMENT, last_trading_day="2026-11-18")
-    broker, sent, _ = _run(at=_at("13:29", SETTLEMENT),
+    _intraday_ran(SETTLEMENT_DAY)
+    _on_file(SETTLEMENT_DAY, last_trading_day="2026-11-18")
+    broker, sent, _ = _run(at=_at("13:29", SETTLEMENT_DAY),
                            order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 1
     assert sent[0].splitlines()[1:4] == [
@@ -606,7 +575,7 @@ def test_killed_while_looking_up_an_exit_order_it_is_never_sent_again():
     _on_file()
     first = _KilledDuringLookup(fill_price=45200.0, order_errors=[_SENT_BUT_UNKNOWN])
     with pytest.raises(_Killed):
-        exit_program.run(first, _config(), notify=RecordingNotifier(),
+        exit_program.run(first, LIVE, notify=RecordingNotifier(),
                          clock=lambda: _at("13:25"), sleep=lambda seconds: None)
     assert len(first.orders) == 1
 
@@ -661,7 +630,7 @@ def test_with_auto_order_off_a_micro_position_on_file_is_reported_not_closed():
     """模擬模式不寫部位檔，所以「開關關著卻有部位檔」代表使用者今天進場之後把它關掉了。
     關掉就是不要程式碰下單 API：不登入、不送單。但微台沒人平就過夜，一定要講。"""
     content = _on_file()
-    broker, sent, _ = _run(config=_config(auto_order_enabled=False),
+    broker, sent, _ = _run(config=make_config(),
                            login_error=AssertionError("自動下單關閉時不該登入"))
     assert broker.orders == []
     assert sent == [
@@ -676,7 +645,7 @@ def test_with_auto_order_off_a_micro_position_on_file_is_reported_not_closed():
 
 def test_with_auto_order_off_and_no_position_file_it_stays_quiet():
     """模擬模式的平常一天。"""
-    broker, sent, _ = _run(config=_config(auto_order_enabled=False))
+    broker, sent, _ = _run(config=make_config())
     assert broker.orders == []
     assert sent == []
 
@@ -777,9 +746,7 @@ def test_a_day_whose_exit_program_already_raised_the_alarm_is_not_reported_again
 def test_a_missed_day_whose_position_file_cannot_be_read_is_reported_and_today_still_exits():
     """週一的部位檔讀不懂、週一的出場程式又沒跑：不知道那天有沒有微台，照實講（規格第 38 條）。
     今天的出場照常——一份舊檔讀不懂，不能讓今天的微台也跟著過夜。"""
-    path = position_file.path_for(DAY)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("{寫到一半")
+    write_position_file("{寫到一半")
     _intraday_ran(TUESDAY)
     _on_file(TUESDAY, entries=_lots(1))
 
@@ -825,7 +792,7 @@ def test_tx_and_mtx_on_a_missed_day_were_closed_by_the_broker_and_need_no_word(p
 
 def test_with_discord_off_the_position_is_still_closed_and_nothing_is_sent():
     _on_file()
-    broker, sent, _ = _run(config=_config(discord_enabled=False),
+    broker, sent, _ = _run(config=make_config(auto_order_enabled=True, discord_enabled=False),
                            order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 4
     assert sent == []

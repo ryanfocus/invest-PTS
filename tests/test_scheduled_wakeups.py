@@ -10,50 +10,29 @@
 斷言送出的委託、發出的訊息，以及有沒有登入（假 broker 的登入一被呼叫就讓測試失敗）。
 """
 
-import os
-
-from broker import TMF_CODE, LoginFailed, LoginUnavailable
+from broker import LoginFailed, LoginUnavailable
 from broker.fake import FakeBroker
-from day_script import DAY, PREVIOUS_DAY, at, calm_history, contracts, whole_morning
+from day_script import DAY, PREVIOUS_DAY, at, make_config, run_day, whole_morning, write_position_file
 from recording import RecordingNotifier
 import exit_program
 import heartbeat
 import intraday
-import position_file
-import settings
-
-
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=False, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
 
 
 def _wake(events=(), *, day=DAY, **broker_options):
-    """排程叫醒盤中程式一次。回傳 (發出的訊息, 結果)。"""
-    broker = FakeBroker(contracts=contracts(), events=events,
-                        minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
-    notifier = RecordingNotifier()
-    outcome = intraday.run(broker, _config(), today=day, notify=notifier)
-    return notifier.sent, outcome
+    """排程叫醒盤中程式一次（`run_day`）。回傳 (發出的訊息, 結果)。"""
+    _, sent, outcome = run_day(events, today=day, **broker_options)
+    return sent, outcome
 
 
 def _must_not_log_in(why: str) -> AssertionError:
     return AssertionError(why)
 
 
-def _write_position_file(text: str) -> None:
-    path = position_file.path_for(DAY)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-
-
 def test_after_giving_up_on_an_unreadable_position_file_the_next_wake_up_stays_quiet():
     """部位檔讀不懂：盤中程式告警、今天不進場（ticket 06）。一分鐘後排程又叫醒它，檔案
     還是讀不懂——再告警一次的話，到 13:20 就是兩百多則同樣的訊息。"""
-    _write_position_file("{寫到一半")
+    write_position_file("{寫到一半")
     sent, _ = _wake(login_error=_must_not_log_in("部位檔讀不懂時不該登入"))
     assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場"]
 
@@ -113,7 +92,7 @@ def test_a_failed_login_still_shows_up_at_1325_as_the_intraday_program_not_runni
     _wake(login_error=_must_not_log_in("今天登入失敗過，不該再登入"))
 
     notifier = RecordingNotifier()
-    exit_program.run(FakeBroker(), _config(), notify=notifier, clock=lambda: at("13:25:00"),
+    exit_program.run(FakeBroker(), make_config(), notify=notifier, clock=lambda: at("13:25:00"),
                      sleep=lambda seconds: None)
     assert [m.splitlines()[0] for m in notifier.sent] == ["【要你處理】PTS 盤中程式今天沒有跑"]
 

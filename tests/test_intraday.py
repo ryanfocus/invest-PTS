@@ -6,24 +6,18 @@
 
 from datetime import date
 
-from broker import TMF_CODE
 from broker.fake import FakeBroker
-from day_script import at, clock, counts, product_trade, trade, whole_morning
+from day_script import DAY, at, clock, counts, make_config, product_trade, trade, whole_morning
 from recording import RecordingNotifier
 import intraday
-import settings
 
-TRADING_DAY = date(2026, 11, 9)      # 週一
 SATURDAY = date(2026, 11, 7)
 
 
-def _config(product: str = TMF_CODE) -> settings.Config:
-    return settings.Config(auto_order_enabled=False, product=product, lots_per_entry=1,
-                           max_position=20, discord_enabled=False)
-
-
-def _run(broker: FakeBroker, today: date = TRADING_DAY) -> intraday.SessionOutcome:
-    return intraday.run(broker, _config(), today=today, notify=RecordingNotifier())
+def _run(broker: FakeBroker, today: date = DAY) -> intraday.SessionOutcome:
+    """這個檔看的是 K 棒與原始行情，不是訊息：Discord 關著。"""
+    return intraday.run(broker, make_config(discord_enabled=False), today=today,
+                        notify=RecordingNotifier())
 
 
 # --- 一整個上午 ---
@@ -155,7 +149,7 @@ def test_each_bar_records_the_bichai_as_of_its_end():
     assert _bichai(outcome) == [("08:45", 220), ("08:46", 140)]
 
 
-def _raw_lines(market_dir, day: date = TRADING_DAY) -> list[str]:
+def _raw_lines(market_dir, day: date = DAY) -> list[str]:
     path = market_dir / f"TX-{day:%Y%m%d}.csv"
     return path.read_text(encoding="utf-8").splitlines()
 
@@ -195,7 +189,7 @@ def test_a_restart_on_the_same_day_appends_to_that_days_raw_file(market_dir):
 
 # --- 報價交易日（規格第 10 條）---
 
-FRIDAY = date(2026, 11, 6)           # TRADING_DAY 的前一個交易日
+FRIDAY = date(2026, 11, 6)           # DAY 的前一個交易日
 
 
 def test_quotes_from_the_previous_trading_day_end_the_session_without_bars_or_a_raw_file(

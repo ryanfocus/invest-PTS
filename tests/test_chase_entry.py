@@ -12,30 +12,16 @@ from datetime import date
 
 import pytest
 
-from broker import TMF_CODE, TX_CODE, ProductListUnavailable
-from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, SETTLEMENT_DAY, at, calm_history, clock, contracts,
-                        minute, product_trade, rally, trade, trading_tx)
-from recording import RecordingNotifier
-import intraday
-import settings
-
-
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=False, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
+from broker import TX_CODE, ProductListUnavailable
+from day_script import (SETTLEMENT_DAY, at, clock, contracts, make_config, minute, product_trade,
+                        rally, run_day, trade, trading_tx)
 
 
 def _run(events, *, config=None, last_trading_day: date = SETTLEMENT_DAY):
-    """跑 DAY（週一）這一天，回傳 (broker, 發出的訊息)。前一個交易日平淡、收 45000；
-    商品清單的最後交易日預設在下週三，今天不在結算週。"""
-    broker = FakeBroker(events=events, minute_bars={PREVIOUS_DAY: calm_history(45000)},
-                        contracts=contracts(last_trading_day))
-    notifier = RecordingNotifier()
-    intraday.run(broker, config or _config(), today=DAY, notify=notifier)
-    return broker, notifier.sent
+    """跑 DAY（週一）這一天（`run_day`），回傳 (broker, 發出的訊息)。商品清單的最後交易日
+    預設在下週三，今天不在結算週。"""
+    broker, sent, _ = run_day(events, config=config, contracts=contracts(last_trading_day))
+    return broker, sent
 
 
 # 每一天的劇本都從 08:50 條件 1 在 45150 進的第一口開始：已經持有多單，條件 3 才有意義。
@@ -145,7 +131,7 @@ def test_trading_tx_fills_at_the_very_trade_that_triggered_the_entry():
                         + minute("10:01", 45170, 45175, bichai=1600)
                         + minute("10:02", 45175, 45180, bichai=1600)
                         + [trade(at("10:03:00"), 45185)])
-    broker, sent = _run(events, config=_config(product=TX_CODE))
+    broker, sent = _run(events, config=make_config(product=TX_CODE))
     assert sent == [
         "【模擬】PTS 做多：買進大台 1 口 @ 45155\n"
         "觸發：條件 1（早盤做多）\n"
@@ -233,7 +219,7 @@ def test_a_strong_day_adds_all_the_way_to_the_cap():
     突破進場：觸發價是上一根的最高點（收盤價），下一根一開盤就碰到，09:46、09:47、09:48、
     09:49 各進一口，到加碼上限 60 口為止；之後到 10:00 一路照樣強勢，不再進場。"""
     broker, sent = _run(rally("08:45", 76, bichai_step=100) + [trade(at("10:01:00"), 45860)],
-                        config=_config(max_position=60))
+                        config=make_config(max_position=60))
     times = _times(sent)
     assert len(sent) == 60
     assert (times[0], times[55], times[56], times[-1]) == ("08:50:00", "09:45:00", "09:46:00",
@@ -263,7 +249,7 @@ def test_a_breakout_fills_only_what_was_left_under_the_cap_when_it_was_set():
               + minute("10:01", 45220, 45225, bichai=1600)
               + minute("10:02", 45225, 45230, bichai=1600)
               + [trade(at("10:03:00"), 45235)])
-    broker, sent = _run(events, config=_config(lots_per_entry=3, max_position=20))
+    broker, sent = _run(events, config=make_config(lots_per_entry=3, max_position=20))
     assert _times(sent) == ["08:50:00", "08:51:00", "08:52:00", "08:53:00", "08:54:00",
                             "08:55:00", "10:02:30"]
     assert sent[-1] == ("【模擬】PTS 做多：買進微台 2 口 @ 45225\n"
@@ -290,8 +276,6 @@ def test_in_the_settlement_week_only_conditions_1_and_2_enter(events, last_tradi
 
 def test_without_the_product_list_conditions_3_and_4_are_off_but_1_and_2_are_not():
     """商品清單查不到，就不知道今天是不是結算週：條件 3、4 停用，條件 1、2 照常。"""
-    broker = FakeBroker(events=_breakout_day(), minute_bars={PREVIOUS_DAY: calm_history(45000)},
-                        contracts_error=ProductListUnavailable("10 秒內未取得完整商品清單"))
-    notifier = RecordingNotifier()
-    intraday.run(broker, _config(), today=DAY, notify=notifier)
-    assert notifier.sent == [FIRST_LOT]
+    _, sent, _ = run_day(_breakout_day(),
+                         contracts_error=ProductListUnavailable("10 秒內未取得完整商品清單"))
+    assert sent == [FIRST_LOT]

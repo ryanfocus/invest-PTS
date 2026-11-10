@@ -10,6 +10,10 @@ import pytest
 
 import settings
 from conftest import REPO_ROOT
+from day_script import make_config
+
+# 自動下單打開：期貨帳號也要
+LIVE = make_config(auto_order_enabled=True)
 
 FULL = (
     "# 註解\n"
@@ -21,13 +25,6 @@ FULL = (
 )
 
 
-def _config(**overrides) -> settings.Config:
-    base = dict(auto_order_enabled=True, product="TM0000AM", lots_per_entry=1,
-                max_position=20, discord_enabled=True)
-    base.update(overrides)
-    return settings.Config(**base)
-
-
 def _env(tmp_path, text: str) -> str:
     path = tmp_path / ".env"
     path.write_text(text, encoding="utf-8")
@@ -35,7 +32,7 @@ def _env(tmp_path, text: str) -> str:
 
 
 def test_all_four_values_are_read(tmp_path):
-    secrets = settings.load_secrets(_config(), path=_env(tmp_path, FULL))
+    secrets = settings.load_secrets(LIVE, path=_env(tmp_path, FULL))
     assert secrets.user_id == "A100000000"
     assert secrets.password == "not-a-real-password"
     assert secrets.futures_account == "F0000000000000"
@@ -45,7 +42,7 @@ def test_all_four_values_are_read(tmp_path):
 def test_every_missing_value_is_named_at_once(tmp_path):
     """一次列完，不是修好一個才發現還有下一個。"""
     with pytest.raises(settings.SettingsError) as exc:
-        settings.load_secrets(_config(), path=_env(tmp_path, "CAPITAL_USER_ID=A100000000\n"))
+        settings.load_secrets(LIVE, path=_env(tmp_path, "CAPITAL_USER_ID=A100000000\n"))
     for name in ("CAPITAL_PASSWORD", "CAPITAL_FUTURES_ACCOUNT", "DISCORD_WEBHOOK_URL"):
         assert name in str(exc.value)
     assert "CAPITAL_USER_ID" not in str(exc.value)
@@ -54,20 +51,20 @@ def test_every_missing_value_is_named_at_once(tmp_path):
 def test_an_empty_value_counts_as_missing(tmp_path):
     """`.env.example` 複製過來沒填，每一行都是 `NAME=`。"""
     with pytest.raises(settings.SettingsError, match="CAPITAL_PASSWORD"):
-        settings.load_secrets(_config(), path=_env(tmp_path, FULL.replace(
+        settings.load_secrets(LIVE, path=_env(tmp_path, FULL.replace(
             "CAPITAL_PASSWORD=not-a-real-password", "CAPITAL_PASSWORD=")))
 
 
 def test_simulation_mode_does_not_need_a_futures_account(tmp_path):
     """模擬模式完全不碰下單 API，沒有期貨帳號也能跑——上線前就是這樣驗證的。"""
     text = FULL.replace("CAPITAL_FUTURES_ACCOUNT=F0000000000000\n", "")
-    secrets = settings.load_secrets(_config(auto_order_enabled=False), path=_env(tmp_path, text))
+    secrets = settings.load_secrets(make_config(), path=_env(tmp_path, text))
     assert secrets.futures_account == ""
 
 
 def test_no_webhook_is_needed_when_discord_is_off(tmp_path):
     text = FULL.replace("DISCORD_WEBHOOK_URL=https://discord.example/api/webhooks/1/token\n", "")
-    secrets = settings.load_secrets(_config(discord_enabled=False), path=_env(tmp_path, text))
+    secrets = settings.load_secrets(make_config(auto_order_enabled=True, discord_enabled=False), path=_env(tmp_path, text))
     assert secrets.discord_webhook == ""
 
 
@@ -80,19 +77,19 @@ def test_the_read_only_tool_only_needs_the_login(tmp_path):
 
 def test_a_missing_file_says_how_to_create_it(tmp_path):
     with pytest.raises(settings.SettingsError, match=r"\.env\.example"):
-        settings.load_secrets(_config(), path=str(tmp_path / ".env"))
+        settings.load_secrets(LIVE, path=str(tmp_path / ".env"))
 
 
 def test_a_name_that_is_only_a_prefix_is_not_matched(tmp_path):
     """讀 CAPITAL_USER_ID 不可以撈到 CAPITAL_USER_ID_OLD 的值。"""
     text = "CAPITAL_USER_ID_OLD=wrong\n" + FULL
-    assert settings.load_secrets(_config(), path=_env(tmp_path, text)).user_id == "A100000000"
+    assert settings.load_secrets(LIVE, path=_env(tmp_path, text)).user_id == "A100000000"
 
 
 def test_the_password_and_webhook_never_show_up_in_a_printout(tmp_path):
     """設定物件常被印進 log 或錯誤訊息。webhook 的 token 等於發訊權限，
     密碼等於下單權限——invest-os 曾經把 webhook token 寫進日誌（2026-09）。"""
-    secrets = settings.load_secrets(_config(), path=_env(tmp_path, FULL))
+    secrets = settings.load_secrets(LIVE, path=_env(tmp_path, FULL))
     shown = repr(secrets) + str(secrets)
     assert "not-a-real-password" not in shown
     assert "token" not in shown

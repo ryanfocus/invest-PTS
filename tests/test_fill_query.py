@@ -27,7 +27,7 @@ import pytest
 from broker import FillQuery, FillUnknown, OrderRequest, TMF_CODE, ContractInfo, SELL
 from broker.capital import CapitalBroker
 from broker.capital_wire import ReportUnreadable, parse_fills, parse_order_book_no
-from fake_skcom import FakeSkcom, silence
+from fake_skcom import FakeSkcom, capital_broker, silence
 
 CRLF = "\r\n"            # 群益查詢回傳的換行
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -233,10 +233,8 @@ def test_a_query_error_in_the_fulfill_report_is_a_failure():
 
 def _broker(skcom: FakeSkcom, **kwargs) -> CapitalBroker:
     """`sleep` 記進 skcom.calls，才看得出它夾在兩段查詢的哪裡。"""
-    kwargs.setdefault("account", "F0000000000000")
-    broker = CapitalBroker("A100000000", "pw", com=skcom, settle_seconds=0, fill_timeout=0.2,
-                           sleep=lambda s: skcom.calls.append(("time", "sleep", (s,))),
-                           **kwargs)
+    broker = capital_broker(skcom, fill_timeout=0.2,
+                            sleep=lambda s: skcom.calls.append(("time", "sleep", (s,))), **kwargs)
     broker.login()
     return broker
 

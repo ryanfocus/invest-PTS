@@ -14,14 +14,13 @@ import pytest
 
 from broker import MinuteBar, QuoteUnavailable
 from broker.capital import CapitalBroker
-from fake_skcom import FakeSkcom
+from fake_skcom import FakeSkcom, capital_broker
 
 FRIDAY = date(2026, 11, 6)
 
 
 def _broker(skcom: FakeSkcom) -> CapitalBroker:
-    broker = CapitalBroker("A100000000", "pw", "F0000000000000", com=skcom, settle_seconds=0,
-                           connect_timeout=0.2, pump_interval=0)
+    broker = capital_broker(skcom, connect_timeout=0.2)
     broker.login()
     return broker
 

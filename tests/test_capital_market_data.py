@@ -13,24 +13,13 @@ import pytest
 from broker import (TMF_CODE, TX_CODE, Clock, ProductTrade, QuoteUnavailable, TxTrade,
                     TxTradeCounts)
 from broker.capital import CapitalBroker
-from fake_skcom import MTX_INDEX, TMF_INDEX, TX_INDEX, FakeSkcom
-
-
-class _Ticking:
-    """本機時鐘的替身：每被問一次就往前走 `step`。"""
-
-    def __init__(self, start: datetime, step: timedelta):
-        self._t, self._step = start, step
-
-    def __call__(self) -> datetime:
-        t, self._t = self._t, self._t + self._step
-        return t
+from fake_skcom import (MTX_INDEX, TMF_INDEX, TX_INDEX, FakeSkcom, TickingClock, capital_broker,
+                        tick_event, trade_info_event)
 
 
 def _broker(skcom: FakeSkcom, now=None) -> CapitalBroker:
-    broker = CapitalBroker("A100000000", "pw", "F0000000000000", com=skcom, settle_seconds=0,
-                           pump_interval=0,
-                           now=now or _Ticking(datetime(2026, 11, 9, 8, 40), timedelta(0.1)))
+    broker = capital_broker(
+        skcom, now=now or TickingClock(datetime(2026, 11, 9, 8, 40), timedelta(0.1)))
     broker.login()
     return broker
 
@@ -45,19 +34,11 @@ def _market(stream) -> list:
     return [e for e in islice(stream, 200) if not isinstance(e, Clock)]
 
 
-def _tick(index: int, ymd: int, hhmmss: int, close: int, *, simulate: int = 0,
-          history: bool = False) -> tuple:
-    """`OnNotifyTicksLONG`／`OnNotifyHistoryTicksLONG` 的參數（兩者完全相同，文件 4-4-l／m）。"""
-    name = "OnNotifyHistoryTicksLONG" if history else "OnNotifyTicksLONG"
-    #       sMarketNo nIndex nPtr nDate nTimehms nTimemillismicros nBid nAsk nClose nQty nSimulate
-    return name, (2, index, 0, ymd, hhmmss, 0, close - 100, close + 100, close, 1, simulate)
-
-
 def test_the_connection_is_kept_alive_by_asking_for_the_server_time_every_15_seconds():
     """文件 4-4-5：「為避免…無報價資料傳送，導致連線被防火牆切斷…請固定每十五秒呼叫此函式」。
     08:40 到 08:45 開盤前常常沒有行情，而盤中程式一連跑四個半小時。"""
     skcom = FakeSkcom()
-    now = _Ticking(datetime(2026, 11, 9, 8, 40, 0), timedelta(seconds=1))
+    now = TickingClock(datetime(2026, 11, 9, 8, 40, 0), timedelta(seconds=1))
     _clocks(_broker(skcom, now=now).events(TMF_CODE), 46)          # 08:40:00–08:40:45
     assert len(_requests(skcom, "SKQuoteLib_RequestServerTime")) == 4   # :00 :15 :30 :45
 
@@ -70,9 +51,9 @@ def test_tx_ticks_become_trades_at_the_exchanges_time_and_real_price():
     不能切字串（官方 V2 範例那樣切，10 點以前會切成 84 時）。價格放大 100 倍。
     回補（History）與即時的格式相同，一樣是成交。"""
     skcom = FakeSkcom(market=[
-        _tick(TX_INDEX, 20261109, 84500, 4500000, history=True),
-        _tick(TX_INDEX, 20261109, 84501, 4501000),
-        _tick(TX_INDEX, 20261109, 100000, 4500050),
+        tick_event(TX_INDEX, 20261109, 84500, 4500000, history=True),
+        tick_event(TX_INDEX, 20261109, 84501, 4501000),
+        tick_event(TX_INDEX, 20261109, 100000, 4500050),
     ])
     trades = [(e.time, e.price) for e in _market(_broker(skcom).events(TMF_CODE))]
     assert trades == [
@@ -86,8 +67,8 @@ def test_trial_match_ticks_before_the_open_are_not_trades():
     """08:30 起就有成交明細，但那是試撮（`nSimulate=1`）。2026-08-10 實測：最早的試撮價
     44981，真正的開盤價 44985 在 08:45:00。拿試撮組 K 棒，開盤價就是錯的。"""
     skcom = FakeSkcom(market=[
-        _tick(TX_INDEX, 20261109, 83000, 4498100, simulate=1, history=True),
-        _tick(TX_INDEX, 20261109, 84500, 4498500, history=True),
+        tick_event(TX_INDEX, 20261109, 83000, 4498100, simulate=1, history=True),
+        tick_event(TX_INDEX, 20261109, 84500, 4498500, history=True),
     ])
     trades = [(e.time, e.price) for e in _market(_broker(skcom).events(TMF_CODE))]
     assert trades == [(datetime(2026, 11, 9, 8, 45, 0), 44985.0)]
@@ -99,8 +80,8 @@ def test_ticks_from_another_trading_day_come_through_with_their_own_date():
     交易日」（規格第 10 條）要看到這個證據才判斷得出來。在這裡濾掉的話，颱風假那天
     看起來只是一整天的報價中斷。本機時鐘是 2026-11-09（週一）。"""
     skcom = FakeSkcom(market=[
-        _tick(TX_INDEX, 20261106, 134459, 4410000, history=True),
-        _tick(TMF_INDEX, 20261106, 134459, 4409000, history=True),
+        tick_event(TX_INDEX, 20261106, 134459, 4410000, history=True),
+        tick_event(TMF_INDEX, 20261106, 134459, 4409000, history=True),
     ])
     events = _market(_broker(skcom).events(TMF_CODE))
     assert events == [TxTrade(datetime(2026, 11, 6, 13, 44, 59), 44100.0),
@@ -114,7 +95,7 @@ def test_a_clock_event_comes_once_for_each_second_of_the_local_clock():
     """群益沒有每秒一次的事件（`OnTimer` 每分鐘一次），13:20 截止、報價中斷偵測卻需要
     沒有成交時也知道現在幾點——所以時鐘由 broker 用本機時間產生，每跨過一個整秒一次。"""
     start = datetime(2026, 11, 9, 8, 45, 0)
-    broker = _broker(FakeSkcom(), now=_Ticking(start, timedelta(seconds=0.4)))
+    broker = _broker(FakeSkcom(), now=TickingClock(start, timedelta(seconds=0.4)))
     assert _clocks(broker.events(TMF_CODE), 3) == [
         datetime(2026, 11, 9, 8, 45, 0, 0),
         datetime(2026, 11, 9, 8, 45, 1, 200000),
@@ -129,8 +110,8 @@ def test_ticks_of_the_trading_product_become_product_trades():
     """「部位不虧」要用交易商品自己的現價（規格第 14 條）。逐筆成交事件只帶系統索引，
     哪個索引是哪個商品，由訂閱時查到的商品資料決定。"""
     skcom = FakeSkcom(market=[
-        _tick(TX_INDEX, 20261109, 84500, 4500000),
-        _tick(TMF_INDEX, 20261109, 84500, 4499000),
+        tick_event(TX_INDEX, 20261109, 84500, 4500000),
+        tick_event(TMF_INDEX, 20261109, 84500, 4499000),
     ])
     events = _market(_broker(skcom).events(TMF_CODE))
     assert events == [TxTrade(datetime(2026, 11, 9, 8, 45), 45000.0),
@@ -138,7 +119,7 @@ def test_ticks_of_the_trading_product_become_product_trades():
 
 
 def test_when_trading_tx_each_tx_tick_is_also_the_products_trade():
-    skcom = FakeSkcom(market=[_tick(TX_INDEX, 20261109, 84500, 4500000)])
+    skcom = FakeSkcom(market=[tick_event(TX_INDEX, 20261109, 84500, 4500000)])
     events = _market(_broker(skcom).events(TX_CODE))
     assert events == [TxTrade(datetime(2026, 11, 9, 8, 45), 45000.0),
                       ProductTrade(datetime(2026, 11, 9, 8, 45), 45000.0)]
@@ -148,8 +129,8 @@ def test_ticks_under_an_index_we_did_not_look_up_are_dropped_loudly_once(caplog)
     """只訂了大台與交易商品，所以認不得的索引代表「訂閱時查到的索引」和事件帶來的不一樣
     （例如 `TX00AM` 查回的是全盤商品的索引）。那樣的話大台的成交會**全部**被丟掉——
     一週的實機紀錄（ticket 03）就白跑了。不能安靜，但也不必每一筆都講。"""
-    skcom = FakeSkcom(market=[_tick(MTX_INDEX, 20261109, 84500, 4500000),
-                              _tick(MTX_INDEX, 20261109, 84501, 4500100)])
+    skcom = FakeSkcom(market=[tick_event(MTX_INDEX, 20261109, 84500, 4500000),
+                              tick_event(MTX_INDEX, 20261109, 84501, 4500100)])
     assert _market(_broker(skcom).events(TMF_CODE)) == []
     assert caplog.text.count(f"索引 {MTX_INDEX}") == 1
 
@@ -177,19 +158,11 @@ def test_trading_tx_subscribes_its_ticks_only_once():
 # --- 大台累計成交筆數 ---
 
 
-def _trade_info(buy_deals: int, sell_deals: int, code: str = TX_CODE) -> tuple:
-    """`OnNotifyFutureTradeInfoLONG` 的參數（文件 4-4-q）。前四個數字是**委託**的
-    筆數與口數，筆差用不到；最後兩個才是**成交**買進／賣出筆數。"""
-    #                               sMarketNo nStockIdx 委買筆 委賣筆 委買口 委賣口 成交買筆 成交賣筆
-    return "OnNotifyFutureTradeInfoLONG", (code, 2, TX_INDEX, 9000, 9100, 30000, 31000,
-                                           buy_deals, sell_deals)
-
-
 def test_tx_deal_counts_become_counts_stamped_with_the_time_they_arrived():
     """筆差 = 成交賣出筆數 − 成交買進筆數（GLOSSARY）。群益的這個事件沒有日期也沒有時間，
     所以時間是收到它的那一刻（本機時鐘）。"""
-    skcom = FakeSkcom(market=[_trade_info(buy_deals=1500, sell_deals=1620)])
-    now = _Ticking(datetime(2026, 11, 9, 8, 45, 10), timedelta(seconds=0.1))
+    skcom = FakeSkcom(market=[trade_info_event(buy_deals=1500, sell_deals=1620)])
+    now = TickingClock(datetime(2026, 11, 9, 8, 45, 10), timedelta(seconds=0.1))
     assert _market(_broker(skcom, now=now).events(TMF_CODE)) == [
         TxTradeCounts(datetime(2026, 11, 9, 8, 45, 10), buy_count=1500, sell_count=1620)]
 
@@ -230,8 +203,8 @@ def test_a_tick_whose_time_cannot_be_read_is_skipped_and_the_stream_goes_on(capl
     """事件處理函式裡拋出的例外會被 COM 吞掉，之後的事件也可能跟著不見。
     看不懂的那一筆跳過、記下來，後面的照常。"""
     skcom = FakeSkcom(market=[
-        _tick(TX_INDEX, 0, 84500, 4500000),
-        _tick(TX_INDEX, 20261109, 84501, 4501000),
+        tick_event(TX_INDEX, 0, 84500, 4500000),
+        tick_event(TX_INDEX, 20261109, 84501, 4501000),
     ])
     trades = [(e.time, e.price) for e in _market(_broker(skcom).events(TMF_CODE))]
     assert trades == [(datetime(2026, 11, 9, 8, 45, 1), 45010.0)]
@@ -248,9 +221,9 @@ def test_a_quote_connection_that_drops_is_logged_and_the_clock_keeps_coming(capl
     """群益用 `OnConnection` 的代碼告知報價連線斷了（文件 4-4-a、6 代碼表）。之後成交與筆數都
     不會再來，但時鐘照樣每秒一個——盤中程式靠它發現報價中斷、3 分鐘後告警（test_quote_outage）。
     log 寫下群益講的代碼與意思，查原因時才知道是網路、還是群益那邊。"""
-    skcom = FakeSkcom(market=[_tick(TX_INDEX, 20261109, 84500, 4500000),
+    skcom = FakeSkcom(market=[tick_event(TX_INDEX, 20261109, 84500, 4500000),
                               ("OnConnection", (code, 0))])
-    now = _Ticking(datetime(2026, 11, 9, 8, 45, 0), timedelta(seconds=1))
+    now = TickingClock(datetime(2026, 11, 9, 8, 45, 0), timedelta(seconds=1))
     stream = _broker(skcom, now=now).events(TMF_CODE)
     assert [type(e).__name__ for e in islice(stream, 6)] == [
         "Clock", "TxTrade", "Clock", "Clock", "Clock", "Clock"]

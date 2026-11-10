@@ -6,33 +6,17 @@
 斷言送出的委託與發出的訊息。
 """
 
-from datetime import date, timedelta
+from datetime import timedelta
 
-from broker import TMF_CODE, ContractInfo
 from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, contracts, counts, minute,
-                        product_trade, rally, trade)
-from recording import RecordingNotifier
-import intraday
-import settings
-
-CONTRACTS = {TMF_CODE: ContractInfo(TMF_CODE, date(2026, 11, 18), "TM2611")}
-
-
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=True, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
-
+from day_script import (PREVIOUS_DAY, at, clock, counts, make_config, minute, product_trade,
+                        rally, run_day, trade)
 
 def _run(events, *, config=None, **broker_options) -> tuple[FakeBroker, list[str]]:
-    broker_options.setdefault("contracts", CONTRACTS)
-    broker = FakeBroker(events=events,
-                        minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
-    notifier = RecordingNotifier()
-    intraday.run(broker, config or _config(), today=DAY, notify=notifier)
-    return broker, notifier.sent
+    """跑一天（`run_day`，預設自動下單打開），回傳 (broker, 發出的訊息)。"""
+    broker, sent, _ = run_day(events, config=config or make_config(auto_order_enabled=True),
+                              **broker_options)
+    return broker, sent
 
 
 def _silence(start: str, end: str, step: int = 10) -> list:
@@ -83,7 +67,7 @@ def test_an_outage_shorter_than_three_minutes_is_not_reported():
     """報價斷了 2 分 50 秒又回來：中斷期間照樣不進場，但不發告警——規格說連續 3 分鐘。"""
     events = (rally("08:45", 6) + _silence("08:50:40", "08:53:10")
               + rally("08:53", 3, open_=45200) + [trade(at("08:56:00"), 45240)])
-    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    _, sent = _run(events, config=make_config())
     assert _OUTAGE not in _heads(sent)
 
 
@@ -94,7 +78,7 @@ def test_counts_that_stop_while_trades_go_on_are_an_outage_too():
     events = rally("08:45", 16, step=1)
     events += [e for i in range(5) for e in minute(f"09:0{i + 1}", 45200, 45201)]
     events += [trade(at("09:06:00"), 45201)]
-    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    _, sent = _run(events, config=make_config())
     outages = [m for m in sent if m.startswith(_OUTAGE)]
     assert [m.splitlines()[1:2] + m.splitlines()[-1:] for m in outages] == [
         ["最後收到的大台成交：09:03:30；累計成交筆數：09:00:20", "2026/11/09 09:04:00"]]
@@ -115,7 +99,7 @@ def test_a_waiting_breakout_is_cancelled_when_an_outage_is_reported():
               + [clock(at("10:05:00")), trade(at("10:05:00"), 45175),
                  counts(at("10:05:20"), buy=20000, sell=21700), trade(at("10:05:30"), 45180),
                  product_trade(at("10:05:40"), 45180), trade(at("10:06:00"), 45175)])
-    broker, sent = _run(events, contracts=contracts())
+    broker, sent = _run(events)
 
     assert [o.lots for o in broker.orders] == [1]
     assert [(m.splitlines()[0], m.splitlines()[-1]) for m in sent] == [
@@ -129,7 +113,7 @@ def test_each_separate_outage_is_reported_once():
     events = (rally("08:45", 2) + _silence("08:46:40", "08:51:00")
               + rally("08:51", 2) + _silence("08:52:40", "08:56:00")
               + rally("08:56", 2))
-    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    _, sent = _run(events, config=make_config())
     assert [m.splitlines()[-1] for m in sent if m.startswith(_OUTAGE)] == [
         "2026/11/09 08:49:20", "2026/11/09 08:55:20"]
 
@@ -140,7 +124,7 @@ def test_no_quotes_after_the_open_may_be_a_day_off_and_the_alert_says_so():
     不必處理——不告警的話，真的斷線時一整天沒有人知道。"""
     events = ([clock(at("08:40:00")), trade(at("13:44:59", PREVIOUS_DAY), 44100),
                counts(at("08:40:01"), buy=0, sell=0)] + _silence("08:44:00", "08:49:00"))
-    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    _, sent = _run(events, config=make_config())
     assert sent == [
         "【要你處理】PTS 盤中報價中斷超過 3 分鐘\n"
         "最後收到的大台成交：今天還沒有；累計成交筆數：08:40:01\n"
@@ -156,17 +140,17 @@ def test_after_a_late_start_the_three_minutes_count_from_the_start():
     那是心跳記錄的事。3 分鐘從這一輪的第一個時鐘算起：10:02 之前報價來了就不告警；
     一直沒來的話，10:03 告警，而不是一啟動就告警。"""
     _, sent = _run(_silence("10:00:00", "10:02:00") + rally("10:02", 3),
-                   config=_config(auto_order_enabled=False))
+                   config=make_config())
     assert _OUTAGE not in _heads(sent)
 
-    _, sent = _run(_silence("10:00:00", "10:04:00"), config=_config(auto_order_enabled=False))
+    _, sent = _run(_silence("10:00:00", "10:04:00"), config=make_config())
     assert [m.splitlines()[-1] for m in sent] == ["2026/11/09 10:03:00"]
 
 
 def test_no_alert_outside_the_day_session():
     """08:45 開盤之前沒有成交是正常的；13:20 收工之後盤中程式也不在了。"""
     _, sent = _run(_silence("08:40:00", "08:44:50") + rally("08:45", 2),
-                   config=_config(auto_order_enabled=False))
+                   config=make_config())
     assert sent == []
 
 
@@ -192,7 +176,7 @@ def test_counts_that_stall_for_a_while_are_not_taken_for_a_bichai_jump():
                trade(at("08:56:30"), 45140), product_trade(at("08:56:40"), 45140)]
     after = (minute("08:57", 45140, 45140, bichai=2095) + minute("08:58", 45140, 45140, bichai=2180)
              + minute("08:59", 45140, 45140, bichai=2280) + [trade(at("09:00:00"), 45140)])
-    broker, sent = _run(rally("08:45", 5) + flat + stalled + after, contracts=contracts())
+    broker, sent = _run(rally("08:45", 5) + flat + stalled + after)
 
     assert [(m.splitlines()[1], m.splitlines()[-1]) for m in sent] == [
         ("觸發：條件 1（早盤做多）", "2026/11/09 08:50:00"),
@@ -221,7 +205,7 @@ def test_bars_with_trades_missing_from_an_outage_are_not_used_to_enter():
               + [trade(at("08:51:10"), 45160), bar_counts("08:51:20"),
                  trade(at("08:51:30"), 45170), product_trade(at("08:51:40"), 45170)]
               + rally("08:52", 7, open_=45180) + [trade(at("08:59:00"), 45260)])
-    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    _, sent = _run(events, config=make_config())
     assert [m.splitlines()[-1] for m in sent] == [
         "2026/11/09 08:50:00", "2026/11/09 08:58:00", "2026/11/09 08:59:00"]
 
@@ -236,6 +220,6 @@ def test_a_gap_inside_one_minute_leaves_the_next_bar_whole():
               + _silence("08:50:05", "08:50:50")
               + [trade(at("08:50:50"), 45160), product_trade(at("08:50:55"), 45160)]
               + rally("08:51", 7, open_=45170) + [trade(at("08:58:00"), 45250)])
-    _, sent = _run(events, config=_config(auto_order_enabled=False))
+    _, sent = _run(events, config=make_config())
     assert [m.splitlines()[-1] for m in sent] == [
         "2026/11/09 08:50:00", "2026/11/09 08:57:00", "2026/11/09 08:58:00"]

@@ -11,39 +11,25 @@ import pytest
 
 from broker import (
     BUY,
-    MTX_CODE,
     SELL,
     TMF_CODE,
     TX_CODE,
     Broker,
     Clock,
-    ContractInfo,
     FillUnknown,
     MinuteBar,
     OrderFailed,
-    OrderRequest,
     ProductTrade,
     TxTrade,
     TxTradeCounts,
 )
-from broker.capital import CapitalBroker
 from broker.fake import FakeBroker
-from fake_skcom import FakeSkcom
-
-CONTRACTS = {
-    TX_CODE: ContractInfo(TX_CODE, date(2026, 11, 18), "TX11"),
-    MTX_CODE: ContractInfo(MTX_CODE, date(2026, 11, 18), "MTX11"),
-    TMF_CODE: ContractInfo(TMF_CODE, date(2026, 11, 18), "TM2611"),
-}
-
-
-def _order(code=TMF_CODE, *, side=BUY, lots=1, day=date(2026, 11, 9)) -> OrderRequest:
-    return OrderRequest(contract=CONTRACTS[code], side=side, lots=lots, trading_day=day)
-
+from day_script import contracts, order_request
+from fake_skcom import FakeSkcom, capital_broker
 
 class _Fake:
     def __init__(self):
-        self.broker = FakeBroker(contracts=CONTRACTS, fill_price=45000.0)
+        self.broker = FakeBroker(contracts=contracts(), fill_price=45000.0)
 
     def sent(self) -> int:
         return len(self.broker.orders)
@@ -52,8 +38,7 @@ class _Fake:
 class _Capital:
     def __init__(self):
         self.skcom = FakeSkcom()
-        self.broker = CapitalBroker("A100000000", "pw", "F0000000000000", com=self.skcom,
-                                    settle_seconds=0, fill_timeout=0.3)
+        self.broker = capital_broker(self.skcom, fill_timeout=0.3, pump_interval=0.05)
         self.broker.login()
 
     def sent(self) -> int:
@@ -76,14 +61,14 @@ def test_both_brokers_offer_the_whole_contract(make):
 def test_an_expired_contract_is_never_sent_by_either_broker(make):
     side = make()
     with pytest.raises(OrderFailed, match="最後交易日"):
-        side.broker.place_order(_order(day=date(2026, 11, 19)))
+        side.broker.place_order(order_request(day=date(2026, 11, 19)))
     assert side.sent() == 0
 
 
 @BOTH
 def test_the_settlement_day_is_sent_by_either_broker(make):
     side = make()
-    side.broker.place_order(_order(day=date(2026, 11, 18)))
+    side.broker.place_order(order_request(day=date(2026, 11, 18)))
     assert side.sent() == 1
 
 
@@ -91,7 +76,7 @@ def test_the_settlement_day_is_sent_by_either_broker(make):
 def test_an_order_outside_one_to_ten_lots_cannot_even_be_written(lots):
     """期交所每筆市價單最多 10 口。超過要拆單（出場程式），這裡擋的是呼叫端寫錯。"""
     with pytest.raises(ValueError, match="10"):
-        _order(lots=lots)
+        order_request(lots=lots)
 
 
 @BOTH
@@ -99,7 +84,7 @@ def test_ten_lots_is_the_cap_itself_and_is_sent_by_either_broker(make):
     """10 口是上限本身，要送得出去。出場程式拆單時每筆就是 10 口（規格第 33 條）——
     上界錯一格的話，13:25 的微台平倉會直接拋例外，部位就過夜了。"""
     side = make()
-    assert side.broker.place_order(_order(lots=10)).filled_lots == 10
+    assert side.broker.place_order(order_request(lots=10)).filled_lots == 10
     assert side.sent() == 1
 
 
@@ -108,9 +93,9 @@ def test_ten_lots_is_the_cap_itself_and_is_sent_by_either_broker(make):
 
 def test_the_fake_records_every_order_it_receives_with_the_day_trade_mark():
     """流程測試斷言「送出了哪些委託」就是讀這裡。當沖註記由商品決定，看得到才測得到。"""
-    fake = FakeBroker(contracts=CONTRACTS, fill_price=45000.0)
-    fake.place_order(_order(TX_CODE, side=SELL, lots=2))
-    fake.place_order(_order(TMF_CODE))
+    fake = FakeBroker(contracts=contracts(), fill_price=45000.0)
+    fake.place_order(order_request(TX_CODE, side=SELL, lots=2))
+    fake.place_order(order_request(TMF_CODE))
     assert [(o.contract.order_code, o.side, o.lots, o.day_trade) for o in fake.orders] == [
         ("TX11", SELL, 2, True),
         ("TM2611", BUY, 1, False),
@@ -120,48 +105,48 @@ def test_the_fake_records_every_order_it_receives_with_the_day_trade_mark():
 def test_the_fake_fills_everything_at_the_last_traded_price_by_default():
     """市價單成交在當下的價格。劇本裡交易商品最後一筆成交價就是成交價。"""
     t = datetime(2026, 11, 9, 8, 50)
-    fake = FakeBroker(contracts=CONTRACTS, events=[ProductTrade(t, 45010.0),
+    fake = FakeBroker(contracts=contracts(), events=[ProductTrade(t, 45010.0),
                                                    ProductTrade(t, 45012.0)])
     for _ in fake.events(TMF_CODE):
         pass
-    result = fake.place_order(_order(lots=2))
+    result = fake.place_order(order_request(lots=2))
     assert (result.filled_lots, result.avg_price) == (2, 45012.0)
     assert result.order_seq
 
 
 def test_the_fake_can_fill_part_of_an_order():
-    fake = FakeBroker(contracts=CONTRACTS, fill_price=45000.0, fills=[1, 0])
-    assert fake.place_order(_order(lots=3)).filled_lots == 1
-    nothing = fake.place_order(_order(lots=3))
+    fake = FakeBroker(contracts=contracts(), fill_price=45000.0, fills=[1, 0])
+    assert fake.place_order(order_request(lots=3)).filled_lots == 1
+    nothing = fake.place_order(order_request(lots=3))
     assert (nothing.filled_lots, nothing.avg_price) == (0, None)
 
 
-def test_the_fake_plays_back_both_kinds_of_failure_in_order():
+def test_the_fake_plays_back_both_kinds_of_failure_inorder_request():
     """「拒單之後當天停止」「不確定之後當天停止」這類流程測試靠它（ticket 07）。"""
-    fake = FakeBroker(contracts=CONTRACTS, fill_price=45000.0, order_errors=[
+    fake = FakeBroker(contracts=contracts(), fill_price=45000.0, order_errors=[
         OrderFailed("保證金不足"),
         FillUnknown("沒等到回報", order_seq="2315610000001"),
         None,
     ])
     with pytest.raises(OrderFailed):
-        fake.place_order(_order())
+        fake.place_order(order_request())
     with pytest.raises(FillUnknown):
-        fake.place_order(_order())
-    assert fake.place_order(_order()).filled_lots == 1
+        fake.place_order(order_request())
+    assert fake.place_order(order_request()).filled_lots == 1
     assert len(fake.orders) == 3, "失敗的委託也送出去過，要記下來"
 
 
 def test_a_fake_without_a_price_refuses_to_invent_one():
     """沒安排成交價的測試卻送了單——那是測試沒寫對，不是成交在 0 元。"""
-    fake = FakeBroker(contracts=CONTRACTS)
+    fake = FakeBroker(contracts=contracts())
     with pytest.raises(AssertionError, match="成交價"):
-        fake.place_order(_order())
+        fake.place_order(order_request())
 
 
 # --- 假 broker：照劇本回放一個交易日 ---
 
 
-def test_the_fake_replays_the_days_events_in_order():
+def test_the_fake_replays_the_days_events_inorder_request():
     t = datetime(2026, 11, 9, 8, 45)
     script = [Clock(t), TxTrade(t, 45000.0), TxTradeCounts(t, buy_count=10, sell_count=12),
               ProductTrade(t, 45001.0)]

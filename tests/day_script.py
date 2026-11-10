@@ -1,15 +1,26 @@
-"""寫交易日劇本的小工具：給 `FakeBroker(events=...)` 用的行情事件。
+"""寫交易日劇本的小工具：給 `FakeBroker(events=...)` 用的行情事件，以及各測試檔共用的
+設定、「跑一天」、部位檔的寫法。
 
 劇本就是 broker 依序送來的事件。這裡只負責把「08:45:03 成交 45000」寫得短一點，
 不替測試決定任何行為——事件的先後就是 list 的先後。
+
+共用的東西集中在這裡，理由同 invest-os 的 `make_config`：設定多一個鍵、部位檔的格式改一次，
+只有一個地方要改，不是每個測試檔各自炸掉一次。
 """
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import date, datetime, timedelta
 
-from broker import (MTX_CODE, TMF_CODE, TX_CODE, Clock, ContractInfo, MinuteBar, ProductTrade,
-                    TxTrade, TxTradeCounts)
+from broker import (BUY, MTX_CODE, TMF_CODE, TX_CODE, Clock, ContractInfo, MinuteBar,
+                    OrderRequest, ProductTrade, TxTrade, TxTradeCounts)
+from broker.fake import FakeBroker
+from recording import RecordingNotifier
+import intraday
+import position_file
+import settings
 
 DAY = date(2026, 11, 9)              # 週一，一般交易日
 SETTLEMENT_DAY = date(2026, 11, 18)  # 2026 年 11 月的第三個週三：DAY 那一週不是結算週
@@ -21,6 +32,12 @@ def contracts(last_trading_day: date = SETTLEMENT_DAY) -> dict[str, ContractInfo
     return {TX_CODE: ContractInfo(TX_CODE, last_trading_day, f"TX{month}"),
             MTX_CODE: ContractInfo(MTX_CODE, last_trading_day, f"MTX{month}"),
             TMF_CODE: ContractInfo(TMF_CODE, last_trading_day, f"TM{last_trading_day:%y%m}")}
+
+
+def order_request(code: str = TMF_CODE, *, side: str = BUY, lots: int = 1,
+                  day: date = DAY) -> OrderRequest:
+    """一筆委託（`contracts()` 的近月）。broker 的測試直接拿它送單。"""
+    return OrderRequest(contract=contracts()[code], side=side, lots=lots, trading_day=day)
 
 
 def at(hhmmss: str, day: date = DAY) -> datetime:
@@ -162,3 +179,106 @@ def restarted_at(events: list, t: datetime) -> list:
     """盤中程式在 `t` 重啟之後，broker 送來的樣子：先一個本機時鐘，接著群益第一次訂閱時
     回補的今天的成交（到 `t` 為止，只有成交），然後才是 `t` 之後的即時行情。"""
     return [Clock(t)] + replayed(until(events, t)) + [e for e in events if e.time > t]
+
+
+# ── 設定與「跑一天」───────────────────────────────────────────────────────
+
+
+def make_config(**overrides) -> settings.Config:
+    """使用者的設定。**預設不下單**（模擬模式）：會下單的測試自己寫明
+    `auto_order_enabled=True`，哪些測試會碰下單 API 在測試碼裡看得見（invest-os 的前例）。"""
+    values = dict(auto_order_enabled=False, product=TMF_CODE, lots_per_entry=1,
+                  max_position=20, discord_enabled=True)
+    values.update(overrides)
+    return settings.Config(**values)
+
+
+def run_day(events, *, config: settings.Config | None = None, today: date = DAY,
+            **broker_options) -> tuple[FakeBroker, list[str], intraday.SessionOutcome]:
+    """盤中程式跑 `today` 一輪：假 broker 照 `events` 回放，通知換成記錄器。
+    回傳 (broker, 發出的訊息, 結果)。
+
+    假 broker 預設：前一個交易日（`PREVIOUS_DAY`）平淡、收 45000；商品清單是 `contracts()`。
+    其餘的（成交、失敗、登入）照 `broker_options` 交給 `FakeBroker`。"""
+    broker_options.setdefault("minute_bars", {PREVIOUS_DAY: calm_history(45000)})
+    broker_options.setdefault("contracts", contracts())
+    broker = FakeBroker(events=events, **broker_options)
+    notifier = RecordingNotifier()
+    outcome = intraday.run(broker, config or make_config(), today=today, notify=notifier)
+    return broker, notifier.sent, outcome
+
+
+# ── 部位檔（兩支程式之間的約定，測試裡逐字寫出來）────────────────────────────
+
+# `position_content(某欄位=DROP)`：那一欄不寫（「少了欄位」的部位檔）
+DROP = object()
+
+
+def position_content(day: date = DAY, **overrides) -> dict:
+    """部位檔的原始內容：預設是盤中程式今天寫下的微台多單 1 口 @ 45100。
+    `overrides` 換掉其中幾欄；值是 `DROP` 的那一欄拿掉。"""
+    content = {
+        "trading_day": f"{day:%Y-%m-%d}",
+        "product": "TM0000AM",
+        "order_code": "TM2611",
+        "contract_month": "202611",
+        "direction": "LONG",
+        "last_trading_day": "2026-11-18",
+        "status": "CONFIRMED",
+        "entries": [{"order_seq": "2315609990001", "lots": 1, "price": 45100.0}],
+        "exits": [],
+        "uncertain": None,
+    }
+    for key, value in overrides.items():
+        if value is DROP:
+            del content[key]
+        else:
+            content[key] = value
+    return content
+
+
+def write_position_file(content: dict | str, day: date = DAY) -> None:
+    """把部位檔放進 conftest 導開的 `state/`：dict 寫成 JSON，字串原封不動寫進去
+    （寫壞的、寫到一半的檔）。"""
+    path = position_file.path_for(day)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        if isinstance(content, str):
+            fh.write(content)
+        else:
+            json.dump(content, fh, ensure_ascii=False)
+
+
+def position_on_file(day: date = DAY) -> dict:
+    """部位檔現在的原始內容。格式是和出場程式、和人之間的約定，所以逐字斷言。"""
+    with open(position_file.path_for(day), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+# 送單前記下的「不確定」：這一筆還沒有序號、已知成交 0 口（`intraday._Orders._mark_sending`）
+SENDING_MARKER = {"stage": "ENTRY", "order_seq": "", "requested_lots": 1, "known_filled": 0}
+
+
+def _denied(*args) -> None:
+    raise PermissionError(13, "存取被拒")
+
+
+def lock_position_file(m) -> None:
+    """部位檔置換的那一步失敗：Windows 上防毒或索引程式剛好開著正式檔時，`os.replace` 就是
+    這樣。`m` 是 `monkeypatch`，或只管一段劇本的 `monkeypatch.context()`。"""
+    m.setattr(os, "replace", _denied)
+
+
+def lock_position_file_once_sent(m) -> None:
+    """委託送出去之後，部位檔才被鎖住（等成交回報的那段時間，防毒或索引程式剛好開著它）：
+    送單前記下的「不確定」寫進去了，之後的每一次都寫不進去。
+
+    只鎖一輪（之後重啟時已經不鎖）的話，用 `with monkeypatch.context() as m:` 包住那一輪：
+    離開時只還原 `m` 做過的事。⚠️ 不要用 `monkeypatch.undo()`——它連 conftest 導開的資料夾
+    也一起還原，之後的檔案就寫進正式的 `state/`。"""
+    place_order = FakeBroker.place_order
+
+    def locking(self, request):
+        lock_position_file(m)
+        return place_order(self, request)
+    m.setattr(FakeBroker, "place_order", locking)

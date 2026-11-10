@@ -10,48 +10,30 @@
 
 import json
 import os
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 
 from broker import BUY, MTX_CODE, SELL, TMF_CODE, TX_CODE, ContractInfo
-from broker.capital import CapitalBroker
 from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, minute, rally,
-                        restarted_at, trade, until)
-from fake_skcom import TMF_INDEX, TX_INDEX, FakeSkcom, reply_row
+from day_script import (DAY, DROP, PREVIOUS_DAY, SENDING_MARKER, at, calm_history, clock,
+                        contracts, lock_position_file, lock_position_file_once_sent, make_config,
+                        minute, position_content, position_on_file as _file, rally,
+                        restarted_at, run_day, trade, until, write_position_file)
+from fake_skcom import (TMF_INDEX, TX_INDEX, FakeSkcom, TickingClock, capital_broker, reply_row,
+                        tick_at, trade_info_event)
 from recording import RecordingNotifier
 import intraday
 import position_file
-import settings
 
-CONTRACTS = {
-    TX_CODE: ContractInfo(TX_CODE, date(2026, 11, 18), "TX11"),
-    MTX_CODE: ContractInfo(MTX_CODE, date(2026, 11, 18), "MTX11"),
-    TMF_CODE: ContractInfo(TMF_CODE, date(2026, 11, 18), "TM2611"),
-}
+# 這個檔的每一輪都打開自動下單：要的就是真的送單
+LIVE = make_config(auto_order_enabled=True)
 
 
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=True, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
-
-
-def _run(events, *, config=None, contracts=CONTRACTS, **broker_options):
-    """跑一天，回傳 (broker, 發出的訊息)。前一個交易日是平淡的一天、收 45000。"""
-    broker = FakeBroker(contracts=contracts, events=events,
-                        minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
-    notifier = RecordingNotifier()
-    intraday.run(broker, config or _config(), today=DAY, notify=notifier)
-    return broker, notifier.sent
-
-
-def _file(day: date = DAY) -> dict:
-    """部位檔的原始內容。格式是和出場程式、和人之間的約定，所以逐字斷言。"""
-    with open(position_file.path_for(day), encoding="utf-8") as fh:
-        return json.load(fh)
+def _run(events, *, config=None, **broker_options):
+    """跑一天（`run_day`，預設自動下單打開），回傳 (broker, 發出的訊息)。"""
+    broker, sent, _ = run_day(events, config=config or LIVE, **broker_options)
+    return broker, sent
 
 
 def test_a_strong_open_sends_a_market_order_writes_the_fill_and_reports_it():
@@ -89,7 +71,7 @@ def test_with_auto_order_off_the_same_day_sends_nothing_and_writes_no_position_f
     """同一個會進場的早上，開關關著：下單函式一次都沒被呼叫，部位檔不存在——出場程式
     看的是部位檔，模擬的口數寫進去，13:25 它就會去平一個不存在的部位。只有「模擬」訊息。"""
     broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
-                        config=_config(auto_order_enabled=False))
+                        config=make_config())
     assert broker.orders == []
     assert not os.path.exists(position_file.path_for(DAY))
     assert sent[0].splitlines()[0] == "【模擬】PTS 做多：買進微台 1 口 @ 45150"
@@ -108,7 +90,7 @@ def test_tx_and_mtx_entries_are_marked_day_trade_and_tmf_entries_are_not(
     """大台、小台標當沖（保證金減半才放得下 20 口，由券商 13:30 強平）；微台不能標，
     由出場程式 13:25 平倉（ADR-0002）。下單代碼是商品清單裡指名月份的那個。"""
     broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
-                        config=_config(product=product))
+                        config=make_config(auto_order_enabled=True, product=product))
     assert [(o.contract.order_code, o.day_trade) for o in broker.orders] == [(order_code, day_trade)]
     assert sent[0].splitlines()[0] == f"PTS 做多：買進{name} 1 口 @ 45150"
     assert (_file()["product"], _file()["order_code"]) == (product, order_code)
@@ -143,7 +125,7 @@ def test_on_the_settlement_day_it_trades_the_contract_expiring_that_day():
 def test_a_partial_fill_is_recorded_and_reported_as_the_lots_actually_filled():
     """每次 3 口，IOC 只成交 1 口：部位檔、訊息、之後的加碼上限都照 1 口算。"""
     broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
-                        config=_config(lots_per_entry=3), fills=[1])
+                        config=make_config(auto_order_enabled=True, lots_per_entry=3), fills=[1])
     assert [o.lots for o in broker.orders] == [3]
     assert _file()["entries"] == [{"order_seq": "2315610000001", "lots": 1, "price": 45150.0}]
     assert sent[0].splitlines()[0] == "PTS 做多：買進微台 1 口 @ 45150"
@@ -176,7 +158,7 @@ def test_every_order_is_kept_with_its_own_sequence_and_the_average_comes_from_th
     """兩口成交在 45150、45160（08:51 那一筆只成交 2 口裡的 1 口）。均價由明細算：
     (45150 × 2 + 45160 × 1) ÷ 3 = 45153.33。每一則訊息都帶累計，看最新的一則就知道部位。"""
     broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
-                        config=_config(lots_per_entry=2), fills=[2, 1])
+                        config=make_config(auto_order_enabled=True, lots_per_entry=2), fills=[2, 1])
     assert _file()["entries"] == [
         {"order_seq": "2315610000001", "lots": 2, "price": 45150.0},
         {"order_seq": "2315610000002", "lots": 1, "price": 45160.0},
@@ -191,7 +173,7 @@ def test_the_cap_counts_the_lots_actually_filled():
     """加碼上限 3、每次 2 口。08:50 只成交 1 口 → 08:51 還有 2 口的空間，送 2 口；
     滿了之後就不再送。照委託口數算的話，08:51 只會送 1 口。"""
     broker, _ = _run(rally("08:45", 8) + [trade(at("08:53:00"), 45180)],
-                     config=_config(lots_per_entry=2, max_position=3), fills=[1, 2])
+                     config=make_config(auto_order_enabled=True, lots_per_entry=2, max_position=3), fills=[1, 2])
     assert [o.lots for o in broker.orders] == [2, 2]
     assert sum(e["lots"] for e in _file()["entries"]) == 3
 
@@ -236,33 +218,14 @@ class _SnapshotNotifier(RecordingNotifier):
 def test_the_fill_is_on_file_before_the_message_goes_out():
     """發 Discord 會失敗、會卡住，程式也可能在那時被關掉。成交訊息送出時，那一筆成交
     必須已經在部位檔裡——出場程式不看 Discord。"""
-    broker = FakeBroker(contracts=CONTRACTS,
+    broker = FakeBroker(contracts=contracts(),
                         events=rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
                         minute_bars={PREVIOUS_DAY: calm_history(45000)})
     notifier = _SnapshotNotifier()
-    intraday.run(broker, _config(), today=DAY, notify=notifier)
+    intraday.run(broker, LIVE, today=DAY, notify=notifier)
     assert notifier.lots_on_file == [1, 2]
 
 
-def _locked(monkeypatch) -> None:
-    """置換那一步失敗：Windows 上防毒或索引程式剛好開著正式檔時，`os.replace` 就是這樣。"""
-    def denied(src, dst):
-        raise PermissionError(13, "存取被拒")
-    monkeypatch.setattr(os, "replace", denied)
-
-
-def _locked_once_sent(monkeypatch) -> None:
-    """委託送出去之後，部位檔才被鎖住（等成交回報的那段時間，防毒或索引程式剛好開著它）：
-    送單前記下的「不確定」寫進去了，之後的每一次都寫不進去。"""
-    place_order = FakeBroker.place_order
-
-    def locking(self, request):
-        _locked(monkeypatch)
-        return place_order(self, request)
-    monkeypatch.setattr(FakeBroker, "place_order", locking)
-
-
-_MARKER = {"stage": "ENTRY", "order_seq": "", "requested_lots": 1, "known_filled": 0}
 
 
 def test_when_the_position_file_cannot_be_written_before_sending_no_order_goes_out(
@@ -272,7 +235,7 @@ def test_when_the_position_file_cannot_be_written_before_sending_no_order_goes_o
     同一種處境——告警「委託沒有送出去」，今天不再進場（下一分鐘多半也寫不進去）。稍早的 2 口
     還在部位檔裡，照常了結。"""
     content = _on_file()
-    _locked(monkeypatch)
+    lock_position_file(monkeypatch)
     broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
 
     assert broker.orders == []
@@ -294,12 +257,12 @@ def test_a_fill_that_cannot_be_written_to_the_position_file_is_reported_and_ends
     「不確定」：13:25 出場程式不會自動平倉，微台不平就帶著部位過夜。所以立刻發「部位還在」的
     告警，講明這次成交了什麼、要人自己平掉；之後的部位檔和帳上對不上，加碼上限與部位不虧都算
     不準，今天不再進場（08:51 條件仍然成立，也不送）。盤中程式不因此中止：原始行情照樣記到收工。"""
-    _locked_once_sent(monkeypatch)
-    broker = FakeBroker(contracts=CONTRACTS,
+    lock_position_file_once_sent(monkeypatch)
+    broker = FakeBroker(contracts=contracts(),
                         events=rally("08:45", 6) + [trade(at("08:51:00"), 45160)],
                         minute_bars={PREVIOUS_DAY: calm_history(45000)})
     notifier = RecordingNotifier()
-    outcome = intraday.run(broker, _config(), today=DAY, notify=notifier)
+    outcome = intraday.run(broker, LIVE, today=DAY, notify=notifier)
 
     assert [(o.side, o.lots) for o in broker.orders] == [(BUY, 1)]
     assert notifier.sent == [
@@ -321,13 +284,13 @@ def test_when_the_write_fails_after_earlier_fills_the_alert_says_how_many_lots_a
     """部位檔已經有今天稍早的 2 口：兩個數字都寫出來，對帳時才知道差在哪裡。檔裡是稍早的
     2 口加上送單前記下的「不確定」——這次成交的那一口沒記到。"""
     content = _on_file()
-    _locked_once_sent(monkeypatch)
+    lock_position_file_once_sent(monkeypatch)
     broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
     assert len(broker.orders) == 1
     assert sent[0].splitlines()[1:3] == [
         "這次：買進小台 1 口 @ 45150（委託序號 2315610000001）",
         "帳上 PTS 共多單 3 口，部位檔只記到 2 口，而且停在送單前記下的「不確定」"]
-    assert _file() == dict(content, status="UNCERTAIN", uncertain=_MARKER)
+    assert _file() == dict(content, status="UNCERTAIN", uncertain=SENDING_MARKER)
 
 
 def test_after_a_fill_that_could_not_be_written_a_restart_enters_nothing(monkeypatch):
@@ -335,23 +298,21 @@ def test_after_a_fill_that_could_not_be_written_a_restart_enters_nothing(monkeyp
     帳上的口數和檔裡對不上，照常加碼的話，加碼上限少算 1 口、部位不虧也算在錯的均價上——而告警
     已經說了「盤中程式今天不再進場」。那一則已經發過，重啟不再發。"""
     content = _on_file()
-    replace = os.replace
-    _locked_once_sent(monkeypatch)
     morning = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]   # 條件 1 每分鐘成立
-    _run(until(morning, at("08:50:40")))
-    # 重啟時檔案已經不鎖了。⚠️ 不用 monkeypatch.undo()：它連 conftest 導開的資料夾也還原
-    monkeypatch.setattr(os, "replace", replace)
+    with monkeypatch.context() as m:        # 重啟時檔案已經不鎖了
+        lock_position_file_once_sent(m)
+        _run(until(morning, at("08:50:40")))
 
     broker, sent = _run(restarted_at(morning, at("08:51:10")))
 
     assert broker.orders == []
     assert sent == []
-    assert _file() == dict(content, status="UNCERTAIN", uncertain=_MARKER)
+    assert _file() == dict(content, status="UNCERTAIN", uncertain=SENDING_MARKER)
 
 
 def test_the_fill_is_on_file_even_with_discord_switched_off():
     _, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
-                   config=_config(discord_enabled=False))
+                   config=make_config(auto_order_enabled=True, discord_enabled=False))
     assert sent == []
     assert len(_file()["entries"]) == 1
 
@@ -373,24 +334,15 @@ def test_a_position_deep_in_the_red_is_never_closed_by_the_intraday_program():
 # --- 當天已經有部位：交易商品以部位檔為準（規格第 43 條）---
 
 
+# 今天稍早（例如重啟之前）寫下的部位檔：小台多單 2 口 @ 45100
+_MTX_ON_FILE = dict(product="MTX00AM", order_code="MTX11",
+                    entries=[{"order_seq": "2315619999999", "lots": 2, "price": 45100.0}])
+
+
 def _on_file(**overrides) -> dict:
-    """今天稍早（例如重啟之前）寫下的部位檔：小台多單 2 口 @ 45100。"""
-    content = {
-        "trading_day": "2026-11-09",
-        "product": "MTX00AM",
-        "order_code": "MTX11",
-        "contract_month": "202611",
-        "direction": "LONG",
-        "last_trading_day": "2026-11-18",
-        "status": "CONFIRMED",
-        "entries": [{"order_seq": "2315619999999", "lots": 2, "price": 45100.0}],
-        "exits": [],
-        "uncertain": None,
-    }
-    content.update(overrides)
-    os.makedirs(os.path.dirname(position_file.path_for(DAY)), exist_ok=True)
-    with open(position_file.path_for(DAY), "w", encoding="utf-8") as fh:
-        json.dump(content, fh, ensure_ascii=False)
+    """把今天稍早的部位檔（`_MTX_ON_FILE`，換掉 `overrides` 那幾欄）放進去，回傳內容。"""
+    content = position_content(**{**_MTX_ON_FILE, **overrides})
+    write_position_file(content)
     return content
 
 
@@ -400,7 +352,7 @@ def test_a_position_already_on_file_today_decides_the_product_not_the_settings()
     (45100 × 2 + 45150) ÷ 3 = 45116.67。設定從下一個交易日起才生效。"""
     _on_file()
     broker, sent = _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)],
-                        config=_config(product=TMF_CODE))
+                        config=make_config(auto_order_enabled=True, product=TMF_CODE))
     assert broker.streamed == [MTX_CODE]
     assert [(o.contract.order_code, o.day_trade) for o in broker.orders] == [("MTX11", True)]
     assert sent[0].splitlines()[0] == "PTS 做多：買進小台 1 口 @ 45150"
@@ -417,7 +369,7 @@ def test_the_lots_on_file_count_toward_the_cap():
     重啟時沒把檔裡的口數算進去的話，第一筆會送 2 口、衝過上限。"""
     _on_file()
     broker, _ = _run(rally("08:45", 7) + [trade(at("08:52:00"), 45170)],
-                     config=_config(lots_per_entry=2, max_position=3))
+                     config=make_config(auto_order_enabled=True, lots_per_entry=2, max_position=3))
     assert [o.lots for o in broker.orders] == [1]
 
 
@@ -441,7 +393,7 @@ def test_a_signal_against_the_direction_on_file_is_never_entered(auto):
     content = _on_file(entries=[{"order_seq": "2315619999999", "lots": 2, "price": 44000.0}])
     events = (rally("08:45", 6, open_=44900, step=-10, bichai=-1500)
               + [trade(at("08:51:00"), 44830)])
-    broker, sent = _run(events, config=_config(auto_order_enabled=auto))
+    broker, sent = _run(events, config=make_config(auto_order_enabled=auto))
     assert broker.orders == []
     assert sent == []
     assert _file() == content
@@ -464,35 +416,15 @@ def test_a_position_file_left_from_another_day_is_not_todays_position():
 # --- 部位檔讀不懂：大聲失敗，不能當成「沒有部位」---
 
 
-def _damaged(text: str) -> None:
-    os.makedirs(os.path.dirname(position_file.path_for(DAY)), exist_ok=True)
-    with open(position_file.path_for(DAY), "w", encoding="utf-8") as fh:
-        fh.write(text)
-
-
 def _with(**changes) -> str:
-    content = {
-        "trading_day": "2026-11-09", "product": "MTX00AM", "order_code": "MTX11",
-        "contract_month": "202611", "direction": "LONG", "last_trading_day": "2026-11-18",
-        "status": "CONFIRMED",
-        "entries": [{"order_seq": "2315619999999", "lots": 2, "price": 45100.0}],
-        "exits": [], "uncertain": None,
-    }
-    for key, value in changes.items():
-        if value is _DROP:
-            del content[key]
-        else:
-            content[key] = value
-    return json.dumps(content, ensure_ascii=False)
-
-
-_DROP = object()
+    """今天稍早的部位檔，換掉（`DROP`：拿掉）其中幾欄之後的原始文字。"""
+    return json.dumps(position_content(**{**_MTX_ON_FILE, **changes}), ensure_ascii=False)
 
 DAMAGE = {
     "寫到一半": '{"trading_day": "2026-11-09", "product": "MTX0',
     "不是 JSON 物件": "[]",
     "空檔": "",
-    "少了欄位": _with(order_code=_DROP),
+    "少了欄位": _with(order_code=DROP),
     "多了不認得的欄位": _with(stop_loss=44000),
     "別天的內容": _with(trading_day="2026-11-06"),
     "日期寫錯": _with(last_trading_day="2026/11/18"),
@@ -517,7 +449,7 @@ def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text):
     """讀不懂的部位檔可能記著今天已經成交的口數。當成「沒有部位」照常進場的話，
     口數、均價、加碼上限、甚至商品都會錯；這一天不進場，發 Discord 請人看帳戶。
     檔案原封不動——那是人工處理時唯一的線索。"""
-    _damaged(text)
+    write_position_file(text)
     broker, sent = _run(rally("08:45", 6) + [trade(at("08:51:00"), 45160)])
     assert broker.orders == []
     assert len(sent) == 1
@@ -547,28 +479,6 @@ def test_an_uncertain_position_on_file_means_no_more_entries_today():
 # --- 只認自己委託序號的成交回報（規格第 56 條）：從群益 broker 一路打到部位檔 ---
 
 
-class _Ticking:
-    """本機時鐘的替身：每被問一次就往前走 `step`。"""
-
-    def __init__(self, start, step):
-        self._t, self._step = start, step
-
-    def __call__(self):
-        t, self._t = self._t, self._t + self._step
-        return t
-
-
-def _tick(index: int, t, price: float) -> tuple:
-    """`OnNotifyTicksLONG` 的參數（文件 4-4-m）：價格放大 100 倍、時間是整數 hhmmss。"""
-    hhmmss = t.hour * 10000 + t.minute * 100 + t.second
-    return "OnNotifyTicksLONG", (2, index, 0, 20261109, hhmmss, 0, 0, 0, int(price * 100), 1, 0)
-
-
-def _deal_counts(buy: int, sell: int) -> tuple:
-    """`OnNotifyFutureTradeInfoLONG` 的參數（文件 4-4-q）：最後兩個是成交買進／賣出筆數。"""
-    return "OnNotifyFutureTradeInfoLONG", ("TX00AM", 2, TX_INDEX, 0, 0, 0, 0, buy, sell)
-
-
 def test_fills_of_other_orders_on_the_shared_reply_line_never_become_ptss_position():
     """回報頻道是共用的：OS 的單、使用者手動下的單、連線時補送的舊回報，全部走同一條線進來。
     這裡不用假 broker，換掉的是群益元件本身（`FakeSkcom`），從盤中程式一路打到部位檔：
@@ -577,11 +487,11 @@ def test_fills_of_other_orders_on_the_shared_reply_line_never_become_ptss_positi
     market = []
     for i in range(5):                       # 08:45–08:49 一路強勢，同 rally("08:45", 5)
         start = at(f"08:4{5 + i}:00")
-        market += [_tick(TX_INDEX, start, 45100 + 10 * i),
-                   _deal_counts(20000, 21500),
-                   _tick(TX_INDEX, start + timedelta(seconds=30), 45110 + 10 * i),
-                   _tick(TMF_INDEX, start + timedelta(seconds=40), 45110 + 10 * i)]
-    market.append(_tick(TX_INDEX, at("08:50:00"), 45150))
+        market += [tick_at(TX_INDEX, start, 45100 + 10 * i),
+                   trade_info_event(20000, 21500),
+                   tick_at(TX_INDEX, start + timedelta(seconds=30), 45110 + 10 * i),
+                   tick_at(TMF_INDEX, start + timedelta(seconds=40), 45110 + 10 * i)]
+    market.append(tick_at(TX_INDEX, at("08:50:00"), 45150))
     calm = [f"2026/11/06 {b.start:%H:%M}, {b.open:g}, {b.high:g}, {b.low:g}, {b.close:g}, 100"
             for b in calm_history(45000)]
 
@@ -597,11 +507,10 @@ def test_fills_of_other_orders_on_the_shared_reply_line_never_become_ptss_positi
     skcom = FakeSkcom(market=market, klines={"20261106": calm}, on_send=crowded,
                       replayed_rows=(reply_row("N", seq=old, qty=1),
                                      reply_row("D", seq=old, qty=1, price=44000.0)))
-    broker = CapitalBroker("A100000000", "pw", "F0000000000000", com=skcom, settle_seconds=0,
-                           pump_interval=0, connect_timeout=1, fill_timeout=1,
-                           now=_Ticking(at("08:50:00"), timedelta(minutes=10)))
+    broker = capital_broker(skcom, connect_timeout=1, fill_timeout=1,
+                            now=TickingClock(at("08:50:00"), timedelta(minutes=10)))
     notifier = RecordingNotifier()
-    intraday.run(broker, _config(), today=DAY, notify=notifier)
+    intraday.run(broker, LIVE, today=DAY, notify=notifier)
 
     # 市價（M）、IOC（1）、倉別自動（2）、微台不標當沖（0）、買進（0）——送到群益的就是這些
     assert [(o.bstrStockNo, o.sBuySell, o.nQty, o.bstrPrice, o.sTradeType, o.sNewClose,

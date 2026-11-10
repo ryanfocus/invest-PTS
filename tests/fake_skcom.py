@@ -24,6 +24,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
+from broker import TX_CODE
+from broker.capital import CapitalBroker
 
 STOCKS_READY = 3003
 
@@ -106,6 +110,52 @@ class FUTUREORDER(_Struct):
 
 # 商品的系統索引（逐筆成交事件只帶這個）。數字本身沒有意義，只要三個商品互不相同。
 TX_INDEX, MTX_INDEX, TMF_INDEX = 101, 102, 103
+
+
+# ── 群益事件的參數與 CapitalBroker 的測試參數：線路格式只寫在這裡 ─────────────
+
+
+class TickingClock:
+    """本機時鐘的替身（`CapitalBroker(now=...)`）：每被問一次就往前走 `step`。"""
+
+    def __init__(self, start: datetime, step: timedelta):
+        self._t, self._step = start, step
+
+    def __call__(self) -> datetime:
+        t, self._t = self._t, self._t + self._step
+        return t
+
+
+def tick_event(index: int, ymd: int, hhmmss: int, close: int, *, simulate: int = 0,
+               history: bool = False) -> tuple:
+    """`OnNotifyTicksLONG`／`OnNotifyHistoryTicksLONG` 的參數（兩者完全相同，文件 4-4-l／m），
+    照線路上的樣子給：日期、時間是整數（`84500` 沒有前導零），價格放大 100 倍。"""
+    name = "OnNotifyHistoryTicksLONG" if history else "OnNotifyTicksLONG"
+    #       sMarketNo nIndex nPtr nDate nTimehms nTimemillismicros nBid nAsk nClose nQty nSimulate
+    return name, (2, index, 0, ymd, hhmmss, 0, close - 100, close + 100, close, 1, simulate)
+
+
+def tick_at(index: int, t: datetime, price: float) -> tuple:
+    """`tick_event`，時刻與價格照一般的寫法給（`at("08:45:00")`、45100）。"""
+    return tick_event(index, int(f"{t:%Y%m%d}"), t.hour * 10000 + t.minute * 100 + t.second,
+                      round(price * 100))
+
+
+def trade_info_event(buy_deals: int, sell_deals: int, code: str = TX_CODE) -> tuple:
+    """`OnNotifyFutureTradeInfoLONG` 的參數（文件 4-4-q）。前四個數字是**委託**的
+    筆數與口數，筆差用不到；最後兩個才是**成交**買進／賣出筆數。"""
+    #                               sMarketNo nStockIdx 委買筆 委賣筆 委買口 委賣口 成交買筆 成交賣筆
+    return "OnNotifyFutureTradeInfoLONG", (code, 2, TX_INDEX, 9000, 9100, 30000, 31000,
+                                           buy_deals, sell_deals)
+
+
+def capital_broker(skcom: "FakeSkcom", **knobs) -> CapitalBroker:
+    """底下換成 `skcom` 的群益 broker（還沒登入）。測試用的帳密、期貨帳號，以及不必真的等的
+    `settle_seconds=0`、`pump_interval=0` 都在這裡；其餘照 `knobs`。"""
+    knobs.setdefault("account", "F0000000000000")
+    knobs.setdefault("settle_seconds", 0)
+    knobs.setdefault("pump_interval", 0)
+    return CapitalBroker("A100000000", "pw", com=skcom, **knobs)
 STOCK_INDEX = {"TX00AM": TX_INDEX, "MTX00AM": MTX_INDEX, "TM0000AM": TMF_INDEX}
 
 

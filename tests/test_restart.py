@@ -13,29 +13,11 @@ import pytest
 
 from broker import MTX_CODE, TMF_CODE
 from broker.fake import FakeBroker
-from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, contracts, counts,
-                        minute, rally, restarted_at, trade, until)
+from day_script import (DAY, at, clock, counts, make_config, minute, rally, restarted_at,
+                        run_day, trade, until)
 from recording import RecordingNotifier
 import exit_program
-import intraday
 import position_file
-import settings
-
-
-def _config(**overrides) -> settings.Config:
-    values = dict(auto_order_enabled=False, product=TMF_CODE, lots_per_entry=1,
-                  max_position=20, discord_enabled=True)
-    values.update(overrides)
-    return settings.Config(**values)
-
-
-def _run(events, *, config=None, **broker_options):
-    """跑一輪，回傳 (broker, 發出的訊息, 結果)。"""
-    broker = FakeBroker(contracts=contracts(), events=events,
-                        minute_bars={PREVIOUS_DAY: calm_history(45000)}, **broker_options)
-    notifier = RecordingNotifier()
-    outcome = intraday.run(broker, config or _config(), today=DAY, notify=notifier)
-    return broker, notifier.sent, outcome
 
 
 def _bichai(outcome) -> list[tuple]:
@@ -50,8 +32,8 @@ def test_after_a_restart_the_bichai_of_each_bar_comes_back_from_the_raw_market_f
     它們結束那一刻的筆數都沒有記到，筆差是「不知道」——不是當掉前最後的那個值，
     也不是重啟後收到的值。重啟之後的 08:54 起照常。"""
     day = rally("08:45", 12, bichai=1000, bichai_step=10) + [trade(at("08:57:00"), 45230)]
-    _run(until(day, at("08:50:40")))
-    _, _, outcome = _run(restarted_at(day, at("08:54:10")))
+    run_day(until(day, at("08:50:40")))
+    _, _, outcome = run_day(restarted_at(day, at("08:54:10")))
 
     assert _bichai(outcome) == [
         ("08:45", 1000), ("08:46", 1010), ("08:47", 1020), ("08:48", 1030), ("08:49", 1040),
@@ -80,11 +62,11 @@ def test_counts_that_piled_up_while_the_program_was_down_are_not_a_bichai_jump(r
         if i == 2:
             flat.append(counts(at("08:52:55"), buy=20000, sell=21700))
     day = rally("08:45", 5) + flat + [trade(at("08:57:00"), 45140)]
-    on = _config(auto_order_enabled=True)
-    first, _, _ = _run(until(day, at("08:51:40")), config=on)
+    on = make_config(auto_order_enabled=True)
+    first, _, _ = run_day(until(day, at("08:51:40")), config=on)
     assert [o.lots for o in first.orders] == [1]
 
-    _, sent, _ = _run(restarted_at(day, at(restart)), config=on)
+    _, sent, _ = run_day(restarted_at(day, at(restart)), config=on)
     assert [(m.splitlines()[1], m.splitlines()[-1]) for m in sent] == [
         ("觸發：條件 3（追多加碼）", "2026/11/09 08:57:00")]
 
@@ -103,9 +85,9 @@ def test_bars_with_trades_missing_before_the_crash_are_still_not_used_after_a_re
                + [trade(at("08:51:10"), 45160), counts(at("08:51:20"), buy=20000, sell=21500),
                   trade(at("08:51:30"), 45170)]
                + rally("08:52", 7, open_=45180) + [trade(at("08:59:00"), 45260)])
-    _run(until(morning, at("08:52:40")))
+    run_day(until(morning, at("08:52:40")))
 
-    _, sent, _ = _run(restarted_at(morning, at("08:53:10")))
+    _, sent, _ = run_day(restarted_at(morning, at("08:53:10")))
 
     assert [m.splitlines()[-1] for m in sent] == ["2026/11/09 08:58:00", "2026/11/09 08:59:00"]
 
@@ -123,13 +105,13 @@ def test_a_quick_restart_does_not_judge_the_last_bar_again():
     08:50 那根在當掉時還沒結束，筆差當成不知道，08:51 不進場；08:52 起照常，累計接在
     部位檔原來的口數後面。"""
     day = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
-    on = _config(auto_order_enabled=True)
-    first, _, _ = _run(until(day, at("08:50:05")), config=on)
+    on = make_config(auto_order_enabled=True)
+    first, _, _ = run_day(until(day, at("08:50:05")), config=on)
     assert len(first.orders) == 1
 
     restart = restarted_at(day, at("08:50:20"))
     restart.insert(1, counts(at("08:50:20"), buy=20000, sell=21500))
-    second, sent, _ = _run(restart, config=on)
+    second, sent, _ = run_day(restart, config=on)
     assert len(second.orders) == 2
     assert [(m.splitlines()[2], m.splitlines()[-1]) for m in sent] == [
         ("累計：多單 2 口，均價 45160", "2026/11/09 08:52:00"),
@@ -147,8 +129,8 @@ def test_the_raw_market_file_keeps_each_trade_once_across_a_restart(market_dir):
     依時間排好——ticket 03 拿它看筆差，作者日後拿它做 tick 等級的回測，重複的成交會讓
     兩者都失真。當機期間的成交（08:51–08:54）由回補補上。"""
     day = rally("08:45", 12, bichai=1000, bichai_step=10) + [trade(at("08:57:00"), 45230)]
-    _run(until(day, at("08:50:40")))
-    _run(restarted_at(day, at("08:54:10")))
+    run_day(until(day, at("08:50:40")))
+    run_day(restarted_at(day, at("08:54:10")))
 
     rows = (market_dir / "TX-20261109.csv").read_text(encoding="utf-8").splitlines()[1:]
     trades = [r.split(",")[0][11:19] for r in rows if r.split(",")[1]]
@@ -174,11 +156,11 @@ def test_an_order_left_waiting_for_its_fill_by_a_crash_is_uncertain_after_the_re
       * 13:25 出場程式看到「不確定」就不平倉、告警：照部位檔裡的口數平的話，多出來的那一口
         沒人平，微台就過夜。"""
     morning = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
-    on = _config(auto_order_enabled=True)
+    on = make_config(auto_order_enabled=True)
     with pytest.raises(_Killed):
-        _run(until(morning, at("08:50:40")), config=on, order_errors=[_Killed()])
+        run_day(until(morning, at("08:50:40")), config=on, order_errors=[_Killed()])
 
-    second, sent, _ = _run(restarted_at(morning, at("08:51:10")), config=on)
+    second, sent, _ = run_day(restarted_at(morning, at("08:51:10")), config=on)
 
     assert second.orders == []
     assert sent == [
@@ -204,12 +186,12 @@ def test_after_the_restart_that_reported_it_a_further_restart_stays_quiet():
     """當掉留下的「不確定」，重啟後那一輪已經告警、寫下停止進場記錄。之後再重啟一次（又當掉、
     或使用者手動重開）：照樣不進場，但不再告警——同一件事講一次就夠。"""
     morning = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
-    on = _config(auto_order_enabled=True)
+    on = make_config(auto_order_enabled=True)
     with pytest.raises(_Killed):
-        _run(until(morning, at("08:50:40")), config=on, order_errors=[_Killed()])
-    _run(until(restarted_at(morning, at("08:51:10")), at("08:51:40")), config=on)
+        run_day(until(morning, at("08:50:40")), config=on, order_errors=[_Killed()])
+    run_day(until(restarted_at(morning, at("08:51:10")), at("08:51:40")), config=on)
 
-    third, sent, _ = _run(restarted_at(morning, at("08:52:10")), config=on)
+    third, sent, _ = run_day(restarted_at(morning, at("08:52:10")), config=on)
 
     assert third.orders == []
     assert sent == []
@@ -223,12 +205,12 @@ def test_after_a_restart_the_lots_and_product_on_file_carry_on_even_if_the_setti
     微台，08:52:50 盤中程式被重啟。今天已經有小台的部位：照樣看小台的行情、下小台的單，
     累計接在原來的 2 口後面（加碼上限也是）；新設定從下一個交易日起才生效。"""
     day = rally("08:45", 10) + [trade(at("08:55:00"), 45200)]
-    first, _, _ = _run(until(day, at("08:51:40")),
-                       config=_config(auto_order_enabled=True, product=MTX_CODE))
+    first, _, _ = run_day(until(day, at("08:51:40")),
+                       config=make_config(auto_order_enabled=True, product=MTX_CODE))
     assert [o.contract.order_code for o in first.orders] == ["MTX11", "MTX11"]
 
-    second, sent, _ = _run(restarted_at(day, at("08:52:50")),
-                           config=_config(auto_order_enabled=True, product=TMF_CODE,
+    second, sent, _ = run_day(restarted_at(day, at("08:52:50")),
+                           config=make_config(auto_order_enabled=True, product=TMF_CODE,
                                           max_position=3))
     assert second.streamed == [MTX_CODE]
     assert [o.contract.order_code for o in second.orders] == ["MTX11"]
@@ -249,11 +231,11 @@ def test_a_breakout_waiting_before_the_crash_is_not_restored():
            + minute("10:01", 45170, 45175, bichai=1600)
            + minute("10:02", 45175, 45180, bichai=1600)
            + [trade(at("10:03:00"), 45185)])
-    on = _config(auto_order_enabled=True)
-    first, _, _ = _run(until(day, at("10:01:05")), config=on)
+    on = make_config(auto_order_enabled=True)
+    first, _, _ = run_day(until(day, at("10:01:05")), config=on)
     assert len(first.orders) == 1             # 08:50 條件 1
 
-    second, sent, _ = _run(restarted_at(day, at("10:01:20")), config=on)
+    second, sent, _ = run_day(restarted_at(day, at("10:01:20")), config=on)
     assert second.orders == []
     assert sent == []
 
@@ -265,12 +247,12 @@ def test_a_raw_market_line_cut_off_by_the_crash_is_skipped_and_new_lines_start_f
     """當掉那一刻最後一行只寫了一半。重啟後讀不懂的那一行略過，其餘照樣讀回；新的行情另起
     一行寫，不黏在半行後面（黏上去的話，兩行一起讀不懂）。"""
     day = rally("08:45", 12, bichai=1000, bichai_step=10) + [trade(at("08:57:00"), 45230)]
-    _run(until(day, at("08:50:40")))
+    run_day(until(day, at("08:50:40")))
     path = market_dir / "TX-20261109.csv"
     with open(path, "a", encoding="utf-8", newline="") as fh:
         fh.write("2026-11-09T08:50:4")
 
-    _, _, outcome = _run(restarted_at(day, at("08:54:10")))
+    _, _, outcome = run_day(restarted_at(day, at("08:54:10")))
 
     assert _bichai(outcome)[:5] == [("08:45", 1000), ("08:46", 1010), ("08:47", 1020),
                                     ("08:48", 1030), ("08:49", 1040)]
