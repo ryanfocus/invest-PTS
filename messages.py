@@ -372,10 +372,10 @@ def exit_missed_unreadable(*, at: datetime, day: date, reason: str) -> str:
 
 
 def _missed_reason(day: str) -> str:
-    """出場程式那天為什麼沒平：排程補跑落在隔天或週末，或那天跑到一半停了——分不出是哪一種，
-    兩種都講。"""
-    return (f"原因：出場程式 {day} 沒有跑完（電腦當時關機、睡著，或出場程式中途停了），"
-            "這一次執行才發現。那天的日盤已經收盤，不送單")
+    """出場程式那天為什麼沒平：排程補跑落在隔天或週末、那天跑到一半停了，或那天的告警沒有
+    送出去（網路斷了，`exit_program.done_path`）——分不出是哪一種，都講。"""
+    return (f"原因：出場程式 {day} 沒有跑完（電腦當時關機、睡著，出場程式中途停了，"
+            "或告警沒有送出去），這一次執行才發現。那天的日盤已經收盤，不送單")
 
 
 def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,

@@ -15,7 +15,8 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from broker import BUY, SELL, TMF_CODE, FillQuery, FillUnknown, LoginFailed, OrderFailed
+from broker import (BUY, SELL, TMF_CODE, FillQuery, FillUnknown, LoginFailed, LoginUnavailable,
+                    OrderFailed)
 from broker.fake import FakeBroker
 from day_script import (DAY, SETTLEMENT_DAY, WEBHOOK, main_env, make_config, position_content,
                         position_on_file as _file, settings_yaml, write_position_file)
@@ -665,6 +666,72 @@ def test_a_failed_login_is_reported_at_once_with_the_lots_to_close():
     ]
 
 
+_OFFLINE = LoginUnavailable("群益登入沒有成功（網路或群益主機），代碼 1108：因網路異常，無法連線")
+
+
+def test_a_login_lost_to_the_network_is_retried_a_minute_later():
+    """13:25 電腦剛從睡眠醒來，網路還沒好：群益回「網路異常」（`LoginUnavailable`）。這時一張
+    平倉單都還沒送出去，帳上確定沒有異動，和「平倉單沒送出去」一樣每分鐘再試（規格第 34 條）。
+    13:26 網路好了：登入、平倉，不打擾人。"""
+    _on_file()
+    broker, sent, time = _run(login_error=[_OFFLINE, None])
+    assert _orders(broker) == [("TM2611", SELL, 3, False, DAY)]
+    assert time.slept == [60]
+    assert sent == []
+    assert [e["lots"] for e in _file()["exits"]] == [3]
+
+
+def test_a_network_that_never_comes_back_is_reported_after_three_retries():
+    """13:25 起每分鐘再登入一次，13:28 還是連不上：還剩 3 口，告警「部位還在」，原因是最後一次
+    登入失敗的訊息。"""
+    _on_file()
+    broker, sent, time = _run(login_error=_OFFLINE)
+    assert broker.orders == []
+    assert time.slept == [60, 60, 60]
+    assert sent[0].splitlines()[:3] == [
+        "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口",
+        "原因：平倉單重試 3 次都沒能送出（最後一次：群益登入沒有成功（網路或群益主機），"
+        "代碼 1108：因網路異常，無法連線）",
+        "請自行賣出微台 3 口（TM2611），日盤 13:45 收盤。",
+    ]
+
+
+# --- 告警送不出去：那一天不算處理完（下一次執行再講一次）---
+
+
+class _Offline(RecordingNotifier):
+    """Discord 送不出去（網路斷了）：每一則都記下來，但回報失敗。"""
+
+    def __call__(self, text: str) -> bool:
+        super().__call__(text)
+        return False
+
+
+class _Broken(RecordingNotifier):
+    """送 Discord 的那一步拋例外（不該發生，但出場程式不能因此停下）。"""
+
+    def __call__(self, text: str) -> bool:
+        super().__call__(text)
+        raise OSError("網路斷了")
+
+
+@pytest.mark.parametrize("notifier", [_Offline, _Broken], ids=["回報失敗", "拋例外"])
+def test_an_alert_that_did_not_go_out_is_told_again_on_the_next_run(notifier):
+    """週一 13:25 網路斷了：平倉單送不出去、「部位還在」的告警也送不出去。使用者什麼都不知道，
+    微台就這樣過夜——所以那一天不寫出場記錄，週二出場程式執行時把週一那 3 口再講一次。"""
+    _on_file()
+    first = notifier()
+    exit_program.run(FakeBroker(fill_price=45200.0, login_error=_OFFLINE), LIVE, notify=first,
+                     clock=_Time(_at("13:25")).clock, sleep=lambda seconds: None)
+    assert [m.splitlines()[0] for m in first.sent] == [
+        "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口"]
+
+    _intraday_ran(TUESDAY)
+    _, tuesday, _ = _run(at=_at("13:25", TUESDAY))
+    assert [m.splitlines()[0] for m in tuesday] == [
+        "【要你處理】PTS 部位還在：11/09 的微台沒有平倉，還剩多單 3 口"]
+
+
 # --- 13:20 之前被叫起來：盤中程式可能還在進場 ---
 
 
@@ -697,7 +764,7 @@ LATER = {
 def _monday_missed(at: datetime) -> str:
     return (
         "【要你處理】PTS 部位還在：11/09 的微台沒有平倉，還剩多單 3 口\n"
-        "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，或出場程式中途停了），"
+        "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，出場程式中途停了，或告警沒有送出去），"
         "這一次執行才發現。那天的日盤已經收盤，不送單\n"
         "請先到券商 APP 確認帳戶（你可能已經自己平掉了），還在的話請自行賣出微台 3 口（TM2611）。"
         "TM2611 的最後交易日是 11/18：過了那天 13:30 還在的口數由交易所以最後結算價現金了結，"
@@ -769,7 +836,7 @@ def test_an_uncertain_micro_position_on_a_missed_day_is_reported():
         "【要你處理】PTS 委託送出去了，但不知道成交幾口：11/09 的微台沒有平倉\n"
         "不確定的委託：進場買進微台 1 口（委託序號 2315609990003），已知至少成交 0 口\n"
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
-        "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，或出場程式中途停了），"
+        "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，出場程式中途停了，或告警沒有送出去），"
         "這一次執行才發現。那天的日盤已經收盤，不送單\n"
         "請到券商 APP 確認帳戶，自行平掉 PTS 還在的微台部位。TM2611 的最後交易日是 11/18：過了那天 "
         "13:30 還在的口數由交易所以最後結算價現金了結，不必再平。\n"

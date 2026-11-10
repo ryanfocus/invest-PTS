@@ -35,7 +35,9 @@ class FakeBroker:
       ——市價單成交在當下的價格。兩者都沒有就拒絕送單（那是測試沒寫對）。
     - `fills`：每筆委託實際成交幾口，逐筆消耗。沒給就是全部成交。
     - `order_errors`：每筆委託要拋的例外（`None` 代表照常成交），逐筆消耗。
-    - `minute_bars_error`：查 1 分 K 時要拋的例外（每次都拋）。
+    - `login_error`／`contracts_error`／`minute_bars_error`：登入、查商品清單、查 1 分 K 時要拋的
+      例外。給一個例外是每次都拋；給一個清單是逐次消耗（`None` 代表那一次照常），用完之後照常
+      ——「第一次斷線、一分鐘後好了」就是 `[LoginUnavailable(...), None]`。
     - `fill_queries`：成交查詢（`query_fills`）的答案，逐次消耗。**沒安排卻被查就是
       AssertionError**：查詢只該出現在出場單不確定之後，測試沒預期到它就是流程走錯路。
     """
@@ -49,9 +51,9 @@ class FakeBroker:
         fill_price: float | None = None,
         fills: Iterable[int] | None = None,
         order_errors: Iterable[Exception | None] = (),
-        login_error: Exception | None = None,
-        contracts_error: Exception | None = None,
-        minute_bars_error: Exception | None = None,
+        login_error: Exception | list[Exception | None] | None = None,
+        contracts_error: Exception | list[Exception | None] | None = None,
+        minute_bars_error: Exception | list[Exception | None] | None = None,
         fill_queries: Iterable[FillQuery] = (),
     ):
         self._contracts = contracts or {}
@@ -61,9 +63,9 @@ class FakeBroker:
         self._last_product_price: float | None = None
         self._fills = list(fills) if fills is not None else None
         self._order_errors = list(order_errors)
-        self._login_error = login_error
-        self._contracts_error = contracts_error
-        self._minute_bars_error = minute_bars_error
+        self._login_error = _Failures(login_error)
+        self._contracts_error = _Failures(contracts_error)
+        self._minute_bars_error = _Failures(minute_bars_error)
         self._fill_queries = list(fill_queries)
         # 被查過的委託，依序：(委託序號, 交易日, 委託口數)。出場單不確定時查的必須是
         # **那一張出場單**——拿進場單的序號去查，查到的是早上的成交，看起來就像已經平倉。
@@ -77,17 +79,14 @@ class FakeBroker:
         self.streamed: list[str] = []
 
     def login(self) -> None:
-        if self._login_error is not None:
-            raise self._login_error
+        self._login_error.next()
 
     def get_contracts(self) -> dict[str, ContractInfo]:
-        if self._contracts_error is not None:
-            raise self._contracts_error
+        self._contracts_error.next()
         return dict(self._contracts)
 
     def minute_bars(self, day: date) -> list[MinuteBar]:
-        if self._minute_bars_error is not None:
-            raise self._minute_bars_error
+        self._minute_bars_error.next()
         return list(self._minute_bars.get(day, []))
 
     def events(self, product: str) -> Iterator[MarketEvent]:
@@ -133,3 +132,17 @@ class FakeBroker:
             # 真的 broker 認得出成交列就一定讀得到價格（讀不到是看不懂，算查詢失敗）
             raise AssertionError("查到成交卻沒有成交價：給 FillQuery(lots=…, avg_price=…)")
         return answer
+
+
+class _Failures:
+    """劇本裡某一個呼叫的失敗：一個例外是每次都拋，一個清單是逐次消耗、用完之後照常。"""
+
+    def __init__(self, spec: Exception | list[Exception | None] | None):
+        self._always = spec if isinstance(spec, BaseException) else None
+        self._each = [] if spec is None or self._always is not None else list(spec)
+
+    def next(self) -> None:
+        """這一次呼叫該失敗就拋出例外。"""
+        error = self._each.pop(0) if self._each else self._always
+        if error is not None:
+            raise error
