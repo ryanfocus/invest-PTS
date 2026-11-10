@@ -98,6 +98,7 @@
   把結論寫進規格；選「不發」的話，要改的是 `intraday._QuoteWatch` 與
   `test_no_quotes_after_the_open_may_be_a_day_off_and_the_alert_says_so`、
   `test_a_day_off_found_only_by_the_quotes_is_not_reported_as_the_program_not_running`。
+  2026-11-10 使用者決定：A（照樣發一則）。規格第 40、53 條已補上這個例外。
 
 **2026-11-10（第二次審查修正，取代上面「中斷期間不進場本來就成立」那一句）：**
 
@@ -110,3 +111,12 @@
 - 告警之前（筆數停了不到 3 分鐘、成交照常），等待中的突破進場照樣會被碰到、會進場：設定之後只看
   價格（規格第 21 條），價格是即時收到的。3 分鐘以內的筆數停頓不算報價中斷，只讓那幾根的筆差變成
   不知道。測試：`test_a_waiting_breakout_is_cancelled_when_an_outage_is_reported`。
+
+**2026-11-10（整合分支 code review 修正）：**
+
+- **當天的設定在第一次啟動時凍結**：自動下單開關、交易商品、每次進場口數、加碼上限寫成
+  `state/day-settings-YYYYMMDD.json`，同一天重啟照它；Discord 開關不凍結。原本重啟時重讀，當天改了
+  開關之後生不生效，看盤中程式有沒有剛好當掉——真實進場後關掉開關的話，重啟後的「模擬」進場疊在帳上
+  的真單上（SPEC-X-2）。
+- **模擬部位跨重啟**：模擬模式的部位寫進 `state/sim-position-YYYYMMDD.json`，重啟後接著累計、加碼上限
+  照它算；出場程式不讀它（SPEC-D-2）。取代上面測試說明裡「重啟前那一輪的模擬部位不留」。
