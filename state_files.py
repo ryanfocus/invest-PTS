@@ -11,6 +11,7 @@
 | `login-failed-YYYYMMDD.txt` | 盤中程式 | 盤中程式（下一次被叫醒） | `intraday.login_failed_path` |
 | `exit-done-YYYYMMDD.txt` | 出場程式 | 出場程式（之後每一次執行） | `exit_program.done_path` |
 | `day-settings-YYYYMMDD.json` | 盤中程式（當天第一次啟動） | 盤中程式（重啟） | `day_settings` |
+| `sim-position-YYYYMMDD.json` | 盤中程式（模擬模式） | 盤中程式（重啟）；出場程式**絕不讀** | `sim_position` |
 | `intraday.lock` | 盤中程式 | — | `intraday._alone` |
 
 兩支程式之間只靠部位檔與心跳記錄溝通（規格「兩支程式」一節）；其他的都只有寫它的那支程式讀。

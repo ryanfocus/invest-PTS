@@ -79,7 +79,7 @@ def test_bars_with_trades_missing_before_the_crash_are_still_not_used_after_a_re
 
     重啟後手上只有原始行情檔，記憶體裡「哪幾根缺了成交」跟著當掉的那一輪一起沒了；從檔裡的
     成交時間重新認出來，它們還在最近 6 根裡時照樣不判斷——和沒當掉的那一天一樣，08:58:00
-    才又進場（模擬模式，重啟前那一輪的模擬部位不留）。"""
+    才又進場（模擬模式）。"""
     morning = (rally("08:45", 5)
                + [clock(at("08:50:00")), trade(at("08:50:00"), 45150),
                   counts(at("08:50:20"), buy=20000, sell=21500)]
@@ -279,6 +279,34 @@ def test_a_settings_snapshot_that_cannot_be_read_is_rewritten_from_the_settings_
 
     second, _, _ = run_day(restarted_at(_STRONG, at("08:52:50")), config=make_config())
     assert len(second.orders) == 2
+
+
+def test_after_a_restart_the_simulated_position_carries_on():
+    """模擬模式、加碼上限 3：08:50、08:51 各模擬 1 口，08:51:40 當掉，08:52:50 重啟。模擬的部位
+    要接著累計（規格第 42 條：照常判斷），加碼上限也照它算：重啟後再模擬 1 口就到上限。歸零的話，
+    累計口數講錯、上限被突破，模擬出來的進場和實盤會走的路不同——而模擬模式就是拿來在上線前
+    核對這條路的。"""
+    capped = make_config(max_position=3)
+    run_day(until(_STRONG, at("08:51:40")), config=capped)
+
+    second, sent, _ = run_day(restarted_at(_STRONG, at("08:52:50")), config=capped)
+
+    assert second.orders == []
+    assert [m.splitlines()[0::2] for m in sent] == [
+        ["【模擬】PTS 做多：買進微台 1 口 @ 45190", "累計：多單 3 口，均價 45166.67"]]
+
+
+def test_the_exit_program_never_takes_a_simulated_position_for_a_real_one():
+    """模擬的部位記在另一個檔：出場程式只看部位檔，拿模擬的口數去平倉的話，那筆「平倉」單就是
+    開出來的反向新倉。（盤中程式 08:51:40 之後沒有再跑，出場程式照樣講這件事。）"""
+    run_day(until(_STRONG, at("08:51:40")))
+    exit_broker = FakeBroker(fill_price=45200.0)
+    notifier = RecordingNotifier()
+    exit_program.run(exit_broker, make_config(), notify=notifier, clock=lambda: at("13:25:00"),
+                     sleep=lambda seconds: None)
+    assert exit_broker.orders == []
+    assert [m.splitlines()[0] for m in notifier.sent] == [
+        "【要你處理】PTS 盤中程式今天 08:51 之後就沒有再跑"]
 
 
 def test_the_discord_switch_is_not_frozen():

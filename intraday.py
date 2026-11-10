@@ -10,7 +10,8 @@
 
   * 自動下單打開：送出市價 IOC → 把實際成交寫進部位檔 → 發一則成交訊息（ticket 06）。
   * 自動下單關閉（模擬模式）：在交易商品當下的價格模擬成交，發一則標示「模擬」的訊息，
-    **完全不呼叫下單 API**、不寫部位檔（ticket 04）。
+    **完全不呼叫下單 API**、不寫部位檔（ticket 04）。模擬的部位記在另一個檔（`sim_position`），
+    重啟後接著累計，出場程式不看它。
 
 立刻進場與突破進場被觸發走的是同一條路（`_Trading._execute`），開關只在那裡分岔。
 
@@ -104,6 +105,7 @@ import paths
 import position_file
 import raw_market
 import settings
+import sim_position
 import state_files
 import strategy
 from broker import (BUY, SELL, TX_CODE, Broker, BrokerError, Clock, ContractInfo,
@@ -691,8 +693,8 @@ class _Trading:
     """每根 K 棒結束時問策略，條件成立就進場、累計部位、發通知；盯等待中的突破進場。
 
     自動下單關閉時是模擬模式（規格第 42 條）：成交價是交易商品**當下的價格**（最新一筆
-    成交），部位只留在記憶體裡——**不寫部位檔**。出場程式看的是部位檔，模擬的口數不能
-    讓它以為今天有部位。打開時才有 `orders`，那是唯一會呼叫下單函式的路徑。
+    成交），部位記在模擬部位（`sim_position`）——**不寫部位檔**。出場程式看的是部位檔，模擬的
+    口數不能讓它以為今天有部位。打開時才有 `orders`，那是唯一會呼叫下單函式的路徑。
     """
 
     def __init__(self, config: settings.Config, notify: Callable[[str], bool],
@@ -706,7 +708,7 @@ class _Trading:
         self._orders = orders
         self._today = today
         self._product = product
-        self.position = _held(record)
+        self.position = _held(record) if orders is not None else self._simulated_so_far()
         # 當天不再進場。部位不確定時，帳上的口數不知道，部位不虧、加碼上限都算不了
         # （規格第 50 條）——啟動時讀到「不確定」、或今天這裡送出的委託變成不確定
         # （`_fill_unknown`）；委託被拒（`_not_sent`）、成交寫不進部位檔（`_not_on_file`）
@@ -730,6 +732,16 @@ class _Trading:
         self.product_price: float | None = None
         # 等待中的突破進場。同一時間最多一筆（規格第 21 條）；只在記憶體裡，重啟不恢復（第 48 條）
         self.breakout: strategy.Breakout | None = None
+
+    def _simulated_so_far(self) -> strategy.Position | None:
+        """模擬模式：今天稍早（重啟之前）模擬累計的部位。讀不懂的話今天不再模擬進場——累計口數與
+        加碼上限都算不了；只是模擬，記 log 就好。"""
+        try:
+            return sim_position.read(self._today)
+        except sim_position.Unreadable as exc:
+            logger.error("模擬部位讀不懂，今天不再模擬進場：%s", exc)
+            self._stopped = True
+            return None
 
     def report_uncertain_entry_left_by_last_run(self, now: datetime) -> None:
         """重啟前那一輪送出進場單之後、告警之前就停了：替它發「委託送出去了，但…」的告警
@@ -940,6 +952,12 @@ class _Trading:
         logger.info("模擬進場：%s %s %d 口 @ %g，累計 %d 口，均價 %.2f",
                     decision.condition.value, decision.direction, decision.lots, price,
                     total, avg)
+        try:
+            sim_position.write(self._today, self.position)
+        except Exception as exc:  # noqa: BLE001
+            # 只是模擬：記 log、照樣發訊息。代價是重啟後從檔裡那一份接著累計。
+            logger.error("模擬部位寫不進 %s（%s: %s）", sim_position.path_for(self._today),
+                         type(exc).__name__, exc)
         self._send(messages.entry(
             at=now, product=self._product, direction=decision.direction,
             condition=decision.condition, lots=decision.lots, price=price,

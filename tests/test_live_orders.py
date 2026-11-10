@@ -25,6 +25,8 @@ from fake_skcom import (TMF_INDEX, TX_INDEX, FakeSkcom, TickingClock, capital_br
 from recording import RecordingNotifier
 import intraday
 import position_file
+import sim_position
+import strategy
 
 # 這個檔的每一輪都打開自動下單：要的就是真的送單
 LIVE = make_config(auto_order_enabled=True)
@@ -383,20 +385,31 @@ def test_a_position_on_file_that_is_losing_blocks_conditions_1_and_2():
     assert sent == []
 
 
-@pytest.mark.parametrize("auto", [True, False], ids=["自動下單", "模擬模式"])
-def test_a_signal_against_the_direction_on_file_is_never_entered(auto):
+_AGAINST_LONG = (rally("08:45", 6, open_=44900, step=-10, bichai=-1500)
+                 + [trade(at("08:51:00"), 44830)])
+
+
+def test_a_signal_against_the_direction_on_file_is_never_entered():
     """一天只做一個方向（規格第 17 條）。部位檔記著今天稍早的多單 2 口 @ 44000，重啟後
     這一次卻判斷成開低（例如前一交易日的 1 分 K 這次查不到，往前多退一天，昨收變了），
     條件 2 每分鐘成立。賣單一送出，倉別「自動」會把它變成平倉：帳上剩 1 口，部位檔卻記成
     多單 3 口，13:25 出場程式賣 3 口，就開出空單 2 口帶過夜。所以一筆都不送、不寫、
-    不發成交訊息；模擬模式也不把反向的口數累計進部位。"""
+    不發成交訊息。"""
     content = _on_file(entries=[{"order_seq": "2315619999999", "lots": 2, "price": 44000.0}])
-    events = (rally("08:45", 6, open_=44900, step=-10, bichai=-1500)
-              + [trade(at("08:51:00"), 44830)])
-    broker, sent = _run(events, config=make_config(auto_order_enabled=auto))
+    broker, sent = _run(_AGAINST_LONG)
     assert broker.orders == []
     assert sent == []
     assert _file() == content
+
+
+def test_a_simulated_signal_against_the_simulated_direction_is_never_entered():
+    """模擬模式也一樣：今天稍早模擬了多單 2 口（重啟前），這一次判斷成開低，不把反向的口數
+    累計進模擬部位，也不發模擬訊息。"""
+    sim_position.write(DAY, strategy.Position(strategy.LONG, 2, 44000.0))
+    broker, sent = _run(_AGAINST_LONG, config=make_config())
+    assert broker.orders == []
+    assert sent == []
+    assert sim_position.read(DAY) == strategy.Position(strategy.LONG, 2, 44000.0)
 
 
 def test_a_position_file_left_from_another_day_is_not_todays_position():
