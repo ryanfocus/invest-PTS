@@ -462,7 +462,8 @@ def _stop_for_unreadable_position_file(config: settings.Config, notify: Callable
         logger.info("今天稍早已經停止進場（%s），不再告警", stop_path(today))
         return
     _write_stop(today, f"{today:%Y/%m/%d} 部位檔讀不懂：{exc}")
-    _send(config, notify, messages.position_file_unreadable(day=today, reason=str(exc)))
+    _send(config, notify, messages.position_file_unreadable(
+        day=today, reason=str(exc), entry_log=paths.shown_log("intraday", today)))
 
 
 def _missing_bars(previous: datetime, t: datetime) -> set[datetime]:

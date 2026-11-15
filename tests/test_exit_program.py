@@ -235,6 +235,7 @@ def test_a_position_file_that_cannot_be_read_sends_nothing_and_says_so(text):
         "PTS 今天可能還有部位：請到券商 APP 確認帳戶。"
         "微台要自行平掉（日盤 13:45 收盤；今天如果是結算日，到期的近月 13:30 就停止交易，"
         "之後由交易所以最後結算價現金了結）；大台、小台標了當沖，券商 13:30 會強平。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
         "2026/11/09 13:25:00",
     ]
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:
@@ -272,7 +273,7 @@ def test_an_uncertain_entry_on_file_sends_nothing_and_says_what_is_known():
         "【要你處理】PTS 委託送出去了，但不知道成交幾口，出場程式不再送單\n"
         "不確定的委託：進場買進微台 1 口（委託序號 2315609990003），已知至少成交 0 口\n"
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
-        "請到券商 APP 確認帳戶，自行平掉 PTS 的微台部位（日盤 13:45 收盤）。\n"
+        "請在日盤 13:45 收盤前自行賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。\n"
         "2026/11/09 13:25:00",
     ]
     assert _file() == content
@@ -294,9 +295,9 @@ def test_an_uncertain_exit_on_file_is_never_sent_again():
 
 UNCERTAIN_DEADLINES = {
     "一般日收盤後": (DAY, "13:50", "2026-11-18",
-                "請到券商 APP 確認帳戶，在夜盤自行平掉 PTS 的微台部位（日盤 13:45 已經收盤）。"),
+                "日盤 13:45 已經收盤，請在夜盤自行賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。"),
     "結算日 13:30 前": (date(2026, 11, 18), "13:25", "2026-11-18",
-                    "請到券商 APP 確認帳戶，在 13:30 前自行平掉 PTS 的微台部位：今天是結算日，"
+                    "請在 13:30 前自行賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。今天是結算日，"
                     "近月 13:30 停止交易，之後還在的口數由交易所以最後結算價現金了結。"),
     "結算日 13:30 後": (date(2026, 11, 18), "13:35", "2026-11-18",
                     "今天是結算日，近月 13:30 已經停止交易，不能再平：PTS 還在的微台部位由交易所"
@@ -545,7 +546,8 @@ def test_an_exit_order_not_confirmed_by_the_lookup_is_never_sent_again(answer, s
         f"已知至少成交 {known} 口\n"
         f"券商的成交紀錄：{said}\n"
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
-        "請到券商 APP 確認帳戶，自行平掉 PTS 的微台部位（日盤 13:45 收盤）。\n"
+        "請在日盤 13:45 收盤前自行賣出微台（TM2611）：部位檔的多單 3 口，減掉委託序號 2315610000001 "
+        f"實際成交的口數，也就是 0～{3 - known} 口（到券商 APP 用委託序號查這筆成交了幾口）。\n"
         "2026/11/09 13:25:00",
     ]
     assert (_file()["status"], _file()["exits"]) == ("UNCERTAIN", [])
@@ -814,6 +816,7 @@ def test_a_missed_day_whose_position_file_cannot_be_read_is_reported_and_today_s
     assert sent[0].splitlines()[2] == (
         "PTS 那天可能留下微台部位：請到券商 APP 確認帳戶，還在的話請自行平掉。大台、小台標了當沖，"
         "那天 13:30 已經由券商強平。")
+    assert sent[0].splitlines()[3] == "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。"
 
 
 def test_an_uncertain_micro_position_on_a_missed_day_is_reported():
@@ -828,7 +831,8 @@ def test_an_uncertain_micro_position_on_a_missed_day_is_reported():
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
         "原因：出場程式 11/09 沒有跑完（電腦當時關機、睡著，出場程式中途停了，或告警沒有送出去），"
         "這一次執行才發現。那天的日盤已經收盤，不送單\n"
-        "請到券商 APP 確認帳戶，自行平掉 PTS 還在的微台部位。TM2611 的最後交易日是 11/18：過了那天 "
+        "請先到券商 APP 確認帳戶（你可能已經自己平掉了），還在的話請自行"
+        "賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。TM2611 的最後交易日是 11/18：過了那天 "
         "13:30 還在的口數由交易所以最後結算價現金了結，不必再平。\n"
         "2026/11/10 08:10:00",
     ]
@@ -991,12 +995,14 @@ CRASH_DEADLINES = {
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。微台要自行平掉（日盤 13:45 "
         "收盤；今天如果是結算日，到期的近月 13:30 就停止交易，之後由交易所以最後結算價現金"
         "了結）。大台、小台由券商 13:30 當沖強平。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
         "自己平掉之後，不要再執行出場程式：它只認部位檔，會把你平掉的口數再平一次，開出反向新倉。",
     ]),
     "日盤收盤後": ("13:50", [
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。日盤 13:45 已經收盤，"
         "微台請在夜盤自行平掉（今天如果是結算日，到期的近月已經由交易所以最後結算價現金"
         "了結，不必平）。大台、小台由券商 13:30 當沖強平。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
     ]),
 }
 
@@ -1079,3 +1085,22 @@ def test_settings_that_cannot_be_read_but_say_discord_is_off_send_nothing(tmp_pa
     assert code == 1
     assert _orders(brokers[0]) == [("TM2611", SELL, 3, False, DAY)]
     assert posted.sent == []
+
+
+EXIT_FILLS = {
+    "送單當下就知道成交": dict(),
+    "查詢之後才確認成交": dict(order_errors=[_SENT_BUT_UNKNOWN],
+                       fill_queries=[FillQuery(lots=3, avg_price=45210.0)]),
+}
+
+
+@pytest.mark.parametrize("broker_options", EXIT_FILLS.values(), ids=EXIT_FILLS.keys())
+def test_every_exit_fill_is_logged_under_the_word_the_alerts_point_to(broker_options, caplog):
+    """部位檔讀不懂、出場程式中止時，告警叫人從 log 算 PTS 的口數：找「平倉成交」。送單當下
+    就知道成交的、查詢之後才確認的，都要寫成這個字——少了一種，算出來的口數就少了那幾口。"""
+    caplog.set_level("INFO", logger="exit_program")
+    _on_file()
+    _run(**broker_options)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("平倉成交")]
+    assert len(lines) == 1
+    assert "3 口" in lines[0]

@@ -172,7 +172,7 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
         # 新倉；當成沒有部位，微台就過夜。檔案原封不動，留給人工處理。
         logger.error("部位檔讀不懂，不送任何單：%s", exc)
         say(messages.exit_position_file_unreadable(
-            at=now, reason=str(exc), closed=now.time() >= DAY_SESSION_CLOSE))
+            at=now, reason=str(exc), closed=now.time() >= DAY_SESSION_CLOSE, **_logs(today)))
         return Ending.POSITION_FILE_UNREADABLE
     if record is None:
         return Ending.NO_POSITION
@@ -226,7 +226,8 @@ def _report_missed(today: date, now: datetime, say: Callable[[str], bool]) -> No
         except position_file.Unreadable as exc:
             # 不知道那天留下什麼，照實講。今天的出場照常：一份舊檔不能讓今天的微台也過夜。
             logger.error("%s 的部位檔讀不懂，出場程式那天又沒有跑完：%s", day, exc)
-            told = say(messages.exit_missed_unreadable(at=now, day=day, reason=str(exc)))
+            told = say(messages.exit_missed_unreadable(at=now, day=day, reason=str(exc),
+                                                       **_logs(day)))
             record = None
         # 大台、小台那天 13:30 已經被券商當沖強平（規格第 30 條），跟出場程式有沒有跑無關
         if (record is not None and record.product not in DAY_TRADE_CODES
@@ -236,6 +237,12 @@ def _report_missed(today: date, now: datetime, say: Callable[[str], bool]) -> No
             told = say(messages.exit_missed(at=now, record=record))
         if told:
             _mark_done(day, f"那天沒有跑完，{now:%Y-%m-%d %H:%M} 才發現")
+
+
+def _logs(day: date) -> dict[str, str]:
+    """告警叫人從 log 算 PTS 口數時，那一天兩支程式的 log 位置（`messages._count_from_logs`）。"""
+    return {"entry_log": paths.shown_log("intraday", day),
+            "exit_log": paths.shown_log("exit", day)}
 
 
 def done_path(day: date) -> str:
@@ -455,8 +462,10 @@ class _MicroExit:
 
         found = self._broker.query_fills(seq, self._today, lots)
         if found.lots == lots:
-            logger.info("成交查詢：委託 %s 全部成交 %d 口 @ %g，視為已平倉", seq, lots,
-                        found.avg_price)
+            # 和送單當下就知道成交的那種寫成同一個字：告警叫人從 log 算口數時只要找「平倉成交」
+            # （`messages._count_from_logs`）。
+            logger.info("平倉成交（成交查詢確認）：%s %d 口 @ %g（委託 %s）",
+                        record.order_code, lots, found.avg_price, seq)
             self._ledger.save(replace(record, exits=record.exits + (
                 position_file.Fill(seq, lots, found.avg_price),)))
             return
@@ -583,7 +592,7 @@ def _scheduled_exit(connect: Callable[[settings.Secrets], Broker], *,
         now = clock()
         _send(config, notify, messages.exit_crashed(
             at=now, reason=f"{type(exc).__name__}: {exc}",
-            closed=now.time() >= DAY_SESSION_CLOSE))
+            closed=now.time() >= DAY_SESSION_CLOSE, **_logs(now.date())))
         return 1
     return status
 

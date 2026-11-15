@@ -168,8 +168,8 @@ def test_an_order_sent_without_a_fill_report_is_on_file_as_uncertain_and_ends_en
         "這次：買進微台 1 口（委託序號 2315610000001）\n"
         "原因：30 秒內沒等到委託 2315610000001 結束\n"
         "部位檔已記為「不確定」：盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。\n"
-        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平：PTS 今天的微台部位"
-        "要你自己在 13:30 前平掉。\n"
+        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平，要你自己在 13:30 前賣出微台："
+        "這筆實際成交幾口就平幾口（0～1 口）。\n"
         "2026/11/09 08:50:00",
     ]
 
@@ -203,8 +203,8 @@ def test_on_the_micro_the_alert_counts_the_confirmed_lots_the_user_must_also_clo
 
     assert len(sent) == 2
     assert sent[1].splitlines()[4] == (
-        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平：PTS 今天的微台部位"
-        "（部位檔已確認的多單 1 口，加上這筆實際成交的）要你自己在 13:30 前平掉。")
+        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平，要你自己在 13:30 前賣出微台："
+        "部位檔已確認的多單 1 口，加上這筆實際成交的口數，也就是 1～2 口。")
     assert _file()["entries"] == [{"order_seq": "2315610000001", "lots": 1, "price": 45150.0}]
     assert _file()["status"] == "UNCERTAIN"
 
@@ -226,8 +226,8 @@ def test_when_the_order_seq_cannot_be_written_the_file_still_says_uncertain_from
     assert sent[0].splitlines()[3:5] == [
         "部位檔已記為「不確定」（這筆的委託序號沒寫進去：PermissionError: [Errno 13] 存取被拒）："
         "盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。",
-        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平：PTS 今天的微台部位"
-        "（部位檔已確認的多單 2 口，加上這筆實際成交的）要你自己在 13:30 前平掉。",
+        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平，要你自己在 13:30 前賣出微台："
+        "部位檔已確認的多單 2 口，加上這筆實際成交的口數，也就是 2～3 口。",
     ]
 
 
@@ -259,8 +259,8 @@ def test_when_the_first_order_is_uncertain_and_cannot_be_written_the_file_still_
     assert outcome.ending is intraday.Ending.STREAM_ENDED
     assert _file()["status"] == "UNCERTAIN"
     assert _file()["entries"] == []
-    assert sent[0].splitlines()[4] == ("請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平："
-                                       "PTS 今天的微台部位要你自己在 13:30 前平掉。")
+    assert sent[0].splitlines()[4] == ("請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平，要你自己在 13:30 前賣出微台："
+                                       "這筆實際成交幾口就平幾口（0～1 口）。")
 
 
 # --- 三種處境，三種固定的說法（規格第 41 條）---

@@ -77,6 +77,10 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
     出場程式照樣不平倉——序號在這則告警裡，對帳用它。
 
     `known_filled` 是已知**至少**成交的口數：對帳時至少要看到這麼多。
+
+    微台要人自己平的那一句寫成**要送的單**：買賣別、商品，口數寫成算式與範圍（確認的口數加上
+    這筆實際成交的）。帳戶 APP 看到的是淨部位，含使用者自己的長期部位與 OS 的口數，只寫
+    「平掉 PTS 的部位」的話，使用者分不出要平幾口。
     """
     name = _PRODUCT_TEXT[product]
     holding = _HOLDING_TEXT[direction]
@@ -88,8 +92,13 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
     if product in DAY_TRADE_CODES:
         who_closes = _broker_closes_today(name)
     else:
-        held = f"（部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的）" if held_lots else ""
-        who_closes = f"{name}沒有當沖強平：PTS 今天的{name}部位{held}要你自己在 13:30 前平掉。"
+        if held_lots:
+            count = (f"部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的口數，也就是 "
+                     f"{_span(held_lots + known_filled, held_lots + lots)}")
+        else:
+            count = f"這筆實際成交幾口就平幾口（{_span(known_filled, lots)}）"
+        who_closes = (f"{name}沒有當沖強平，要你自己在 13:30 前"
+                      f"{_CLOSE_SIDE_TEXT[direction]}{name}：{count}。")
     return (
         "【要你處理】PTS 委託送出去了，但不知道成交幾口\n"
         f"這次：{_SIDE_TEXT[direction]}{name} {lots} 口（{seq}）{known}\n"
@@ -105,20 +114,38 @@ def _broker_closes_today(name: str) -> str:
     return f"{name}標了當沖，券商 13:30 會強平 PTS 今天的{name}部位。"
 
 
-def position_file_unreadable(*, day: date, reason: str) -> str:
+def position_file_unreadable(*, day: date, reason: str, entry_log: str) -> str:
     """部位檔讀不懂（規格第 38 條）。盤中程式這一天不進場。
 
-    刻意不說「今天沒有部位」：真相是「可能有部位，但讀不到記錄」。要人做的事寫在前面：
-    看帳戶。出場程式也讀同一個檔，同樣不會自動平倉——不講的話，使用者會以為 13:25
-    有人替他收尾。
+    刻意不說「今天沒有部位」：真相是「可能有部位，但讀不到記錄」。出場程式也讀同一個檔，
+    同樣不會自動平倉——不講的話，使用者會以為 13:25 有人替他收尾。口數 PTS 自己也不知道，
+    就講從哪裡算（`_count_from_logs`；這時還沒有出場，只看盤中程式的 log `entry_log`）。
     """
     return (
         "【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場\n"
         f"原因：{reason}\n"
-        "今天 PTS 可能已經有部位：請到券商 APP 確認帳戶。"
-        "13:25 的出場程式同樣讀不懂這個檔，不會替你平倉。\n"
+        "今天 PTS 可能已經有部位。13:25 的出場程式同樣讀不懂這個檔，不會替你平倉：交易微台的話，"
+        "請在日盤 13:45 收盤前自行平掉；大台、小台標了當沖，券商 13:30 會強平。\n"
+        f"{_count_from_logs(entry_log, None)}\n"
         f"{day:%Y/%m/%d}"
     )
+
+
+def _count_from_logs(entry_log: str, exit_log: str | None) -> str:
+    """PTS 自己也不知道口數時（部位檔讀不懂、出場程式中止），要人平幾口從哪裡算。
+
+    帳戶 APP 看到的是淨部位，含使用者自己的長期部位與 OS 的口數，不能拿來當 PTS 的口數。
+    PTS 的每一筆成交都寫在 log 裡：盤中程式的「進場成交」帶著累計口數，出場程式的每一筆
+    「平倉成交」帶著口數（查詢確認的也是這個字）。`exit_log` 是 None：還沒有出場。
+    """
+    minus = "" if exit_log is None else f"，減掉 {exit_log} 裡每一筆「平倉成交」的口數"
+    return (f"PTS 的口數：{entry_log} 最後一筆「進場成交」的累計口數{minus}"
+            "（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。")
+
+
+def _span(low: int, high: int) -> str:
+    """口數或口數的範圍：確定時只寫一個數字。"""
+    return f"{low} 口" if low == high else f"{low}～{high} 口"
 
 
 def day_settings_lost(*, day: date, reason: str, live: bool, log: str) -> str:
@@ -173,8 +200,8 @@ def fill_not_on_file(*, at: datetime, product: str, direction: str, lots: int, p
     if product in DAY_TRADE_CODES:
         who_closes = _broker_closes_today(name)
     else:
-        who_closes = (f"{name}沒有當沖強平：PTS 今天的{name}部位共 {total_lots} 口"
-                      "要你自己在 13:30 前平掉。")
+        who_closes = (f"{name}沒有當沖強平，要你自己在 13:30 前"
+                      f"{_CLOSE_SIDE_TEXT[direction]}{name} {total_lots} 口（PTS 今天全部的口數）。")
     return (
         "【要你處理】PTS 部位還在，部位檔卻沒記到這次成交\n"
         f"這次：{_SIDE_TEXT[direction]}{name} {lots} 口 @ {_points(price)}"
@@ -248,12 +275,14 @@ def _points(price: float) -> str:
 # ── 出場程式（13:25）─────────────────────────────────────────────────────
 
 
-def exit_position_file_unreadable(*, at: datetime, reason: str, closed: bool = False) -> str:
+def exit_position_file_unreadable(*, at: datetime, reason: str, entry_log: str, exit_log: str,
+                                  closed: bool = False) -> str:
     """出場程式讀不懂部位檔（規格第 38 條）：一張單都不送。
 
     讀不懂就不知道是哪個商品，所以兩種處理都講：微台沒有人會替它平倉，大台、小台有券商的
     當沖強平。只寫「請平倉」的話，交易大台的人會自己平一次、券商 13:30 再平一次。
     也不知道今天是不是結算日，所以微台的兩種期限都講（`closed`：日盤已經收盤）。
+    口數也不知道，講從哪裡算（`_count_from_logs`）。
     """
     tx = "由券商 13:30 強平" if closed else "券商 13:30 會強平"
     return (
@@ -261,6 +290,7 @@ def exit_position_file_unreadable(*, at: datetime, reason: str, closed: bool = F
         f"原因：{reason}\n"
         f"PTS 今天可能還有部位：請到券商 APP 確認帳戶。{_close_micro_any_day(closed)}；"
         f"大台、小台標了當沖，{tx}。\n"
+        f"{_count_from_logs(entry_log, exit_log)}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 
@@ -323,11 +353,31 @@ def _seq_text(order_seq: str) -> str:
     return f"委託序號 {order_seq or '沒有拿到'}"
 
 
+def _uncertain_close_order(record: position_file.PositionRecord) -> str:
+    """部位檔記著一筆不確定的委託時，要人送的平倉單：買賣別、商品、下單代碼，口數寫成算式與範圍。
+
+    帳戶 APP 看到的是淨部位（含使用者自己的、OS 的），只寫「平掉 PTS 的部位」的話分不出要平
+    幾口。進場那一筆成交了幾口就多平幾口；平倉那一筆成交了幾口就少平幾口（檔裡的口數還沒扣掉
+    它，同 `exit_not_on_file`）。
+    """
+    u = record.uncertain
+    held = record.open_lots
+    if u.stage == position_file.ENTRY:
+        how, low, high = "加上", held + u.known_filled, held + u.requested_lots
+    else:
+        how, low, high = "減掉", max(0, held - u.requested_lots), held - u.known_filled
+    return (f"{_CLOSE_SIDE_TEXT[record.direction]}{_PRODUCT_TEXT[record.product]}"
+            f"（{record.order_code}）：部位檔的{_HOLDING_TEXT[record.direction]} {held} 口，"
+            f"{how}{_seq_text(u.order_seq)} 實際成交的口數，也就是 {_span(low, high)}"
+            "（到券商 APP 用委託序號查這筆成交了幾口）")
+
+
 def _check_account(record: position_file.PositionRecord, closed: bool) -> str:
     """不確定時要人做的事，依商品而定（ADR-0002）。
 
     大台、小台叫人自己平的話，會和券商 13:30 的當沖強平撞在一起：兩邊都平，多平的
-    就是反向新倉。所以只請他在強平之後確認。微台的期限見 `exit_incomplete`。
+    就是反向新倉。所以只請他在強平之後確認。微台寫明要送的單（`_uncertain_close_order`），
+    期限見 `exit_incomplete`。
     """
     if record.product in DAY_TRADE_CODES:
         return ("大台、小台標了當沖，券商 13:30 會強平：13:30 之後請到券商 APP 確認帳戶裡"
@@ -335,12 +385,13 @@ def _check_account(record: position_file.PositionRecord, closed: bool) -> str:
     if record.settles_today and closed:
         return ("今天是結算日，近月 13:30 已經停止交易，不能再平：PTS 還在的微台部位由交易所"
                 "以最後結算價現金了結。結算後請到券商 APP 確認帳戶。")
+    order = _uncertain_close_order(record)
     if record.settles_today:
-        return ("請到券商 APP 確認帳戶，在 13:30 前自行平掉 PTS 的微台部位：今天是結算日，"
+        return (f"請在 13:30 前自行{order}。今天是結算日，"
                 "近月 13:30 停止交易，之後還在的口數由交易所以最後結算價現金了結。")
     if closed:
-        return "請到券商 APP 確認帳戶，在夜盤自行平掉 PTS 的微台部位（日盤 13:45 已經收盤）。"
-    return "請到券商 APP 確認帳戶，自行平掉 PTS 的微台部位（日盤 13:45 收盤）。"
+        return f"日盤 13:45 已經收盤，請在夜盤自行{order}。"
+    return f"請在日盤 13:45 收盤前自行{order}。"
 
 
 def exit_incomplete(*, at: datetime, record: position_file.PositionRecord, reason: str,
@@ -407,7 +458,8 @@ def exit_missed(*, at: datetime, record: position_file.PositionRecord) -> str:
             f"{order}\n"
             f"{held}\n"
             f"{_missed_reason(day)}\n"
-            f"請到券商 APP 確認帳戶，自行平掉 PTS 還在的微台部位。{settled}\n"
+            "請先到券商 APP 確認帳戶（你可能已經自己平掉了），還在的話請自行"
+            f"{_uncertain_close_order(record)}。{settled}\n"
             f"{at:%Y/%m/%d %H:%M:%S}"
         )
     lots = record.open_lots
@@ -422,16 +474,19 @@ def exit_missed(*, at: datetime, record: position_file.PositionRecord) -> str:
     )
 
 
-def exit_missed_unreadable(*, at: datetime, day: date, reason: str) -> str:
+def exit_missed_unreadable(*, at: datetime, day: date, reason: str, entry_log: str,
+                           exit_log: str) -> str:
     """出場程式在 `day` 沒有跑完，那天的部位檔又讀不懂（規格第 38 條）：不知道那天留下什麼。
 
     讀不懂就不知道是哪個商品：大台、小台那天 13:30 已經被券商強平，微台沒有人平。
+    口數從那天的 log 算（`_count_from_logs`）。
     """
     return (
         f"【要你處理】PTS {day:%m/%d} 的部位檔讀不懂，出場程式沒有平倉\n"
         f"{_missed_reason(f'{day:%m/%d}')}。部位檔：{reason}\n"
         "PTS 那天可能留下微台部位：請到券商 APP 確認帳戶，還在的話請自行平掉。大台、小台標了當沖，"
         "那天 13:30 已經由券商強平。\n"
+        f"{_count_from_logs(entry_log, exit_log)}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 
@@ -534,9 +589,11 @@ _EXIT_GOES_ON = "出場程式照常處理部位檔裡的部位。"
 _BEFORE_NEXT_OPEN = "下一個交易日 08:40 之前排除。"
 
 
-def exit_crashed(*, at: datetime, reason: str, closed: bool = False) -> str:
+def exit_crashed(*, at: datetime, reason: str, entry_log: str, exit_log: str,
+                 closed: bool = False) -> str:
     """出場程式本身出錯中止。不知道做到哪裡，只能請人看帳戶。`closed`：日盤已經收盤。
 
+    還剩幾口也不知道（可能平到一半），講從哪裡算（`_count_from_logs`）。
     收盤前同樣要講不要重跑（理由見 `exit_incomplete`）。"""
     rerun = ("" if closed else
              "自己平掉之後，不要再執行出場程式：它只認部位檔，會把你平掉的口數再平一次，"
@@ -546,6 +603,7 @@ def exit_crashed(*, at: datetime, reason: str, closed: bool = False) -> str:
         f"原因：{reason}\n"
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。"
         f"{_close_micro_any_day(closed)}。大台、小台由券商 13:30 當沖強平。\n"
+        f"{_count_from_logs(entry_log, exit_log)}\n"
         f"{rerun}"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )

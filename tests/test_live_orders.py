@@ -331,7 +331,8 @@ def test_a_fill_that_cannot_be_written_to_the_position_file_is_reported_and_ends
         "帳上 PTS 共多單 1 口，部位檔只記到 0 口，而且停在送單前記下的「不確定」\n"
         "原因：PermissionError: [Errno 13] 存取被拒\n"
         "13:25 的出場程式看到「不確定」不會自動平倉，盤中程式今天不再進場。"
-        "請到券商 APP 確認帳戶。微台沒有當沖強平：PTS 今天的微台部位共 1 口要你自己在 13:30 前平掉。\n"
+        "請到券商 APP 確認帳戶。微台沒有當沖強平，要你自己在 13:30 前賣出微台 1 口"
+        "（PTS 今天全部的口數）。\n"
         "2026/11/09 08:50:00",
     ]
     assert outcome.ending is intraday.Ending.STREAM_ENDED
@@ -553,6 +554,12 @@ def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text, mar
     assert broker.orders == []
     assert len(sent) == 1
     assert sent[0].startswith("【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場\n")
+    assert sent[0].splitlines()[2:4] == [
+        "今天 PTS 可能已經有部位。13:25 的出場程式同樣讀不懂這個檔，不會替你平倉：交易微台的話，"
+        "請在日盤 13:45 收盤前自行平掉；大台、小台標了當沖，券商 13:30 會強平。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數（有「不知道成交幾口」"
+        "的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
+    ]
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:
         assert fh.read() == text
     assert (market_dir / "TX-20261109.csv").exists()
@@ -624,3 +631,13 @@ def test_fills_of_other_orders_on_the_shared_reply_line_never_become_ptss_positi
                                 "2026/11/09 08:50:00")
     assert [m.splitlines()[0] for m in notifier.sent[1:]] == [
         "【要你處理】PTS 盤中報價中斷超過 3 分鐘"]
+
+
+def test_every_entry_fill_is_logged_with_the_running_total_the_alerts_point_to(caplog):
+    """部位檔讀不懂時，告警叫人從盤中程式的 log 算 PTS 的口數：最後一筆「進場成交」的累計口數
+    （帳戶 APP 是淨部位，含使用者自己的與 OS 的口數，不能拿來算）。log 改了寫法，告警就指錯地方。"""
+    caplog.set_level("INFO", logger="intraday")
+    _run(rally("08:45", 5) + [trade(at("08:50:00"), 45150)])
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("進場成交：")]
+    assert len(lines) == 1
+    assert "累計 1 口" in lines[0]
