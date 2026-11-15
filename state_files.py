@@ -14,7 +14,7 @@
 | `day-settings-YYYYMMDD.json` | 盤中程式（當天第一次啟動） | 盤中程式（重啟） | `day_settings` |
 | `sim-position-YYYYMMDD.json` | 盤中程式（模擬模式） | 盤中程式（重啟）；出場程式**絕不讀** | `sim_position` |
 | `intraday.lock` | 盤中程式 | 收工指令（盤中程式在不在跑） | `intraday._alone` |
-| `stop_today.lock` | 收工指令 | — | `tools/stop_today.py` |
+| `stop_today.lock` | 收工指令、出場程式（讀部位檔之前等收工指令做完） | — | `exit_program.stop_today_lock_path` |
 
 兩支程式之間只靠部位檔與心跳記錄溝通（規格「兩支程式」一節）。使用者盤中下的收工指令
 （`tools/stop_today.py`）另外靠停止進場記錄與確認記錄和盤中程式說好「不再進場」；其他的都只有

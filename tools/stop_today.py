@@ -36,7 +36,10 @@
     不知道成交就用委託序號查而絕不再送、每筆成交寫進部位檔。大台、小台也平，平倉單照商品標當沖。
   * 沒能平完時**不叫人自己平**（`_Tell`）：部位檔記著平掉的，剩下的照常由 13:25 的出場程式（微台）、
     券商 13:30 的當沖強平（大台、小台）了結。13:25 看到已經平完，就不送單。
-  * 同一時間只有一個收工指令（`state/stop_today.lock`）：兩個一起平就是平兩次。
+  * 同一時間只有一個收工指令（`state/stop_today.lock`）：兩個一起平就是平兩次。13:25 的出場程式也拿
+    這把鎖，等收工指令做完才讀部位檔（最多 3 分鐘）：13:24 前送出的最後一筆平倉單，13:25 可能還在等
+    回報或在查成交。所以 13:25 之後才講還剩幾口時，不再說「照常由 13:25 平掉」，改講出場程式會等它、
+    之後照部位檔處理，有告警就照告警的口數。
 """
 
 from __future__ import annotations
@@ -109,17 +112,18 @@ def _stop_today(now: datetime, *, close: bool,
     if not calendar_tw.is_trading_day(today):
         _say(f"{today:%Y/%m/%d} 不是交易日，收工指令什麼都不做。")
         return 0
-    with state_files.exclusive(_lock_path()) as alone:
+    with state_files.exclusive(exit_program.stop_today_lock_path()) as alone:
         if not alone:
-            # 兩個同時平倉就是平兩次：各自照同一份部位檔送單
-            _say("另一個收工指令還在跑，這一個什麼都不做：照那一個印出的結果處理。")
+            # 兩個同時平倉就是平兩次：各自照同一份部位檔送單。13:25 的出場程式處理部位檔時
+            # 也拿著這把鎖（`exit_program._after_stop_command`）
+            _say("另一個收工指令或 13:25 的出場程式正在處理 PTS 的部位，這一個什麼都不做："
+                 "照它印出的結果或 Discord 的告警處理。")
             return 1
         return _stop_alone(now, close=close, connect=connect, clock=clock, sleep=sleep,
                            wait_seconds=wait_seconds)
 
 
-def _lock_path() -> str:
-    return os.path.join(paths.state_dir(), "stop_today.lock")
+
 
 
 def _stop_alone(now: datetime, *, close: bool,
@@ -271,8 +275,10 @@ class _Tell:
                  else "市價 IOC 沒有全部成交，") + f"重試到 {self._until:%H:%M} 仍未完成（{why}）")
 
     def left(self, *, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
+        # 13:25 之後出場程式已經起來、正等著這個收工指令做完：不能再講「照常由 13:25 平掉」
         return messages.stop_today_left(at=at, record=record, reason=reason,
-                                        lots=_exited(record) - _exited(self._before))
+                                        lots=_exited(record) - _exited(self._before),
+                                        exit_started=at >= self._until + _BEFORE_EXIT)
 
     def unresolved(self, *, at: datetime, record: position_file.PositionRecord,
                    lookup: str | None) -> str:

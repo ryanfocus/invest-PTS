@@ -713,16 +713,26 @@ def stop_today_entry_unresolved(*, at: datetime, record: position_file.PositionR
 
 
 def stop_today_left(*, at: datetime, record: position_file.PositionRecord, lots: int,
-                    reason: str) -> str:
+                    reason: str, exit_started: bool) -> str:
     """`--close` 沒能平完（「部位還在」）：這次平了 `lots` 口，還剩的照常了結。
 
     ⚠️ **不叫人自己平**，和出場程式的 `exit_incomplete` 不同：部位檔記著已經平掉的口數，微台剩下的
-       由 13:25 的出場程式平（它只平剩下的）——使用者自己平掉的話，13:25 再平一次就是反向新倉。
+       由 13:25 的出場程式平（它只平剩下的）——使用者自己平掉的話，出場程式再平一次就是反向新倉。
        大台、小台標了當沖，券商 13:30 強平帳上還在的，不必自己平。
+
+    `exit_started`：講這句話時 13:25 已經過了（最後一筆平倉單 13:24 前送出、回報或查詢拖過 13:25）。
+    出場程式這時已經起來、正等著收工指令做完（`exit_program._after_stop_command`），之後才照部位檔
+    處理剩下的——它可能平完，也可能過了期限、碰到不確定而告警。所以不能再保證「照常由 13:25 平掉」，
+    改講它會怎麼做，以及收到告警時照告警的口數。
     """
     left = record.open_lots
     if record.product in DAY_TRADE_CODES:
         who = f"剩下的 {left} 口標了當沖，照常由券商 13:30 強平，不必自己平。"
+    elif exit_started:
+        who = (f"13:25 的出場程式等這個收工指令結束，才照部位檔處理剩下的 {left} 口：部位檔記著"
+               f"已經平掉的 {lots} 口，它只平剩下的。之後 Discord 收到「部位還在」或「委託送出去了，"
+               "但…」的告警時，照那一則的口數處理。\n"
+               "在那之前不要自己平：出場程式會照部位檔再平一次，開出反向新倉。")
     else:
         who = (f"剩下的 {left} 口照常由 13:25 的出場程式平掉：部位檔記著已經平掉的 {lots} 口，"
                "它只平剩下的。\n不要自己平：不然 13:25 會再平一次，開出反向新倉。")

@@ -32,6 +32,7 @@ import heartbeat
 import intraday
 import paths
 import raw_market
+import state_files
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 import stop_today  # noqa: E402
@@ -464,9 +465,14 @@ def test_while_the_intraday_program_runs_and_never_confirms_close_sends_nothing(
     assert env.sent == []
 
 
+# 收工指令的鎖被拿著時講的話：拿著的可能是另一個收工指令，也可能是 13:25 的出場程式
+BUSY = ("另一個收工指令或 13:25 的出場程式正在處理 PTS 的部位，這一個什麼都不做："
+        "照它印出的結果或 Discord 的告警處理。")
+
+
 def test_a_second_stop_command_while_the_first_still_runs_does_nothing(capsys, env):
     """第一個 `--close` 還在等盤中程式確認時，使用者又執行了一次。兩個都平的話就是平兩次：
-    第二個只講「另一個收工指令還在跑」，不寫記錄、不登入、回 1。第一個照常做完。"""
+    第二個只講有人正在處理 PTS 的部位，不寫記錄、不登入、回 1。第一個照常做完。"""
     _on_file()
     lock = _intraday_running()
     lock.__enter__()
@@ -482,7 +488,7 @@ def test_a_second_stop_command_while_the_first_still_runs_does_nothing(capsys, e
     code, brokers, _ = _stop("--close", time=_Time(_at("10:00:00"), during_sleep=meanwhile))
 
     assert second[0][:2] == (1, [])
-    assert "另一個收工指令還在跑，這一個什麼都不做：照那一個印出的結果處理。" in _lines(capsys)
+    assert BUSY in _lines(capsys)
     with open(intraday.stop_path(DAY), encoding="utf-8") as fh:
         assert len(fh.read().splitlines()) == 1
     assert code == 0
@@ -560,6 +566,34 @@ def test_lots_still_open_at_1324_are_left_to_the_1325_exit_program(capsys, env):
     assert exit_sent == []
 
 
+def test_lots_still_open_after_1325_are_not_promised_to_the_exit_program(capsys):
+    """回報更慢（每筆 150 秒）：13:22:30 送出的那一筆 13:25 才知道成交，收工指令 13:26 才講還剩幾口。
+    這時 13:25 的出場程式已經起來、正等著收工指令做完——不能再說「照常由 13:25 的出場程式平掉」。
+    照實講：它等這個收工指令結束，才照部位檔處理剩下的；Discord 收到「部位還在」或「委託送出去了，
+    但…」的告警時，照那一則的口數處理。"""
+    _on_file()
+    time = _Time(_at("13:19:00"))
+
+    class _SlowerReplies(_SlowReplies):
+        def place_order(self, request):
+            self._time.now += timedelta(seconds=60)
+            return super().place_order(request)
+
+    code, _, _ = _stop("--close", time=time, broker=_SlowerReplies(time, fills=[1, 1]))
+
+    assert code == 1
+    out = _lines(capsys)
+    assert out[-5:] == [
+        "PTS 部位還在：收工指令平了 2 口，還剩多單 1 口（TM2611）",
+        "原因：市價 IOC 沒有全部成交，重試到 13:24 仍未完成（收工指令只送到 13:25 出場程式啟動之前）",
+        "13:25 的出場程式等這個收工指令結束，才照部位檔處理剩下的 1 口：部位檔記著已經平掉的 2 口，"
+        "它只平剩下的。之後 Discord 收到「部位還在」或「委託送出去了，但…」的告警時，照那一則的口數處理。",
+        "在那之前不要自己平：出場程式會照部位檔再平一次，開出反向新倉。",
+        "2026/11/09 13:26:00",
+    ]
+    assert not any("照常由 13:25 的出場程式平掉" in line for line in out)
+
+
 def test_lots_of_tx_still_open_are_left_to_the_brokers_day_trade_close(capsys, env):
     """大台還剩的口數標了當沖，照常由券商 13:30 強平。登入失敗（帳密）時一口都沒平，也一樣。"""
     _on_file(product="TX00AM", order_code="TX11")
@@ -634,6 +668,79 @@ def test_when_the_command_itself_breaks_it_says_where_to_look(capsys):
         "logs/stop-20261109.log。部位檔記到的口數照常由 13:25 的出場程式（微台）、券商 13:30 "
         "當沖強平（大台、小台）了結；它要是已經送出平倉單，請到券商 APP 對照 log 裡的「平倉成交」"
         "確認帳戶。")
+
+
+# --- 13:25 的出場程式等收工指令做完，才讀部位檔 ---
+
+
+@contextlib.contextmanager
+def _stop_command_running():
+    """收工指令正在跑：它拿著 `state/stop_today.lock`。"""
+    with state_files.exclusive(exit_program.stop_today_lock_path()) as alone:
+        assert alone
+        yield
+
+
+def _exit_program_at_1325(time: _Time) -> tuple[FakeBroker, list[str]]:
+    heartbeat.write(heartbeat.Heartbeat(DAY, at("13:20:00"), True))
+    broker = FakeBroker(fill_price=45200.0)
+    notifier = RecordingNotifier()
+    exit_program.run(broker, make_config(), notify=notifier, clock=time.clock, sleep=time.sleep)
+    return broker, notifier.sent
+
+
+def test_the_1325_exit_program_waits_for_a_stop_command_still_closing():
+    """收工指令 13:23:50 送出最後一筆平倉單（2 口），回報 30 秒沒來、改用委託序號查（又要 5 秒以上）：
+    13:25 出場程式起來時它還沒做完，部位檔記著「這筆平倉不確定」。這時讀，出場程式會發「委託送出去了，
+    但…」叫人自己平——收工指令一秒後就查到全部成交。所以出場程式先等收工指令結束，讀它留下的最後那份
+    部位檔：已經平完，不送單、不發訊息。"""
+    entries = [{"order_seq": "2315609990001", "lots": 10, "price": 45100.0},
+               {"order_seq": "2315609990002", "lots": 2, "price": 45100.0}]
+    first_close = {"order_seq": "2315610000001", "lots": 10, "price": 45200.0}
+    _on_file(entries=entries, exits=[first_close], status="UNCERTAIN",
+             uncertain={"stage": "EXIT", "order_seq": "2315610000002", "requested_lots": 2,
+                        "known_filled": 0})
+    lock = _stop_command_running()
+    lock.__enter__()
+
+    def stop_command_finishes(now: datetime) -> None:
+        _on_file(entries=entries, exits=[
+            first_close, {"order_seq": "2315610000002", "lots": 2, "price": 45200.0}])
+        lock.__exit__(None, None, None)
+    time = _Time(_at("13:25:00"), during_sleep=stop_command_finishes)
+
+    broker, sent = _exit_program_at_1325(time)
+
+    assert time.slept == [1]
+    assert broker.orders == []
+    assert sent == []
+
+
+def test_a_stop_command_stuck_for_3_minutes_is_not_waited_for_any_longer():
+    """收工指令卡住了（鎖一直沒放）：出場程式最多等 3 分鐘，之後照現在的部位檔照常平倉。再等下去，
+    結算日的近月 13:30 就停止交易了。"""
+    _on_file()
+
+    with _stop_command_running():
+        time = _Time(_at("13:25:00"))
+        broker, sent = _exit_program_at_1325(time)
+
+    assert sum(time.slept) == 180
+    assert _orders(broker) == [("TM2611", SELL, 3, False)]
+    assert sent == []
+
+
+def test_a_stop_command_while_the_exit_program_works_does_nothing(capsys):
+    """13:26 出場程式正在平倉（拿著同一把鎖）時執行收工指令：不寫記錄、不登入、回 1，講明有人正在
+    處理——不是講成「另一個收工指令還在跑」。"""
+    _on_file()
+
+    with _stop_command_running():
+        code, brokers, _ = _stop("--close", at="13:26:00")
+
+    assert code == 1
+    assert brokers == []
+    assert _lines(capsys) == [BUSY]
 
 
 # --- --close 只看部位檔，和出場程式同一條規則 ---

@@ -34,6 +34,9 @@
 「部位已經了結」，不送單。兩者不同的只有送單的期限與沒能平完時怎麼講（`Tell`）：收工指令不叫人
 自己平，剩下的交給這裡。
 
+兩者不會同時碰部位檔：讀今天的部位檔之前先拿收工指令的鎖，收工指令還在跑就等它做完，最多 3 分鐘
+（`_after_stop_command`）。它 13:24 前送出的最後一筆平倉單，13:25 可能還在等回報或在查成交。
+
 ## 時間
 
 出場程式在啟動時讀一次系統時鐘（規格「時間」一節），用它判斷今天是哪一天、是不是已經
@@ -59,6 +62,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import logging
 import os
@@ -66,7 +70,7 @@ import sys
 import time as time_module
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Protocol
+from typing import Callable, Iterator, Protocol
 
 import calendar_tw
 import heartbeat
@@ -94,6 +98,11 @@ _RETRY_INTERVAL = timedelta(minutes=1)
 # 過了就不送平倉單。日盤收盤（`calendar_tw.DAY_SESSION_CLOSE`，規格第 55 條：之後才補跑就請
 # 使用者在夜盤處理）；結算日的近月 13:30 就停止交易，還在的口數由交易所以最後結算價現金了結。
 _SETTLEMENT_CLOSE = time(13, 30)
+
+# 收工指令還在跑時，最多等它多久、多久看一次（`_after_stop_command`）。13:25 起最多等到 13:28：
+# 結算日的近月 13:30 就停止交易，再等下去出場程式就沒有用了。
+_STOP_COMMAND_WAIT = timedelta(minutes=3)
+_STOP_COMMAND_POLL = timedelta(seconds=1)
 
 
 class Ending(enum.Enum):
@@ -154,17 +163,53 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
                      f"{now:%H:%M}", f"{strategy.ENTRY_CUTOFF:%H:%M}")
         ending = Ending.TOO_EARLY
     else:
-        ending = _exit_today(broker, config, today=today, now=now, clock=clock, sleep=sleep,
-                             say=say)
-        if alerts.all_sent:
-            _mark_done(today, ending.value)
-        else:
-            # 告警沒送到，使用者就不知道今天的事（網路斷了的話，平倉多半也沒做成）。不寫出場記錄：
-            # 下一次執行（補跑或下一個交易日）會把今天還在的微台再講一次（`_report_missed`）。
-            logger.error("有告警沒有送出去，不寫今天的出場記錄：下一次執行會再講一次今天的部位")
+        with _after_stop_command(clock=clock, sleep=sleep):
+            # 等過收工指令的話，開始處理今天部位的「現在」已經不是被叫醒的那一刻
+            ending = _exit_today(broker, config, today=today, now=clock(), clock=clock,
+                                 sleep=sleep, say=say)
+            if alerts.all_sent:
+                _mark_done(today, ending.value)
+            else:
+                # 告警沒送到，使用者就不知道今天的事（網路斷了的話，平倉多半也沒做成）。不寫出場
+                # 記錄：下一次執行（補跑或下一個交易日）會把今天還在的微台再講一次（`_report_missed`）。
+                logger.error("有告警沒有送出去，不寫今天的出場記錄：下一次執行會再講一次今天的部位")
     # 之前的交易日留下的排在今天的出場之後：這裡出了什麼事，都擋不到今天的微台平倉
     _report_missed(today, now, say)
     return _end(ending)
+
+
+@contextlib.contextmanager
+def _after_stop_command(*, clock: Callable[[], datetime],
+                        sleep: Callable[[float], None]) -> Iterator[None]:
+    """等收工指令（`tools/stop_today.py`）做完，才讓出場程式讀今天的部位檔；讀、平倉的時候拿著
+    同一把鎖（`stop_today_lock_path`），兩者不會同時碰部位檔。
+
+    收工指令 13:24 之前送出的最後一筆平倉單，13:25 可能還在等回報（30 秒）或在查成交：部位檔
+    這時記著「這筆平倉不確定」。照它講，就是叫人自己平一筆一秒後就查到成交的單。
+
+    **最多等 `_STOP_COMMAND_WAIT`**（3 分鐘），用注入的 `clock`／`sleep` 每秒看一次：收工指令卡住
+    的話，再等下去結算日的近月 13:30 就停止交易了。等不到就照現在的部位檔做，記 log。沒有收工
+    指令在跑時立刻拿到鎖，一秒都不等，出場程式的行為和以前一模一樣。
+    """
+    give_up = clock() + _STOP_COMMAND_WAIT
+    waited = False
+    while True:
+        with state_files.exclusive(stop_today_lock_path()) as alone:
+            if alone:
+                if waited:
+                    logger.info("收工指令做完了，照它留下的部位檔處理")
+                yield
+                return
+        if clock() >= give_up:
+            logger.error("等了 %d 分鐘收工指令都沒有做完（卡住了？），不再等，照現在的部位檔處理",
+                         _STOP_COMMAND_WAIT.seconds // 60)
+            yield
+            return
+        if not waited:
+            waited = True
+            logger.warning("收工指令正在跑（%s 被鎖住），等它做完再讀部位檔（最多 %d 分鐘）",
+                           stop_today_lock_path(), _STOP_COMMAND_WAIT.seconds // 60)
+        sleep(_STOP_COMMAND_POLL.total_seconds())
 
 
 def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, today: date,
@@ -264,6 +309,12 @@ def _logs(day: date) -> dict[str, str]:
     return {"entry_log": paths.shown_log("intraday", day),
             "exit_log": paths.shown_log("exit", day),
             "stop_log": paths.shown_log("stop", day)}
+
+
+def stop_today_lock_path() -> str:
+    """收工指令（`tools/stop_today.py`）的鎖 `state/stop_today.lock`：同一時間只有一個收工指令，
+    13:25 的出場程式也拿同一把鎖，等收工指令做完才讀部位檔（`_after_stop_command`）。"""
+    return os.path.join(paths.state_dir(), "stop_today.lock")
 
 
 def done_path(day: date) -> str:
