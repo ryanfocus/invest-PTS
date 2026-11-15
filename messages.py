@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 
 from broker import MTX_CODE, TMF_CODE, TX_CODE
 from calendar_tw import DAY_SESSION_CLOSE
+import closing
 import handoff
 from handoff import DAY_TRADE_CLOSE, SETTLEMENT_CLOSE, Handoff, Who
 import position_file
@@ -506,6 +507,51 @@ def exit_missed(*, at: datetime, record: position_file.PositionRecord) -> str:
     )
 
 
+def exit_shortfall(closed: closing.Closed, *, started: datetime) -> str:
+    """出場程式平不完的原因（`closing.Short`）。`started`：出場程式開始處理今天部位的時刻。
+
+    過了期限：日盤收盤（之後只能在夜盤平），或結算日近月停止交易（之後由交易所以最後結算價
+    現金了結，損益和回測有落差，規格第 35 條）。兩種都還剩口數，都要告警——結算日的「交易所會
+    了結」是期交所規則，PTS 還沒有實機樣本，靠人在結算後確認。
+    """
+    if closed.short is not closing.Short.OUT_OF_TIME:
+        return _shortfall(closed)
+    if closed.record.settles_today:
+        close = f"近月 {SETTLEMENT_CLOSE:%H:%M} 停止交易"
+        stopped = f"今天結算的近月 {SETTLEMENT_CLOSE:%H:%M} 已經停止交易"
+    else:
+        close = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 收盤"
+        stopped = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 已經收盤"
+    if closed.rounds:
+        return _not_all_sent(closed) + f"重試到{close}仍未完成"
+    return f"出場程式 {started:%H:%M} 才執行，{stopped}，沒有送出平倉單"
+
+
+def stop_shortfall(closed: closing.Closed) -> str:
+    """收工指令平不完的原因（`closing.Short`）：它只送到 13:24，出場程式 13:25 啟動之前。"""
+    if closed.short is not closing.Short.OUT_OF_TIME:
+        return _shortfall(closed)
+    until = handoff.STOP_COMMAND_UNTIL
+    why = f"收工指令只送到 {handoff.EXIT_START:%H:%M} 出場程式啟動之前"
+    if not closed.rounds:
+        return f"已經過了 {until:%H:%M}，沒有送出平倉單（{why}）"
+    return _not_all_sent(closed) + f"重試到 {until:%H:%M} 仍未完成（{why}）"
+
+
+def _shortfall(closed: closing.Closed) -> str:
+    """登入失敗、重試用完：誰平都一樣的說法。"""
+    if closed.short is closing.Short.LOGIN_FAILED:
+        return closed.problem
+    if closed.problem:
+        return f"平倉單重試 {closing.RETRIES} 次都沒能送出（最後一次：{closed.problem}）"
+    return f"市價 IOC 沒有全部成交，重試 {closing.RETRIES} 次仍有剩餘"
+
+
+def _not_all_sent(closed: closing.Closed) -> str:
+    return (f"平倉單沒能送出（最後一次：{closed.problem}），" if closed.problem
+            else "市價 IOC 沒有全部成交，")
+
+
 def exit_missed_unreadable(*, at: datetime, day: date, reason: str,
                            logs: handoff.FillLogs) -> str:
     """出場程式在 `day` 沒有跑完，那天的部位檔又讀不懂（規格第 38 條）：不知道那天留下什麼。
@@ -784,7 +830,7 @@ def stop_today_left(*, at: datetime, record: position_file.PositionRecord, lots:
 
 def stop_today_not_on_file(*, at: datetime, record: position_file.PositionRecord,
                            on_file: position_file.PositionRecord, reason: str) -> str:
-    """`--close` 平倉了，部位檔卻寫不進去（`exit_program.Closing`）。
+    """`--close` 平倉了，部位檔卻寫不進去（`closing.Closed.file_behind`）。
 
     比出場程式那一則（`exit_not_on_file`）更急：13:25 的出場程式**一定會跑**，照舊檔把已經平掉的
     微台再平一次。所以要人在那之前停用它的排程，帳上還在的自己平。大台、小台出場程式本來就

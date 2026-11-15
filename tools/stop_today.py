@@ -32,9 +32,9 @@
     出場程式、券商的當沖強平因此不會同時送單。之後才執行就不送單，講明由誰了結。
   * **只看部位檔**，和出場程式同一條規則：部位檔只有真實下單會寫，模擬的日子沒有它，不送單（規格
     第 42 條）；讀不懂、不確定的照出場程式的規則（`_close`）。
-  * **平倉就是出場程式那一套**（`exit_program.close_now`）：每筆最多 10 口、沒送出去每分鐘重試、
+  * **平倉就是出場程式那一套**（`closing.close`）：每筆最多 10 口、沒送出去每分鐘重試、
     不知道成交就用委託序號查而絕不再送、每筆成交寫進部位檔。大台、小台也平，平倉單照商品標當沖。
-  * 沒能平完時**不叫人自己平**（`_Tell`）：部位檔記著平掉的，剩下的照常由 13:25 的出場程式（微台）、
+  * 沒能平完時**不叫人自己平**（`_report`）：部位檔記著平掉的，剩下的照常由 13:25 的出場程式（微台）、
     券商 13:30 的當沖強平（大台、小台）了結。13:25 看到已經平完，就不送單。
   * 同一時間只有一個收工指令（`state/stop_today.lock`）：兩個一起平就是平兩次。13:25 的出場程式也拿
     這把鎖，等收工指令做完才讀部位檔（最多 3 分鐘）：13:24 前送出的最後一筆平倉單，13:25 可能還在等
@@ -56,6 +56,7 @@ from typing import Callable, Iterator
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import calendar_tw  # noqa: E402
+import closing  # noqa: E402
 import exit_program  # noqa: E402
 import handoff  # noqa: E402
 import intraday  # noqa: E402
@@ -205,32 +206,45 @@ def _close(record: position_file.PositionRecord | None, *,
     if now.time() >= strategy.ENTRY_CUTOFF:
         _say(messages.stop_today_after_cutoff())
         return _show(record, now)
-    if record is None or (record.uncertain is None and not record.open_lots):
+    if record is None:
         _say(messages.stop_today_position(record, now))
         return 0
-    if record.status == position_file.UNCERTAIN and not handoff.exit_looks_up(record):
-        _say(messages.exit_uncertain(at=now, record=record))
-        return 1
     try:
-        secrets = _secrets()
+        # 帳密在真的要登入時才讀：沒有要平的、或不確定而不能送單時，讀不到也講得清楚
+        closed = closing.close(record, broker=lambda: connect(_secrets()),
+                               until=handoff.stop_command_until(record.trading_day),
+                               clock=clock, sleep=sleep)
     except settings.SettingsError as exc:
         _say(f"【要你處理】讀不到平倉要用的帳密，沒有平倉：{exc}\n"
              "部位照常了結：微台由 13:25 的出場程式平倉，大台、小台由券商 13:30 當沖強平"
              "（出場程式用的是同一份 .env）。")
         return 1
-    broker = connect(secrets)
-    until = handoff.stop_command_until(record.trading_day)
-    closing = exit_program.close_now(broker, record, until=until, clock=clock, sleep=sleep,
-                                     say=_say, tell=_Tell(record, until))
-    if closing.record != closing.on_file:
+    return _report(closed, clock())
+
+
+def _report(closed: closing.Closed, now: datetime) -> int:
+    """平倉的結果。和出場程式最大的不同：剩下的口數**不叫人自己平**——部位檔記著這次平掉的，
+    剩下的照常由 13:25 的出場程式（微台）或券商 13:30 的當沖強平（大台、小台）了結，叫人自己平，
+    13:25 就是再平一次（`messages.stop_today_left`）。部位檔沒記到的話，最後另外講。"""
+    record = closed.record
+    if closed.result is closing.Result.NOTHING_OPEN:
+        _say(messages.stop_today_position(record, now))
+        return 0
+    if closed.result is closing.Result.LEFT:
+        _say(messages.stop_today_left(at=now, record=record, lots=closed.closed_lots,
+                                      reason=messages.stop_shortfall(closed)))
+    elif closed.result is closing.Result.ENTRY_UNRESOLVED:
+        _say(messages.stop_today_entry_unresolved(at=now, record=record, lookup=closed.lookup))
+    elif closed.result is not closing.Result.CLOSED:
+        _say(messages.exit_uncertain(at=now, record=record, lookup=closed.lookup))
+    if closed.file_behind:
         # 13:25 的出場程式只認部位檔：照舊檔把已經平掉的再平一次
-        _say(messages.stop_today_not_on_file(at=clock(), record=closing.record,
-                                             on_file=closing.on_file, reason=closing.file_error))
+        _say(messages.stop_today_not_on_file(at=now, record=record, on_file=closed.on_file,
+                                             reason=closed.file_error))
         return 1
-    if closing.ending != exit_program.Ending.CLOSED:
-        return 1            # `_Tell` 已經講了剩下的、或不確定的怎麼辦
-    _say(messages.stop_today_closed(at=clock(), record=closing.record,
-                                    lots=closing.record.exited_lots - record.exited_lots))
+    if closed.result is not closing.Result.CLOSED:
+        return 1
+    _say(messages.stop_today_closed(at=now, record=record, lots=closed.closed_lots))
     return 0
 
 
@@ -240,38 +254,6 @@ def _secrets() -> settings.Secrets:
     if not secrets.futures_account:
         raise settings.SettingsError(f"{paths.env_path()} 缺少：CAPITAL_FUTURES_ACCOUNT")
     return secrets
-
-
-class _Tell:
-    """收工指令沒能平完、或不確定時怎麼講（`exit_program.Tell`）。
-
-    和出場程式最大的不同：剩下的口數**不叫人自己平**。部位檔記著這次平掉的，剩下的照常由 13:25 的
-    出場程式（微台）或券商 13:30 的當沖強平（大台、小台）了結——叫人自己平，13:25 就是再平一次。
-    """
-
-    def __init__(self, record: position_file.PositionRecord, until: datetime):
-        self._before = record
-        self._until = until
-
-    def ran_out(self, *, record: position_file.PositionRecord, rounds: int,
-                problem: str) -> str:
-        why = f"收工指令只送到 {handoff.EXIT_START:%H:%M} 出場程式啟動之前"
-        if not rounds:
-            return f"已經過了 {self._until:%H:%M}，沒有送出平倉單（{why}）"
-        return ((f"平倉單沒能送出（最後一次：{problem}），" if problem
-                 else "市價 IOC 沒有全部成交，") + f"重試到 {self._until:%H:%M} 仍未完成（{why}）")
-
-    def left(self, *, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
-        return messages.stop_today_left(at=at, record=record, reason=reason,
-                                        lots=record.exited_lots - self._before.exited_lots)
-
-    def unresolved(self, *, at: datetime, record: position_file.PositionRecord,
-                   lookup: str | None) -> str:
-        return messages.stop_today_entry_unresolved(at=at, record=record, lookup=lookup)
-
-    def exit_uncertain(self, *, at: datetime, record: position_file.PositionRecord,
-                       lookup: str) -> str:
-        return messages.exit_uncertain(at=at, record=record, lookup=lookup)
 
 
 def _capital(secrets: settings.Secrets) -> Broker:

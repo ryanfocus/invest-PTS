@@ -1147,7 +1147,7 @@ EXIT_FILLS = {
 def test_every_exit_fill_is_logged_under_the_word_the_alerts_point_to(broker_options, caplog):
     """部位檔讀不懂、出場程式中止時，告警叫人從 log 算 PTS 的口數：找「平倉成交」。送單當下
     就知道成交的、查詢之後才確認的，都要寫成這個字——少了一種，算出來的口數就少了那幾口。"""
-    caplog.set_level("INFO", logger="exit_program")
+    caplog.set_level("INFO", logger="closing")       # 平倉在 closing，log 也從那裡出來
     _on_file()
     _run(**broker_options)
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("平倉成交")]

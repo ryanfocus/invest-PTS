@@ -27,12 +27,12 @@
 做什麼，照的是出場程式自己停止送單的同一個期限（`handoff.deadline`）。
 例行的平倉完成**不發訊息**（規格：只有「有入場」與「需要你動手」才發）。
 
-## 收工指令借用這裡的平倉
+## 和收工指令同一套平倉
 
-使用者盤中執行 `tools/stop_today.py --close` 時，用的是同一套平倉（`close_now`）：在 13:24 之前
-平掉部位檔裡 PTS 的口數（大台、小台也平），成交寫進同一份部位檔。13:25 這裡看到已經平完，就是
-「部位已經了結」，不送單。兩者不同的只有送單的期限與沒能平完時怎麼講（`Tell`）：收工指令不叫人
-自己平，剩下的交給這裡。
+平倉本身在 `closing`：拆單、重試、不確定時查券商紀錄、每筆成交寫進部位檔。使用者盤中執行
+`tools/stop_today.py --close` 時用的也是它：在 13:24 之前平掉部位檔裡 PTS 的口數（大台、小台也平），
+成交寫進同一份部位檔。13:25 這裡看到已經平完，就是「部位已經了結」，不送單。兩者不同的只有送單的
+期限與做完之後怎麼講：收工指令不叫人自己平，剩下的交給這裡。
 
 兩者不會同時碰部位檔：讀今天的部位檔之前先拿收工指令的鎖，收工指令還在跑就等它做完，最多 3 分鐘
 （`_after_stop_command`）。它 13:24 前送出的最後一筆平倉單，13:25 可能還在等回報或在查成交。
@@ -68,11 +68,12 @@ import logging
 import os
 import sys
 import time as time_module
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Iterator
 
 import calendar_tw
+import closing
 import handoff
 import heartbeat
 import housekeeping
@@ -82,20 +83,10 @@ import position_file
 import settings
 import state_files
 import strategy
-from broker import (BUY, MARKET_ORDER_LOT_CAP, SELL, Broker, BrokerError,
-                    FillUnknown, LoginUnavailable, OrderFailed, OrderRequest)
-from calendar_tw import DAY_SESSION_CLOSE
-from handoff import SETTLEMENT_CLOSE
+from broker import Broker
+from closing import Result
 
 logger = logging.getLogger(__name__)
-
-# 平倉的買賣別：多單賣出、空單買進
-_EXIT_SIDE = {strategy.LONG: SELL, strategy.SHORT: BUY}
-
-# 平倉單沒有全部成交時，每隔一分鐘重試、最多 3 次（規格第 34 條）。13:25 送出、
-# 13:26／27／28 重試，13:30 券商當沖強平之前就結束（ADR-0002）。
-_RETRIES = 3
-_RETRY_INTERVAL = timedelta(minutes=1)
 
 # 收工指令還在跑時，最多等它多久、多久看一次（`_after_stop_command`）。13:25 起最多等到 13:28：
 # 結算日的近月 13:30 就停止交易，再等下去出場程式就沒有用了。
@@ -226,34 +217,51 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
         return Ending.POSITION_FILE_UNREADABLE
     if record is None:
         return Ending.NO_POSITION
-    if record.status == position_file.UNCERTAIN and not handoff.exit_looks_up(record):
-        # 不知道帳上有幾口：照檔裡的口數平，可能留下沒平的口數，也可能多平開出反向新倉。
-        # 出場單不確定時更不能再送——它很可能已經成交了（規格第 50 條）。
-        # 這一條排在商品前面：大台、小台雖然不送單，不確定一樣要講。
-        logger.error("部位檔記著一筆不確定的委託（%s），不送任何單", record.uncertain)
-        say(messages.exit_uncertain(at=now, record=record))
-        return Ending.UNCERTAIN
-    if record.uncertain is None and not record.open_lots:
-        logger.info("部位檔的出場口數已經等於進場口數，部位已經了結")
-        return Ending.ALREADY_CLOSED
-    if handoff.left_to_broker(record.product):
+    # 不確定的排在商品前面（`closing.close` 不送單、這裡照樣講）：大台、小台雖然不送單，
+    # 不確定一樣要講
+    if (handoff.left_to_broker(record.product) and record.uncertain is None
+            and record.open_lots):
         logger.info("今天的部位是 %s %s %d 口，標了當沖，交給券商 13:30 強平，不送單",
                     record.order_code, record.direction, record.open_lots)
         return Ending.LEFT_TO_BROKER
 
-    ledger = _Ledger(record)
-    ending = _MicroExit(broker, ledger, today=today, now=now, clock=clock, sleep=sleep,
-                        say=say).run()
-    if isinstance(config, BrokenSettings):
+    closed = closing.close(record, broker=lambda: broker, until=handoff.deadline(record),
+                           clock=clock, sleep=sleep)
+    ending = _report(closed, started=now, at=clock(), say=say)
+    if isinstance(config, BrokenSettings) and closed.result in _WENT_TO_BROKER:
         say(messages.exit_settings_broken(at=clock(), error=config.error))
-    if ledger.record != ledger.on_file:
+    if closed.file_behind:
         # 部位檔沒記到這次做的事。再執行一次出場程式，它會照舊檔把已經平掉的口數再平一次。
         logger.error("部位檔沒記到出場程式這次的平倉：實際還剩 %d 口（%s），檔裡還剩 %d 口（%s）",
-                     ledger.record.open_lots, ledger.record.status, ledger.on_file.open_lots,
-                     ledger.on_file.status)
-        say(messages.exit_not_on_file(at=clock(), record=ledger.record, on_file=ledger.on_file,
-                                      reason=ledger.error))
+                     closed.record.open_lots, closed.record.status, closed.on_file.open_lots,
+                     closed.on_file.status)
+        say(messages.exit_not_on_file(at=clock(), record=closed.record, on_file=closed.on_file,
+                                      reason=closed.file_error))
     return ending
+
+
+# 有登入、照部位檔處理了今天的微台（設定檔有錯時另外講一則，`exit_settings_broken`）
+_WENT_TO_BROKER = frozenset({Result.CLOSED, Result.LEFT, Result.ENTRY_UNRESOLVED,
+                             Result.EXIT_UNCERTAIN})
+
+
+def _report(closed: closing.Closed, *, started: datetime, at: datetime,
+            say: Callable[[str], bool]) -> Ending:
+    """平倉的結果：例行的平完不發訊息；平不完、不確定就告警（`at` 這一刻要人做什麼，
+    `handoff.decide`）。`started` 是出場程式開始處理今天部位的時刻。"""
+    if closed.result is Result.NOTHING_OPEN:
+        return Ending.ALREADY_CLOSED
+    if closed.result is Result.CLOSED:
+        return Ending.CLOSED
+    if closed.result is Result.LEFT:
+        say(messages.exit_incomplete(at=at, record=closed.record,
+                                     reason=messages.exit_shortfall(closed, started=started)))
+        if closed.short is closing.Short.OUT_OF_TIME and closed.record.settles_today:
+            return Ending.SETTLED_BY_EXCHANGE
+        return Ending.NOT_CLOSED
+    say(messages.exit_uncertain(at=at, record=closed.record, lookup=closed.lookup))
+    return (Ending.EXIT_UNCERTAIN if closed.result is Result.EXIT_UNCERTAIN
+            else Ending.UNCERTAIN)
 
 
 def _report_missed(today: date, now: datetime, say: Callable[[str], bool]) -> None:
@@ -340,329 +348,6 @@ def _check_heartbeat(today: date, now: datetime, say: Callable[[str], bool]) -> 
                                           stopped_at=beat.last_alive))
     else:
         logger.info("盤中程式今天跑完了（最後的心跳 %s）", beat.last_alive)
-
-
-class _Ledger:
-    """出場程式這次的部位：`record` 是真實的（含這次的平倉），`on_file` 是部位檔裡的那一份。
-
-    成交之後的下一件事就是寫檔（規格第 52 條）。寫不進去時**照樣繼續平倉**——微台不能過夜，
-    而記憶體裡的口數是對的；兩份對不上就在最後告警（`run()`）。
-    """
-
-    def __init__(self, record: position_file.PositionRecord):
-        self.record = record
-        self.on_file = record
-        self.error = ""
-
-    def save(self, record: position_file.PositionRecord) -> None:
-        self.record = record
-        try:
-            position_file.write(record)
-        except Exception as exc:  # noqa: BLE001
-            # 不管為什麼寫不進去（防毒鎖住、磁碟滿、權限），結果都一樣：帳上和檔裡對不上
-            self.error = f"{type(exc).__name__}: {exc}"
-            logger.error("部位檔寫不進去，繼續平倉：%s", self.error)
-            return
-        self.on_file = record
-
-
-class _ExitUncertain(Exception):
-    """一張平倉單送出去了，查詢卻沒能確認它全部成交。之後一張單都不送。`lookup` 是給人看的查詢結果。"""
-
-    def __init__(self, lookup: str):
-        super().__init__(lookup)
-        self.lookup = lookup
-
-
-class Tell(Protocol):
-    """`_MicroExit` 沒能平完、或碰到不確定時怎麼講：回傳要 `say` 的那一段。
-
-    出場程式用 `_Alarms`（Discord 告警，剩下的請人自己平）；收工指令（`tools/stop_today.py`）
-    有自己的一份：同一套平倉，剩下的口數照常交給 13:25 的出場程式、券商 13:30 的當沖強平。
-    """
-
-    def ran_out(self, *, record: position_file.PositionRecord, rounds: int,
-                problem: str) -> str:
-        """過了送單的期限還有剩：原因（`rounds` 輪送過，`problem` 是最後一輪沒送出去的原因）。"""
-
-    def left(self, *, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
-        """還有沒平的口數，而且不會再送了。"""
-
-    def unresolved(self, *, at: datetime, record: position_file.PositionRecord,
-                   lookup: str | None) -> str:
-        """盤中留下的進場不確定沒能確認（`lookup` 是查到的結果，沒查就是 None），一張單都沒送。"""
-
-    def exit_uncertain(self, *, at: datetime, record: position_file.PositionRecord,
-                       lookup: str) -> str:
-        """一張平倉單送出去了，查詢卻沒能確認它全部成交，之後一張單都不送。"""
-
-
-class _Alarms:
-    """出場程式的說法（`Tell`）。要人在幾點前做什麼，看的是**說的這一刻**過了微台的期限沒有
-    （`handoff.decide`）。"""
-
-    def __init__(self, started: datetime):
-        self._started = started
-
-    def ran_out(self, *, record: position_file.PositionRecord, rounds: int,
-                problem: str) -> str:
-        # 過了期限：日盤收盤（之後只能在夜盤平），或結算日近月停止交易（之後由交易所以最後
-        # 結算價現金了結，損益和回測有落差，規格第 35 條）。兩種都還剩口數，都要告警——
-        # 結算日的「交易所會了結」是期交所規則，PTS 還沒有實機樣本，靠人在結算後確認。
-        if record.settles_today:
-            close = f"近月 {SETTLEMENT_CLOSE:%H:%M} 停止交易"
-            closed = f"今天結算的近月 {SETTLEMENT_CLOSE:%H:%M} 已經停止交易"
-        else:
-            close = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 收盤"
-            closed = f"日盤 {DAY_SESSION_CLOSE:%H:%M} 已經收盤"
-        if rounds:
-            return ((f"平倉單沒能送出（最後一次：{problem}），" if problem
-                     else "市價 IOC 沒有全部成交，") + f"重試到{close}仍未完成")
-        return f"出場程式 {self._started:%H:%M} 才執行，{closed}，沒有送出平倉單"
-
-    def left(self, *, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
-        return messages.exit_incomplete(at=at, record=record, reason=reason)
-
-    def unresolved(self, *, at: datetime, record: position_file.PositionRecord,
-                   lookup: str | None) -> str:
-        return messages.exit_uncertain(at=at, record=record, lookup=lookup)
-
-    def exit_uncertain(self, *, at: datetime, record: position_file.PositionRecord,
-                       lookup: str) -> str:
-        return self.unresolved(at=at, record=record, lookup=lookup)
-
-
-class _MicroExit:
-    """平倉：拆單、重試、不確定時查券商紀錄（規格第 33、34、50 條）。
-
-    出場程式只拿它平微台。收工指令（`close_now`）拿它平任何商品：大台、小台的平倉單照樣標當沖
-    （`OrderRequest.day_trade` 依商品決定）。兩者不同的只有送單的期限 `until`（預設是微台的期限
-    `handoff.deadline`）與怎麼講 `tell`（預設是出場程式的告警 `_Alarms`）。
-    """
-
-    def __init__(self, broker: Broker, ledger: _Ledger, *, today: date, now: datetime,
-                 clock: Callable[[], datetime], sleep: Callable[[float], None],
-                 say: Callable[[str], bool], until: datetime | None = None,
-                 tell: Tell | None = None):
-        self._broker = broker
-        self._ledger = ledger
-        self._today = today
-        self._clock = clock
-        self._sleep = sleep
-        self._say = say
-        self._tell = tell or _Alarms(now)
-        self._settlement_day = ledger.record.settles_today
-        self._deadline = until or handoff.deadline(ledger.record)
-
-    def run(self) -> Ending:
-        """13:25 送出，沒有全部成交就每分鐘再送剩下的，最多重試 3 次。
-
-        登入也算在一輪裡：網路、群益主機的問題（`LoginUnavailable`，13:25 剛從睡眠醒來、網路
-        還沒好就是這樣）時一張平倉單都還沒送出去，帳上確定沒有異動，和「平倉單沒送出去」一樣
-        一分鐘後再登入、再試（規格第 34 條）。帳密、憑證這類登入失敗一分鐘後再試也一樣，立刻講。
-
-        部位檔記著盤中程式留下的進場不確定時（`handoff.exit_looks_up`），登入之後先查券商紀錄，
-        確定了才送平倉單；確定不了就一張都不送（`_unresolved`）。
-        """
-        rounds = 0
-        problem = ""
-        logged_in = False
-        while rounds <= _RETRIES:
-            if rounds:
-                self._sleep(_RETRY_INTERVAL.total_seconds())
-            if self._clock() >= self._deadline:
-                break
-            if not logged_in:
-                try:
-                    self._broker.login()
-                except LoginUnavailable as exc:
-                    logger.warning("登入沒有成功（網路或群益主機），一分鐘後再試：%s", exc)
-                    problem = str(exc)
-                    rounds += 1
-                    continue
-                except BrokerError as exc:
-                    # 密碼、憑證這類問題，一分鐘後再試也一樣；早點講，13:45 前還有時間讓人自己平
-                    if self._ledger.record.uncertain is not None:
-                        return self._unresolved(f"沒能查詢（{exc}）")
-                    return self._incomplete(str(exc))
-                logged_in = True
-            if self._ledger.record.uncertain is not None:
-                try:
-                    self._look_up_entry()
-                except _ExitUncertain as exc:
-                    return self._unresolved(exc.lookup)
-            try:
-                problem = self._send_round()
-            except _ExitUncertain as exc:
-                record = self._ledger.record
-                logger.error("平倉委託不確定（%s），不再送任何單：%s", record.uncertain, exc.lookup)
-                self._say(self._tell.exit_uncertain(at=self._clock(), record=record,
-                                                    lookup=exc.lookup))
-                return Ending.EXIT_UNCERTAIN
-            rounds += 1
-            if not self._ledger.record.open_lots:
-                return Ending.CLOSED
-
-        if self._ledger.record.uncertain is not None:
-            # 進場不確定還沒查到：登入一直沒成功，或已經過了期限（出場程式太晚才執行）
-            return self._unresolved(f"沒能查詢（登入沒有成功，最後一次：{problem}）" if problem
-                                    else None)
-        if rounds > _RETRIES:
-            return self._incomplete(
-                f"平倉單重試 {_RETRIES} 次都沒能送出（最後一次：{problem}）" if problem
-                else f"市價 IOC 沒有全部成交，重試 {_RETRIES} 次仍有剩餘")
-        # 過了送單的期限，還剩口數
-        self._incomplete(self._tell.ran_out(record=self._ledger.record, rounds=rounds,
-                                            problem=problem))
-        return Ending.SETTLED_BY_EXCHANGE if self._settlement_day else Ending.NOT_CLOSED
-
-    def _send_round(self) -> str:
-        """送一輪平倉單：還沒平的口數拆成每筆最多 10 口，依序送出（規格第 33 條）。
-
-        回傳這一輪「委託沒有送出去」的原因（都送出去了是空字串）。沒送出去就停下這一輪，
-        一分鐘後剩下的整批重試；只成交一部分則照送下一筆。
-        """
-        lots = self._ledger.record.open_lots
-        chunks = [MARKET_ORDER_LOT_CAP] * (lots // MARKET_ORDER_LOT_CAP)
-        if lots % MARKET_ORDER_LOT_CAP:
-            chunks.append(lots % MARKET_ORDER_LOT_CAP)
-        for chunk in chunks:
-            record = self._ledger.record
-            try:
-                result = self._broker.place_order(OrderRequest(
-                    contract=record.contract, side=_EXIT_SIDE[record.direction], lots=chunk,
-                    trading_day=self._today, deadline=self._deadline))
-            except OrderFailed as exc:
-                # 確定沒有送出去，也就確定沒有成交：重試是安全的
-                logger.warning("平倉委託沒有送出去：%s", exc)
-                return str(exc)
-            except FillUnknown as exc:
-                self._look_up(exc, chunk)
-                continue
-            if not result.filled_lots:
-                logger.warning("平倉委託 %s 沒有成交（市價 IOC 當下沒有對手價）", result.order_seq)
-                continue
-            fill = position_file.Fill(result.order_seq, result.filled_lots, result.avg_price)
-            logger.info("平倉成交：%s %d 口 @ %g（委託 %s）", record.order_code, fill.lots,
-                        fill.price, fill.order_seq)
-            self._ledger.save(replace(record, exits=record.exits + (fill,)))
-        return ""
-
-    def _look_up(self, exc: FillUnknown, lots: int) -> None:
-        """平倉單送出去了，卻不知道成交幾口（規格第 50 條後半）。**絕不再送一次**：它很可能已經
-        成交，再送就是反向新倉。改用這張單的委託序號向券商查成交紀錄（兩段查詢）。
-
-        查到全部成交：記進出場明細、回到已確認，呼叫端照常送下一筆。其他結局（只成交一部分、
-        查不到、查詢失敗、沒有序號可查）都拋 `_ExitUncertain`：帳上剩幾口已經不知道，
-        還沒送的那幾筆也不送了。
-        """
-        seq = exc.order_seq
-        logger.error("平倉委託送出去了，但不知道成交幾口（委託序號 %s）：%s", seq or "沒有", exc)
-        record = self._ledger.record
-        uncertain = position_file.UncertainOrder(
-            stage=position_file.EXIT, order_seq=seq, requested_lots=lots,
-            known_filled=exc.known_filled)
-        # 先記下「不確定」再查：查詢至少要 5 秒，這段時間程式被關掉的話，重跑時看到的必須是
-        # 「這筆出場單不確定」，而不是「這幾口還沒平」——後者會讓它再送一次。
-        self._ledger.save(replace(record, status=position_file.UNCERTAIN, uncertain=uncertain))
-        if not seq:
-            raise _ExitUncertain("沒有委託序號，無法查詢")
-
-        found = self._broker.query_fills(seq, self._today, lots)
-        if found.lots == lots:
-            # 和送單當下就知道成交的那種寫成同一個字：告警叫人從 log 算口數時只要找「平倉成交」
-            # （`messages._count_from_logs`）。
-            logger.info("平倉成交（成交查詢確認）：%s %d 口 @ %g（委託 %s）",
-                        record.order_code, lots, found.avg_price, seq)
-            self._ledger.save(replace(record, exits=record.exits + (
-                position_file.Fill(seq, lots, found.avg_price),)))
-            return
-        if found.lots:
-            if found.lots > uncertain.known_filled:
-                # 券商紀錄上的成交是確定的下限，記下來，人工對帳時少查一次
-                self._ledger.save(replace(self._ledger.record, uncertain=replace(
-                    uncertain, known_filled=found.lots)))
-            raise _ExitUncertain(f"成交 {found.lots} 口（委託 {lots} 口）")
-        if found.failure:
-            raise _ExitUncertain(f"查詢失敗：{found.failure}")
-        raise _ExitUncertain("查不到這筆委託的成交")
-
-    def _look_up_entry(self) -> None:
-        """盤中程式留下一筆不確定的進場委託（規格第 50 條）：用它的委託序號查券商紀錄（兩段查詢）。
-
-        到 13:25 那筆市價 IOC 早就結束了，券商紀錄也定案了，比盤中當下查可靠。查到全部成交：
-        補進進場明細、回到已確認，呼叫端照常平倉——盤中那則告警請使用者等到 13:25、不要自己平，
-        靠的就是這一步。其他結局都拋 `_ExitUncertain`。**只成交一部分也不算確定**：查詢萬一漏了
-        一列，照少算的口數平，微台就過夜。查到的口數是確定的下限，記進部位檔，人工對帳時少查一次。
-        查不到不是 0 口（`broker.FillQuery`）。
-        """
-        record = self._ledger.record
-        u = record.uncertain
-        found = self._broker.query_fills(u.order_seq, self._today, u.requested_lots)
-        if found.lots == u.requested_lots:
-            confirmed = replace(
-                record, entries=record.entries + (
-                    position_file.Fill(u.order_seq, found.lots, found.avg_price),),
-                status=position_file.CONFIRMED, uncertain=None)
-            logger.info("進場成交（成交查詢確認）：%s %d 口 @ %g（委託 %s），累計 %d 口",
-                        record.direction, found.lots, found.avg_price, u.order_seq,
-                        confirmed.entered_lots)
-            self._ledger.save(confirmed)
-            return
-        if found.lots:
-            if found.lots > u.known_filled:
-                self._ledger.save(replace(record, uncertain=replace(u, known_filled=found.lots)))
-            raise _ExitUncertain(f"成交 {found.lots} 口（委託 {u.requested_lots} 口）")
-        if found.failure:
-            raise _ExitUncertain(f"查詢失敗：{found.failure}")
-        raise _ExitUncertain("查不到這筆委託的成交")
-
-    def _unresolved(self, lookup: str | None) -> Ending:
-        """進場不確定沒能確認：一張單都不送，告警附上查到的（`lookup`，沒查就是 None；規格第 50 條）。"""
-        record = self._ledger.record
-        logger.error("部位檔記著一筆不確定的進場委託（%s），沒能確認，不送任何單：%s",
-                     record.uncertain, lookup)
-        self._say(self._tell.unresolved(at=self._clock(), record=record, lookup=lookup))
-        return Ending.UNCERTAIN
-
-    def _incomplete(self, reason: str) -> Ending:
-        """還有沒平的口數，而且不會再送了：講「部位還在」，寫明還剩幾口（`Tell.left`）。
-
-        出場程式的告警要人做什麼，看的是**告警這一刻**過了期限沒有：還沒過就請他在期限前自己平；
-        過了就是夜盤（一般日）或交易所了結（結算日）。和出場程式自己停止送單用的是同一個期限。
-        """
-        record = self._ledger.record
-        logger.error("%s 平倉沒有完成，還剩 %d 口：%s", record.order_code, record.open_lots, reason)
-        self._say(self._tell.left(at=self._clock(), record=record, reason=reason))
-        return Ending.NOT_CLOSED
-
-
-@dataclass(frozen=True)
-class Closing:
-    """`close_now` 做完之後。`record` 是實際的部位（含這次的平倉），`on_file` 是部位檔裡的那一份：
-    兩者不同就是部位檔沒記到（原因在 `file_error`），13:25 的出場程式會照舊檔再平一次。"""
-
-    ending: Ending
-    record: position_file.PositionRecord
-    on_file: position_file.PositionRecord
-    file_error: str
-
-
-def close_now(broker: Broker, record: position_file.PositionRecord, *, until: datetime,
-              clock: Callable[[], datetime], sleep: Callable[[float], None],
-              say: Callable[[str], bool], tell: Tell) -> Closing:
-    """現在就平掉部位檔裡還沒平的口數（收工指令 `tools/stop_today.py --close`）。
-
-    和 13:25 同一套平倉（`_MicroExit`）：登入（網路類的失敗每分鐘重試）、每筆最多 10 口、
-    「委託沒有送出去」每分鐘重試最多 3 次、「不知道成交」用委託序號查而**絕不再送**、每筆成交寫進
-    部位檔。盤中留下的進場不確定也一樣先查。不同的是送單的期限 `until` 與怎麼講 `tell`，由呼叫端給。
-
-    要不要平由呼叫端先決定：部位檔有還沒平的口數，或記著一筆 `handoff.exit_looks_up` 的不確定。
-    """
-    ledger = _Ledger(record)
-    ending = _MicroExit(broker, ledger, today=record.trading_day, now=clock(), clock=clock,
-                        sleep=sleep, say=say, until=until, tell=tell).run()
-    return Closing(ending, ledger.record, ledger.on_file, ledger.error)
 
 
 def _send(config: settings.Config | BrokenSettings, notify: Callable[[str], bool],
