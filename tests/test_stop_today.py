@@ -188,25 +188,33 @@ def test_the_console_output_is_also_kept_in_the_days_stop_log(capsys, env):
 # --- 盤中程式：每個時鐘事件都看一次停止進場記錄 ---
 
 
-class _UserStopsAt(FakeBroker):
-    """劇本走到 `at` 時（那個事件送出之前），使用者執行收工指令（不帶 --close）。
+class _Meanwhile(FakeBroker):
+    """劇本走到 `at` 時（那個事件送出之前），盤中程式以外的誰做了 `do()`。"""
 
-    `intraday.run` 本身不拿 `intraday.lock`（那是 `intraday.main` 的事），所以收工指令看到的是
-    「盤中程式沒在跑」、不等確認——這裡要看的是盤中程式那一邊。"""
-
-    def __init__(self, at: datetime, **options):
+    def __init__(self, at: datetime, do, **options):
         options.setdefault("minute_bars", {PREVIOUS_DAY: calm_history(45000)})
         options.setdefault("contracts", contracts())
         super().__init__(**options)
         self._at = at
-        self.stopped = False
+        self._do = do
+        self.done = False
 
     def events(self, product):
         for event in super().events(product):
-            if not self.stopped and event.time >= self._at:
-                self.stopped = True
-                assert _stop(time=_Time(self._at))[0] == 0
+            if not self.done and event.time >= self._at:
+                self.done = True
+                self._do()
             yield event
+
+
+def _UserStopsAt(at: datetime, **options) -> _Meanwhile:
+    """劇本走到 `at` 時，使用者執行收工指令（不帶 --close）。
+
+    `intraday.run` 本身不拿 `intraday.lock`（那是 `intraday.main` 的事），所以收工指令看到的是
+    「盤中程式沒在跑」、不等確認——這裡要看的是盤中程式那一邊。"""
+    def user_stops() -> None:
+        assert _stop(time=_Time(at))[0] == 0
+    return _Meanwhile(at, user_stops, **options)
 
 
 def _intraday(broker: FakeBroker, *, live: bool = True) -> list[str]:
@@ -233,6 +241,26 @@ def test_after_the_stop_record_appears_the_intraday_program_enters_no_more(marke
 
     assert [o.lots for o in broker.orders] == [1, 1]
     assert _times(sent) == ["2026/11/09 08:50:00", "2026/11/09 08:51:00"]
+    assert os.path.exists(intraday.stop_seen_path(DAY))
+    assert raw_market.read(DAY)[-1] == trade(at("08:53:00"), 45180)
+
+
+@pytest.mark.parametrize("content", [b"", b"\xff\xfe\xfa"], ids=["空檔", "讀不懂"])
+def test_a_stop_record_caught_half_written_still_stops_entries_without_crashing(content,
+                                                                             market_dir):
+    """收工指令寫停止進場記錄時，檔案先建出來、那一行才寫進去：盤中程式剛好在中間看到的是空檔
+    （寫到一半被砍掉、或寫壞了也一樣）。存在就算數：照樣不再進場、寫確認記錄，原因當成不知道。
+    每秒一次的檢查不能讓盤中程式當掉——它一當，原始行情就斷到排程把它叫回來（規格第 58 條）。"""
+    def half_written() -> None:
+        with open(intraday.stop_path(DAY), "wb") as fh:
+            fh.write(content)
+    day = rally("08:45", 8) + [trade(at("08:53:00"), 45180)]
+    broker = _Meanwhile(at("08:51:30"), half_written, events=day)
+
+    outcome_sent = _intraday(broker)
+
+    assert [o.lots for o in broker.orders] == [1, 1]
+    assert _times(outcome_sent) == ["2026/11/09 08:50:00", "2026/11/09 08:51:00"]
     assert os.path.exists(intraday.stop_seen_path(DAY))
     assert raw_market.read(DAY)[-1] == trade(at("08:53:00"), 45180)
 

@@ -966,18 +966,31 @@ class _Trading:
         （`stop_seen_path`），只記 log、不發 Discord（使用者自己下的指令）。今天已經因為別的原因
         停止進場、或啟動時就讀到記錄，照樣寫確認記錄：收工指令等的是「盤中程式知道了」，
         不是「為什麼停」。寫過一次就不再看。
+
+        **存在就算數**：收工指令寫記錄時檔案先建出來、那一行才寫進去，剛好在中間看到的是空檔；
+        寫到一半被砍掉、寫壞了也一樣——都是停止進場，原因不知道。這裡在事件迴圈裡每秒跑一次，
+        **不可以往外拋**：一拋盤中程式就當掉，原始行情斷到排程把它叫回來。
         """
         if self._stop_seen:
             return
-        why = state_files.read_marker(stop_path(self._today))
-        if why is None:
-            return
-        self._stop_seen = True
-        if not self._stopped:
-            self._stopped = True
-            logger.warning("看到停止進場記錄，今天不再進場：%s", why.splitlines()[-1])
-        self.cancel_breakout("看到停止進場記錄")
-        _write_stop_seen(self._today, now)
+        try:
+            why = state_files.read_marker(stop_path(self._today))
+            if why is None:
+                return
+            if not self._stopped:
+                self._stopped = True
+                logger.warning("看到停止進場記錄，今天不再進場：%s",
+                               why.splitlines()[-1] if why else "（記錄是空的，原因不知道）")
+            self.cancel_breakout("看到停止進場記錄")
+            self._stop_seen = True
+            _write_stop_seen(self._today, now)
+        except Exception as exc:  # noqa: BLE001
+            # 讀的時候檔案已經在了：當成停止進場，下一秒再試著寫確認記錄
+            logger.error("看停止進場記錄時出錯（%s: %s），當成停止進場，下一秒再看",
+                         type(exc).__name__, exc)
+            if os.path.exists(stop_path(self._today)):
+                self._stopped = True
+                self.breakout = None
 
     def cancel_breakout(self, why: str) -> None:
         """取消等待中的突破進場。沒有進場，不發訊息。三個時候：13:20 進場截止（規格第 26 條）、
