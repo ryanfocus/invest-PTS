@@ -643,9 +643,10 @@ def _uncertain(stage: str = "ENTRY", *, seq: str = "2315609990003") -> dict:
     return {"stage": stage, "order_seq": seq, "requested_lots": 1, "known_filled": 0}
 
 
-def test_an_uncertain_micro_entry_confirmed_by_the_lookup_is_closed_as_usual(env):
+def test_an_uncertain_micro_entry_confirmed_by_the_lookup_is_closed_as_usual(capsys, env):
     """盤中留下一筆不確定的進場單（有委託序號）。和 13:25 的出場程式一樣，先用序號查券商紀錄：
-    全部成交，補進部位檔、回到已確認，照常平掉 PTS 全部的 4 口。"""
+    全部成交，補進部位檔、回到已確認，照常平掉 PTS 全部的 4 口——講的也是 4 口，不是查之前檔裡
+    確定的 3 口。"""
     _on_file(status="UNCERTAIN", uncertain=_uncertain())
 
     code, brokers, _ = _stop("--close", fill_queries=[FillQuery(lots=1, avg_price=45160.0)])
@@ -654,6 +655,22 @@ def test_an_uncertain_micro_entry_confirmed_by_the_lookup_is_closed_as_usual(env
     assert brokers[0].queries == [("2315609990003", DAY, 1)]
     assert _orders(brokers[0]) == [("TM2611", SELL, 4, False)]
     assert position_on_file()["status"] == "CONFIRMED"
+    assert _lines(capsys)[-2] == (
+        "收工指令平掉了 PTS 今天的微台多單 4 口（TM2611），部位已經了結：13:25 的出場程式"
+        "不會再送單。")
+
+
+def test_after_the_lookup_confirms_an_entry_the_lots_left_are_counted_from_the_new_total(capsys):
+    """查到那筆不確定的進場全部成交（共 4 口），之後的平倉單每一次都被拒：平了 0 口、還剩 4 口。
+    拿查之前的 3 口去減，就會講成「平了 -1 口」。"""
+    _on_file(status="UNCERTAIN", uncertain=_uncertain())
+
+    code, brokers, _ = _stop("--close", fill_queries=[FillQuery(lots=1, avg_price=45160.0)],
+                             order_errors=[OrderFailed("保證金不足")] * 4)
+
+    assert code == 1
+    assert len(brokers[0].orders) == 4
+    assert "PTS 部位還在：收工指令平了 0 口，還剩多單 4 口（TM2611）" in _lines(capsys)
 
 
 def test_an_uncertain_micro_entry_the_lookup_cannot_confirm_is_left_for_1325(capsys, env):

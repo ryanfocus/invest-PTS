@@ -232,8 +232,14 @@ def _close(record: position_file.PositionRecord | None, *,
     if closing.ending != exit_program.Ending.CLOSED:
         return 1            # `_Tell` 已經講了剩下的、或不確定的怎麼辦
     _say(messages.stop_today_closed(at=clock(), record=closing.record,
-                                    lots=record.open_lots - closing.record.open_lots))
+                                    lots=_exited(closing.record) - _exited(record)))
     return 0
+
+
+def _exited(record: position_file.PositionRecord) -> int:
+    """部位檔記到的平倉口數。這一次平了幾口要拿它前後相減，**不能**拿還沒平的口數相減：
+    盤中留下的不確定進場查到成交時，平倉之前進場口數就先變多了。"""
+    return record.entered_lots - record.open_lots
 
 
 def _secrets() -> settings.Secrets:
@@ -266,7 +272,7 @@ class _Tell:
 
     def left(self, *, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
         return messages.stop_today_left(at=at, record=record, reason=reason,
-                                        lots=self._before.open_lots - record.open_lots)
+                                        lots=_exited(record) - _exited(self._before))
 
     def unresolved(self, *, at: datetime, record: position_file.PositionRecord,
                    lookup: str | None) -> str:
