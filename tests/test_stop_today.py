@@ -325,6 +325,25 @@ def test_close_sells_ptss_own_micro_lots_now_and_leaves_nothing_for_1325(capsys,
     assert exit_sent == []
 
 
+def test_after_a_close_the_1325_alarms_count_the_stop_commands_closes_too():
+    """10:00 `--close` 賣掉 PTS 的 3 口微台，記在 `logs/stop-….log` 的「平倉成交」。13:25 時部位檔壞了：
+    出場程式不知道口數，叫人從 log 算。只減 `logs/exit-….log` 的話算出來是 3 口，使用者照著再賣 3 口，
+    就是空單 3 口過夜。所以兩個 log 的「平倉成交」都要減。"""
+    _on_file()
+    assert _stop("--close")[0] == 0
+    with open(paths.daily_log("stop", DAY), encoding="utf-8") as fh:
+        assert [line for line in fh if "平倉成交" in line][0].count("3 口") == 1
+    write_position_file("{ 寫到一半")
+
+    exit_broker, exit_sent = _exit_at_1325()
+
+    assert exit_broker.orders == []
+    assert exit_sent[0].splitlines()[3] == (
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 "
+        "logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數"
+        "（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。")
+
+
 @pytest.mark.parametrize("product, order_code, name", [("TX00AM", "TX11", "大台"),
                                                        ("MTX00AM", "MTX11", "小台")],
                          ids=["大台", "小台"])

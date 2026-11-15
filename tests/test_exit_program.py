@@ -235,7 +235,7 @@ def test_a_position_file_that_cannot_be_read_sends_nothing_and_says_so(text):
         "PTS 今天可能還有部位：請到券商 APP 確認帳戶。"
         "微台要自行平掉（日盤 13:45 收盤；今天如果是結算日，到期的近月 13:30 就停止交易，"
         "之後由交易所以最後結算價現金了結）；大台、小台標了當沖，券商 13:30 會強平。",
-        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
         "2026/11/09 13:25:00",
     ]
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:
@@ -865,7 +865,7 @@ def test_a_missed_day_whose_position_file_cannot_be_read_is_reported_and_today_s
     assert sent[0].splitlines()[2] == (
         "PTS 那天可能留下微台部位：請到券商 APP 確認帳戶，還在的話請自行平掉。大台、小台標了當沖，"
         "那天 13:30 已經由券商強平。")
-    assert sent[0].splitlines()[3] == "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。"
+    assert sent[0].splitlines()[3] == "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。"
 
 
 def test_an_uncertain_micro_position_on_a_missed_day_is_reported():
@@ -1044,14 +1044,14 @@ CRASH_DEADLINES = {
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。微台要自行平掉（日盤 13:45 "
         "收盤；今天如果是結算日，到期的近月 13:30 就停止交易，之後由交易所以最後結算價現金"
         "了結）。大台、小台由券商 13:30 當沖強平。",
-        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
         "自己平掉之後，不要再執行出場程式：它只認部位檔，會把你平掉的口數再平一次，開出反向新倉。",
     ]),
     "日盤收盤後": ("13:50", [
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。日盤 13:45 已經收盤，"
         "微台請在夜盤自行平掉（今天如果是結算日，到期的近月已經由交易所以最後結算價現金"
         "了結，不必平）。大台、小台由券商 13:30 當沖強平。",
-        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
     ]),
 }
 

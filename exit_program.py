@@ -259,9 +259,11 @@ def entry_to_look_up(record: position_file.PositionRecord) -> bool:
 
 
 def _logs(day: date) -> dict[str, str]:
-    """告警叫人從 log 算 PTS 口數時，那一天兩支程式的 log 位置（`messages._count_from_logs`）。"""
+    """告警叫人從 log 算 PTS 口數時，那一天的 log 位置（`messages._count_from_logs`）：盤中程式的
+    「進場成交」，出場程式與收工指令（`tools/stop_today.py --close`）的「平倉成交」。"""
     return {"entry_log": paths.shown_log("intraday", day),
-            "exit_log": paths.shown_log("exit", day)}
+            "exit_log": paths.shown_log("exit", day),
+            "stop_log": paths.shown_log("stop", day)}
 
 
 def done_path(day: date) -> str:

@@ -557,7 +557,8 @@ def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text, mar
     assert sent[0].splitlines()[2:4] == [
         "今天 PTS 可能已經有部位。13:25 的出場程式同樣讀不懂這個檔，不會替你平倉：交易微台的話，"
         "請在日盤 13:45 收盤前自行平掉；大台、小台標了當沖，券商 13:30 會強平。",
-        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數（有「不知道成交幾口」"
+        "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 "
+        "logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」"
         "的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
     ]
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:
