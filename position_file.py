@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 
 import paths
@@ -200,6 +200,91 @@ class PositionRecord:
         if not lots:
             return None
         return sum(f.lots * f.price for f in self.entries) / lots
+
+    # ── 狀態的變化 ─────────────────────────────────────────────────────────
+    #
+    # 一律回傳新的一份，呼叫端照「先寫檔、再做下一件事」寫進去（`Ledger`）。狀態與「哪一筆
+    # 不確定」一起改，不會只改到一半。
+
+    def entered(self, fill: Fill) -> PositionRecord:
+        """一筆進場單確定成交了 `fill`。"""
+        return replace(self, entries=self.entries + (fill,))
+
+    def closed_by(self, fill: Fill) -> PositionRecord:
+        """一筆平倉單確定成交了 `fill`。出場口數等於進場口數就是已了結（`open_lots`）。"""
+        return replace(self, exits=self.exits + (fill,))
+
+    def unsure(self, stage: str, order_seq: str, requested_lots: int,
+               known_filled: int = 0) -> PositionRecord:
+        """一筆委託送出去了（或正要送出），不知道成交幾口：狀態改成「不確定」，記下是哪一筆。
+
+        盤中程式在送出進場單**之前**就記（還沒有序號）：送出去之後當掉的話，重啟看到的是
+        「不確定」，不是「沒有這一筆」。出場時是平倉單送出去、卻沒等到回報的那一刻，查詢**之前**。
+        """
+        return replace(self, status=UNCERTAIN,
+                       uncertain=UncertainOrder(stage, order_seq, requested_lots, known_filled))
+
+    def settled(self, fill: Fill) -> PositionRecord:
+        """不確定的那一筆有了答案：確定成交了 `fill`，記進它那一段（進場或出場）的明細，
+        回到已確認。"""
+        u = self.uncertain
+        if u is None:
+            raise ValueError(f"沒有不確定的委託，成交 {fill} 不知道是哪一筆的")
+        confirmed = replace(self, status=CONFIRMED, uncertain=None)
+        return confirmed.entered(fill) if u.stage == ENTRY else confirmed.closed_by(fill)
+
+    def at_least(self, lots: int) -> PositionRecord:
+        """不確定的那一筆查到至少成交了 `lots` 口（只查到一部分）：確定的下限，人工對帳時
+        少查一次。比已知的少就不改——下限只會往上。"""
+        u = self.uncertain
+        if u is None or lots <= u.known_filled:
+            return self
+        return replace(self, uncertain=replace(u, known_filled=lots))
+
+
+def behind(actual: PositionRecord, on_file: PositionRecord) -> bool:
+    """部位檔（`on_file`）落後帳上（`actual`）到會讓下一個讀它的程式做錯事：進出場明細、狀態，
+    或不確定的是哪一筆不同。下一個讀它的出場程式會照檔再平一次已經平掉的，或把已經確認的
+    當成不確定。
+
+    只差在不確定那一筆「已知至少成交幾口」不算：那是給人對帳的下限，下一個讀它的會再查一次，
+    叫人「不要再執行出場程式」反而是錯的。
+    """
+    def kept(record: PositionRecord) -> tuple:
+        u = record.uncertain
+        return (record.entries, record.exits, record.status,
+                None if u is None else (u.stage, u.order_seq, u.requested_lots))
+    return kept(actual) != kept(on_file)
+
+
+class Ledger:
+    """一份部位的帳：`record` 是帳上真實的，`on_file` 是部位檔裡的那一份。
+
+    成交之後的下一件事就是寫檔（規格第 52 條）。寫不進去時帳照樣記——記憶體裡的口數是對的，
+    呼叫端照樣做完該做的事（微台不能過夜）——最後問 `behind`。原因在 `error`。
+    """
+
+    def __init__(self, record: PositionRecord):
+        self.record = record
+        self.on_file = record
+        self.error = ""
+
+    def save(self, record: PositionRecord) -> None:
+        if record == self.record and record == self.on_file:
+            return
+        self.record = record
+        try:
+            write(record)
+        except Exception as exc:  # noqa: BLE001
+            # 不管為什麼寫不進去（防毒鎖住、磁碟滿、權限），結果都一樣：帳上和檔裡對不上
+            self.error = f"{type(exc).__name__}: {exc}"
+            logger.error("部位檔寫不進去，照樣做完：%s", self.error)
+            return
+        self.on_file = record
+
+    @property
+    def behind(self) -> bool:
+        return behind(self.record, self.on_file)
 
 
 def path_for(day: date) -> str:

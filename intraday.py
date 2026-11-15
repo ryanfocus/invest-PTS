@@ -733,8 +733,7 @@ class _Orders:
             self._unmark()
             return None
         fill = position_file.Fill(result.order_seq, result.filled_lots, result.avg_price)
-        record = self._current(direction)
-        record = replace(record, entries=record.entries + (fill,))
+        record = marker.settled(fill)
         # ⚠️ 成交之後的**下一件事**就是寫檔（規格第 52 條）：發通知、記 log 都排在後面。
         #    中間任何一步出事（Discord 掛了、程式被關掉），出場程式仍然知道這幾口。
         try:
@@ -750,10 +749,7 @@ class _Orders:
     def _mark_sending(self, direction: str, lots: int) -> position_file.PositionRecord:
         """送單前把部位檔記成「不確定」：這一筆還沒有序號、已知成交 0 口。寫不進去就不送。
         回傳寫進去的那一份。"""
-        marker = replace(self._current(direction), status=position_file.UNCERTAIN,
-                         uncertain=position_file.UncertainOrder(
-                             stage=position_file.ENTRY, order_seq="", requested_lots=lots,
-                             known_filled=0))
+        marker = self._current(direction).unsure(position_file.ENTRY, "", lots)
         try:
             position_file.write(marker)
         except Exception as exc:  # noqa: BLE001
@@ -804,9 +800,7 @@ class _Orders:
                               on_file=on_file)
 
         try:
-            record = replace(marker, uncertain=position_file.UncertainOrder(
-                stage=position_file.ENTRY, order_seq=order_seq, requested_lots=lots,
-                known_filled=known_filled))
+            record = marker.unsure(position_file.ENTRY, order_seq, lots, known_filled)
             position_file.write(record)
         except Exception as exc:  # noqa: BLE001
             # 寫不進去（檔案被鎖、磁碟滿），或 broker 給的數字組不成一筆記錄：部位檔還是

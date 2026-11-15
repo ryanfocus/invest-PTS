@@ -319,6 +319,22 @@ def test_an_uncertain_entry_the_lookup_cannot_confirm_is_reported_and_nothing_is
     assert _file()["uncertain"]["known_filled"] == known
 
 
+def test_a_partial_lookup_the_file_cannot_take_is_not_a_reason_to_avoid_running_again(monkeypatch):
+    """查到盤中那筆只成交一部分，「至少成交 1 口」又寫不進部位檔：檔裡還是同一筆不確定的進場，
+    只是下限少記了。再執行一次出場程式只會再查一次，不會送單——所以只講不確定那一則（附上查到的
+    下限），不講「部位檔沒記到這次的平倉、不要再執行出場程式」：這次根本沒有平倉。"""
+    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY", requested=2))
+
+    def denied(src, dst):
+        raise PermissionError(13, "存取被拒")
+    monkeypatch.setattr(os, "replace", denied)
+    broker, sent, _ = _run(fill_queries=[FillQuery(lots=1, avg_price=45160.0)])
+    assert broker.orders == []
+    assert len(sent) == 1
+    assert sent[0].startswith("【要你處理】PTS 委託送出去了，但不知道成交幾口，出場程式不再送單\n"
+                              "不確定的委託：進場買進微台 2 口（委託序號 2315609990003），已知至少成交 1 口")
+
+
 def test_an_uncertain_entry_cannot_be_looked_up_when_the_login_fails():
     """帳密、憑證這類登入失敗：查不了，照實講。告警照樣寫明要平幾口的算式，請人用委託序號自己查。"""
     _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY"))

@@ -66,3 +66,52 @@ def test_a_record_that_contradicts_itself_cannot_even_be_written():
         _record(exits=(Fill("2315610000003", 5, 45100.0),))
     with pytest.raises(ValueError, match="不確定"):
         _record(status=UNCERTAIN)
+
+
+# --- 狀態的變化：狀態與「哪一筆不確定」一起改 ---
+
+
+def test_an_entry_sent_without_knowing_its_fill_and_then_settled():
+    """送單前記下「不確定」（還沒有序號），補上序號，最後查到成交：回到已確認，成交進了進場明細。"""
+    sending = _record().unsure(position_file.ENTRY, "", 2)
+    assert (sending.status, sending.uncertain.order_seq) == (UNCERTAIN, "")
+    sent = sending.unsure(position_file.ENTRY, "2315610000009", 2, known_filled=1)
+    settled = sent.settled(Fill("2315610000009", 2, 45130.0))
+    assert (settled.status, settled.uncertain) == (CONFIRMED, None)
+    assert settled.entered_lots == 6
+    assert settled == _record(entries=_record().entries + (Fill("2315610000009", 2, 45130.0),))
+
+
+def test_a_close_order_settled_by_the_lookup_counts_as_closed():
+    unsure = _record().unsure(EXIT, "2315610000009", 4)
+    settled = unsure.settled(Fill("2315610000009", 4, 45100.0))
+    assert (settled.status, settled.open_lots) == (CONFIRMED, 0)
+
+
+def test_what_a_lookup_found_only_ever_raises_the_lower_bound():
+    unsure = _record().unsure(EXIT, "2315610000009", 4, known_filled=2)
+    assert unsure.at_least(3).uncertain.known_filled == 3
+    assert unsure.at_least(1) is unsure
+
+
+_CLOSING = "2315610000009"
+
+
+def _closing_unsure() -> PositionRecord:
+    return _record().unsure(EXIT, _CLOSING, 2)
+
+
+#                         帳上                                              檔裡             落後
+BEHIND = {
+    "一樣":                (_closing_unsure(),                                 _closing_unsure(), False),
+    "少了查到的平倉成交":   (_closing_unsure().settled(Fill(_CLOSING, 2, 45100.0)), _closing_unsure(), True),
+    "少了那筆不確定的平倉": (_closing_unsure(),                                 _record(),         True),
+    "只少了已知至少成交幾口":(_closing_unsure().at_least(1),                    _closing_unsure(), False),
+}
+
+
+@pytest.mark.parametrize("actual, on_file, lags", BEHIND.values(), ids=BEHIND.keys())
+def test_the_file_is_behind_only_when_the_next_reader_would_act_wrongly(actual, on_file, lags):
+    """部位檔寫不進去時，什麼樣的落後要叫人「不要再執行出場程式」：下一個讀它的會照檔再平一次、
+    或把不確定的當成確定。已知成交口數是給人對帳的下限，下一個讀它的會再查，不算。"""
+    assert position_file.behind(actual, on_file) is lags

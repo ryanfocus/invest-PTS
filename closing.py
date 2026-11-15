@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import enum
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable
 
@@ -87,7 +87,8 @@ class Closed:
 
     @property
     def file_behind(self) -> bool:
-        return self.record != self.on_file
+        """部位檔落後到下一個讀它的程式會做錯事（`position_file.behind`）。"""
+        return position_file.behind(self.record, self.on_file)
 
 
 def close(record: position_file.PositionRecord, *, broker: Callable[[], Broker],
@@ -107,30 +108,6 @@ def close(record: position_file.PositionRecord, *, broker: Callable[[], Broker],
     return _Closing(broker(), record, until=until, clock=clock, sleep=sleep).run()
 
 
-class _Ledger:
-    """這次的部位：`record` 是真實的（含這次的平倉），`on_file` 是部位檔裡的那一份。
-
-    成交之後的下一件事就是寫檔（規格第 52 條）。寫不進去時**照樣繼續平倉**——微台不能過夜，
-    而記憶體裡的口數是對的；兩份對不上就由呼叫端告警。
-    """
-
-    def __init__(self, record: position_file.PositionRecord):
-        self.record = record
-        self.on_file = record
-        self.error = ""
-
-    def save(self, record: position_file.PositionRecord) -> None:
-        self.record = record
-        try:
-            position_file.write(record)
-        except Exception as exc:  # noqa: BLE001
-            # 不管為什麼寫不進去（防毒鎖住、磁碟滿、權限），結果都一樣：帳上和檔裡對不上
-            self.error = f"{type(exc).__name__}: {exc}"
-            logger.error("部位檔寫不進去，繼續平倉：%s", self.error)
-            return
-        self.on_file = record
-
-
 class _Uncertain(Exception):
     """一筆委託送出去了（或盤中留下的），查詢卻沒能確認它全部成交。`lookup` 是給人看的查詢結果。"""
 
@@ -145,7 +122,7 @@ class _Closing:
                  sleep: Callable[[float], None]):
         self._broker = broker
         self._before = record
-        self._ledger = _Ledger(record)
+        self._ledger = position_file.Ledger(record)
         self._today: date = record.trading_day
         self._until = until
         self._clock = clock
@@ -184,8 +161,9 @@ class _Closing:
                     return self._left(Short.LOGIN_FAILED, rounds, str(exc))
                 logged_in = True
             if self._ledger.record.uncertain is not None:
+                # 盤中留下的進場不確定（`handoff.exit_looks_up`）：確定了才平
                 try:
-                    self._look_up_entry()
+                    self._resolve()
                 except _Uncertain as exc:
                     return self._unresolved(exc.lookup)
             try:
@@ -235,73 +213,51 @@ class _Closing:
             fill = position_file.Fill(result.order_seq, result.filled_lots, result.avg_price)
             logger.info("平倉成交：%s %d 口 @ %g（委託 %s）", record.order_code, fill.lots,
                         fill.price, fill.order_seq)
-            self._ledger.save(replace(record, exits=record.exits + (fill,)))
+            self._ledger.save(record.closed_by(fill))
         return ""
 
     def _look_up(self, exc: FillUnknown, lots: int) -> None:
         """平倉單送出去了，卻不知道成交幾口（規格第 50 條後半）。**絕不再送一次**：它很可能已經
-        成交，再送就是反向新倉。改用這張單的委託序號向券商查成交紀錄（兩段查詢）。
-
-        查到全部成交：記進出場明細、回到已確認，呼叫端照常送下一筆。其他結局（只成交一部分、
-        查不到、查詢失敗、沒有序號可查）都拋 `_Uncertain`：帳上剩幾口已經不知道，
-        還沒送的那幾筆也不送了。
+        成交，再送就是反向新倉。改用這張單的委託序號向券商查（`_resolve`）；確定不了就拋
+        `_Uncertain`：帳上剩幾口已經不知道，還沒送的那幾筆也不送了。
         """
         seq = exc.order_seq
         logger.error("平倉委託送出去了，但不知道成交幾口（委託序號 %s）：%s", seq or "沒有", exc)
-        record = self._ledger.record
-        uncertain = position_file.UncertainOrder(
-            stage=position_file.EXIT, order_seq=seq, requested_lots=lots,
-            known_filled=exc.known_filled)
         # 先記下「不確定」再查：查詢至少要 5 秒，這段時間程式被關掉的話，重跑時看到的必須是
         # 「這筆出場單不確定」，而不是「這幾口還沒平」——後者會讓它再送一次。
-        self._ledger.save(replace(record, status=position_file.UNCERTAIN, uncertain=uncertain))
+        self._ledger.save(self._ledger.record.unsure(position_file.EXIT, seq, lots,
+                                                     exc.known_filled))
         if not seq:
             raise _Uncertain("沒有委託序號，無法查詢")
+        self._resolve()
 
-        found = self._broker.query_fills(seq, self._today, lots)
-        if found.lots == lots:
-            # 和送單當下就知道成交的那種寫成同一個字：告警叫人從 log 算口數時只要找「平倉成交」
-            # （`messages._count_from_logs`）。
-            logger.info("平倉成交（成交查詢確認）：%s %d 口 @ %g（委託 %s）",
-                        record.order_code, lots, found.avg_price, seq)
-            self._ledger.save(replace(record, exits=record.exits + (
-                position_file.Fill(seq, lots, found.avg_price),)))
-            return
-        if found.lots:
-            if found.lots > uncertain.known_filled:
-                # 券商紀錄上的成交是確定的下限，記下來，人工對帳時少查一次
-                self._ledger.save(replace(self._ledger.record, uncertain=replace(
-                    uncertain, known_filled=found.lots)))
-            raise _Uncertain(f"成交 {found.lots} 口（委託 {lots} 口）")
-        if found.failure:
-            raise _Uncertain(f"查詢失敗：{found.failure}")
-        raise _Uncertain("查不到這筆委託的成交")
+    def _resolve(self) -> None:
+        """部位檔記著的那一筆不確定的委託——剛送出的平倉單，或盤中留下的進場單（規格第 50 條）——
+        用它的委託序號查券商紀錄（兩段查詢）。
 
-    def _look_up_entry(self) -> None:
-        """盤中程式留下一筆不確定的進場委託（規格第 50 條）：用它的委託序號查券商紀錄（兩段查詢）。
-
-        到 13:25 那筆市價 IOC 早就結束了，券商紀錄也定案了，比盤中當下查可靠。查到全部成交：
-        補進進場明細、回到已確認，照常平倉——盤中那則告警請使用者等到 13:25、不要自己平，
-        靠的就是這一步。其他結局都拋 `_Uncertain`。**只成交一部分也不算確定**：查詢萬一漏了
-        一列，照少算的口數平，微台就過夜。查到的口數是確定的下限，記進部位檔，人工對帳時少查一次。
-        查不到不是 0 口（`broker.FillQuery`）。
+        查到全部成交：記進明細、回到已確認，照常往下做——盤中那則告警請使用者等到 13:25、
+        不要自己平，靠的就是這一步。其他結局都拋 `_Uncertain`。**只成交一部分也不算確定**：查詢
+        萬一漏了一列，照少算的口數平，微台就過夜。查到的口數是確定的下限，記進部位檔，人工對帳時
+        少查一次。查不到不是 0 口（`broker.FillQuery`）。
         """
         record = self._ledger.record
         u = record.uncertain
         found = self._broker.query_fills(u.order_seq, self._today, u.requested_lots)
         if found.lots == u.requested_lots:
-            confirmed = replace(
-                record, entries=record.entries + (
-                    position_file.Fill(u.order_seq, found.lots, found.avg_price),),
-                status=position_file.CONFIRMED, uncertain=None)
-            logger.info("進場成交（成交查詢確認）：%s %d 口 @ %g（委託 %s），累計 %d 口",
-                        record.direction, found.lots, found.avg_price, u.order_seq,
-                        confirmed.entered_lots)
-            self._ledger.save(confirmed)
+            settled = record.settled(position_file.Fill(u.order_seq, found.lots, found.avg_price))
+            # 和送單當下就知道成交的那種寫成同一個字：告警叫人從 log 算口數時找的就是它們
+            # （`messages._count_from_logs`）
+            if u.stage == position_file.EXIT:
+                logger.info("平倉成交（成交查詢確認）：%s %d 口 @ %g（委託 %s）",
+                            record.order_code, found.lots, found.avg_price, u.order_seq)
+            else:
+                logger.info("進場成交（成交查詢確認）：%s %d 口 @ %g（委託 %s），累計 %d 口",
+                            record.direction, found.lots, found.avg_price, u.order_seq,
+                            settled.entered_lots)
+            self._ledger.save(settled)
             return
         if found.lots:
-            if found.lots > u.known_filled:
-                self._ledger.save(replace(record, uncertain=replace(u, known_filled=found.lots)))
+            self._ledger.save(record.at_least(found.lots))
             raise _Uncertain(f"成交 {found.lots} 口（委託 {u.requested_lots} 口）")
         if found.failure:
             raise _Uncertain(f"查詢失敗：{found.failure}")
