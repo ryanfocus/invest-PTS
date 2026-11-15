@@ -107,6 +107,9 @@ BEHIND = {
     "少了查到的平倉成交":   (_closing_unsure().settled(Fill(_CLOSING, 2, 45100.0)), _closing_unsure(), True),
     "少了那筆不確定的平倉": (_closing_unsure(),                                 _record(),         True),
     "只少了已知至少成交幾口":(_closing_unsure().at_least(1),                    _closing_unsure(), False),
+    # 盤中補不上序號：檔裡那筆「不確定」沒有序號，出場程式查不了
+    "不確定的那一筆少了序號":(_record().unsure(position_file.ENTRY, _CLOSING, 2),
+                            _record().unsure(position_file.ENTRY, "", 2),       True),
 }
 
 
@@ -115,3 +118,25 @@ def test_the_file_is_behind_only_when_the_next_reader_would_act_wrongly(actual, 
     """部位檔寫不進去時，什麼樣的落後要叫人「不要再執行出場程式」：下一個讀它的會照檔再平一次、
     或把不確定的當成確定。已知成交口數是給人對帳的下限，下一個讀它的會再查，不算。"""
     assert position_file.behind(actual, on_file) is lags
+
+
+def test_the_ledger_writes_again_until_the_file_catches_up(monkeypatch, state_dir):
+    """寫不進去之後，同一份再存一次就再寫一次：檔案這次寫得進去的話就跟上了。"""
+    record = _record()
+    ledger = position_file.Ledger(record)
+    closed = record.closed_by(Fill("2315610000009", 1, 45100.0))
+    real_write = position_file.write
+    attempts = []
+
+    def flaky(r):
+        attempts.append(r)
+        if len(attempts) == 1:
+            raise PermissionError(13, "存取被拒")
+        real_write(r)
+    monkeypatch.setattr(position_file, "write", flaky)
+
+    ledger.save(closed)
+    assert ledger.behind
+    ledger.save(closed)
+    assert not ledger.behind
+    assert position_file.read(DAY) == closed
