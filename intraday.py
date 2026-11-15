@@ -139,6 +139,10 @@ _MAX_LAG = timedelta(seconds=30)
 # 連續這麼久沒有即時的大台報價，就發 Discord（規格第 53 條）。
 _OUTAGE_ALERT = timedelta(minutes=3)
 
+# 確認記錄（`stop_seen_path`）寫不進去時，隔多久再寫一次。收工指令每秒看一次、等 2 分鐘，
+# 這個間隔要遠短於那個；不每秒重試，是為了不讓 log 每秒多一行錯誤。
+_SEEN_RETRY = timedelta(seconds=10)
+
 # 大台日盤每秒都有好幾筆成交。相鄰兩筆隔得比這還久，中間就是報價斷了，不是沒有人交易：
 # 斷掉的那一段碰到的 K 棒缺了成交（開高低收都可能不對），見 `_missing_bars`。
 _TRADE_GAP = timedelta(seconds=30)
@@ -858,8 +862,10 @@ class _Trading:
         # 部位檔讀不懂（`_stop_for_unreadable_position_file`）：一開始就不進場
         self._stopped = self._stopped or stopped
         # 寫過確認記錄了沒有（`look_for_stop_record`）。啟動時讀到停止進場記錄也一樣要寫，
-        # 在第一個時鐘事件寫（那時才有「現在」，見模組說明「時間」）。
+        # 在第一個時鐘事件寫（那時才有「現在」，見模組說明「時間」）。寫不進去的話，
+        # `_seen_retry_at` 之後再寫一次。
         self._stop_seen = False
+        self._seen_retry_at: datetime | None = None
         # 排在停止進場的判斷之後：模擬部位讀不懂時，`_simulated_so_far` 會再把它打開
         self.position = _held(record) if live else self._simulated_so_far()
         # 交易商品的現價：部位不虧用它，模擬也成交在它
@@ -965,13 +971,13 @@ class _Trading:
         看到的那一刻今天不再進場、取消等待中的突破進場（同報價中斷，不恢復），寫下確認記錄
         （`stop_seen_path`），只記 log、不發 Discord（使用者自己下的指令）。今天已經因為別的原因
         停止進場、或啟動時就讀到記錄，照樣寫確認記錄：收工指令等的是「盤中程式知道了」，
-        不是「為什麼停」。寫過一次就不再看。
+        不是「為什麼停」。確認記錄寫進去之後就不再看；寫不進去就隔 `_SEEN_RETRY` 再寫。
 
         **存在就算數**：收工指令寫記錄時檔案先建出來、那一行才寫進去，剛好在中間看到的是空檔；
         寫到一半被砍掉、寫壞了也一樣——都是停止進場，原因不知道。這裡在事件迴圈裡每秒跑一次，
         **不可以往外拋**：一拋盤中程式就當掉，原始行情斷到排程把它叫回來。
         """
-        if self._stop_seen:
+        if self._stop_seen or (self._seen_retry_at is not None and now < self._seen_retry_at):
             return
         try:
             why = state_files.read_marker(stop_path(self._today))
@@ -982,8 +988,11 @@ class _Trading:
                 logger.warning("看到停止進場記錄，今天不再進場：%s",
                                why.splitlines()[-1] if why else "（記錄是空的，原因不知道）")
             self.cancel_breakout("看到停止進場記錄")
-            self._stop_seen = True
-            _write_stop_seen(self._today, now)
+            # 確認記錄寫進去了才算看過：寫不進去（防毒鎖住）就隔一下再寫，不然收工指令今天
+            # 怎麼等都等不到，`--close` 一次都做不成
+            self._stop_seen = _write_stop_seen(self._today, now)
+            if not self._stop_seen:
+                self._seen_retry_at = now + _SEEN_RETRY
         except Exception as exc:  # noqa: BLE001
             # 讀的時候檔案已經在了：當成停止進場，下一秒再試著寫確認記錄
             logger.error("看停止進場記錄時出錯（%s: %s），當成停止進場，下一秒再看",
@@ -1367,17 +1376,19 @@ def stop_seen_path(day: date) -> str:
     return state_files.daily("stop-seen", day)
 
 
-def _write_stop_seen(day: date, now: datetime) -> None:
-    """寫不進去只記 log：收工指令等不到確認，會請使用者過一兩分鐘再執行一次，不會平倉。"""
+def _write_stop_seen(day: date, now: datetime) -> bool:
+    """寫下確認記錄，回傳寫進去了沒有。寫不進去只記 log、不往外拋：收工指令等不到確認就不平倉；
+    `look_for_stop_record` 隔 `_SEEN_RETRY` 再寫一次。"""
     path = stop_seen_path(day)
     try:
         state_files.write_marker(path, f"{now:%Y/%m/%d %H:%M:%S} 盤中程式看到停止進場記錄，"
                                        "今天不再進場")
     except Exception as exc:  # noqa: BLE001
-        logger.error("確認記錄寫不進 %s（%s: %s）：收工指令等不到確認，這一次不會平倉",
-                     path, type(exc).__name__, exc)
-        return
+        logger.error("確認記錄寫不進 %s（%s: %s）：收工指令等不到確認、不會平倉，%d 秒後再寫",
+                     path, type(exc).__name__, exc, _SEEN_RETRY.seconds)
+        return False
     logger.info("看到停止進場記錄，已寫下確認記錄 %s", path)
+    return True
 
 
 def _send(config: settings.Config, notify: Callable[[str], bool], text: str) -> None:

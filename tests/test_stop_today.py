@@ -265,6 +265,22 @@ def test_a_stop_record_caught_half_written_still_stops_entries_without_crashing(
     assert raw_market.read(DAY)[-1] == trade(at("08:53:00"), 45180)
 
 
+def test_a_confirmation_that_could_not_be_written_is_written_again_later():
+    """停止進場記錄一開始就在（稍早執行過收工指令），盤中程式起來時確認記錄卻寫不進去（防毒鎖住）。
+    不是看過就算了：之後的時鐘事件再寫，寫進去為止——不然收工指令那天怎麼等都等不到確認，
+    `--close` 一次都做不成。08:50:30 鎖放掉，下一次重試就寫進去了。"""
+    _on_file()
+    assert _stop(at="08:40:00")[0] == 0
+    os.makedirs(intraday.stop_seen_path(DAY))        # 擋在那裡、寫不進去
+    broker = _Meanwhile(at("08:50:30"), lambda: os.rmdir(intraday.stop_seen_path(DAY)),
+                        events=rally("08:45", 8))
+
+    _intraday(broker)
+
+    assert broker.orders == []
+    assert os.path.isfile(intraday.stop_seen_path(DAY))
+
+
 def test_a_waiting_breakout_is_cancelled_when_the_stop_record_appears():
     """08:50 條件 1 進一口（模擬模式），之後平盤到 10:00。10:00 那根筆差跳增，10:01 設下突破進場
     （觸發價 45180，同 test_chase_entry）。使用者 10:01:45 執行收工指令；10:02:30 大台碰到
