@@ -10,6 +10,7 @@ from datetime import date, datetime, time
 import pytest
 
 import handoff
+import messages
 from broker import TMF_CODE, TX_CODE
 from handoff import Who
 from position_file import (CONFIRMED, ENTRY, EXIT, UNCERTAIN, Fill, PositionRecord,
@@ -107,3 +108,25 @@ def test_every_log_that_holds_pts_fills_is_listed():
     assert logs.entry.endswith("intraday-20261109.log")
     assert [log.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for log in logs.closes] == [
         "exit-20261109.log", "stop-20261109.log"]
+
+
+# --- 說法也照這個答案：13:25 之後不叫人等 13:25，結算日 13:30 之後不叫人在 13:30 前平 ---
+
+
+def test_an_intraday_alert_after_1325_does_not_say_wait_for_1325():
+    """盤中程式 13:25 之後才重啟，替上一輪補發「委託送出去了，但…」（`report_uncertain_entry_left_by_last_run`）：
+    出場程式已經起來了，它要是查不到已經發了 Discord。"""
+    on_file = _record(uncertain=ENTRY_WITH_SEQ)
+    text = messages.fill_unknown(at=_at("13:40"), on_file=on_file, lots=2,
+                                 order_seq=ENTRY_WITH_SEQ.order_seq, known_filled=1,
+                                 reason="重啟", file_error=None)
+    assert "不必現在處理" not in text
+    assert "13:25 起由出場程式用委託序號查這筆、查到全部成交就平倉。" in text
+
+
+def test_an_intraday_alert_after_1330_on_the_settlement_day_says_the_exchange_settles_it():
+    on_file = _record(day=SETTLEMENT_DAY, uncertain=ENTRY_NO_SEQ)
+    text = messages.fill_unknown(at=_at("13:35", SETTLEMENT_DAY), on_file=on_file, lots=1,
+                                 order_seq="", known_filled=0, reason="重啟", file_error=None)
+    assert "13:30 前" not in text
+    assert "近月 13:30 已經停止交易，不能再平" in text

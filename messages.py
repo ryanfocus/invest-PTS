@@ -98,7 +98,8 @@ def fill_unknown(*, at: datetime, on_file: position_file.PositionRecord, lots: i
     h = handoff.decide(on_file, at=at, exit_done=False)
     if h.who is Who.EXIT_LOOKS_UP:
         on_file_text = "部位檔已記為「不確定」：盤中程式今天不再進場。"
-        todo = (f"{name}不必現在處理：{_exit_looks_up(name, close, count.high)}")
+        todo = (_exit_looked_up() if h.exit_started
+                else f"{name}不必現在處理：{_exit_looks_up(name, close, count.high)}")
     else:
         on_file_text = (f"部位檔已記為「不確定」{missing}：盤中程式今天不再進場，"
                         "13:25 的出場程式也不會自動平倉。")
@@ -130,13 +131,22 @@ def _exit_looks_up(name: str, close: str, lots: int, *, again: bool = False) -> 
             "在那之前不要自己平：不然 13:25 會再平一次，開出反向新倉。")
 
 
+def _exit_looked_up() -> str:
+    """`Who.EXIT_LOOKS_UP`、但 13:25 已經到了（`Handoff.exit_started`）：出場程式已經起來，它要是
+    查不到，已經（或就要）發 Discord 講要平幾口。不能再說「等 13:25」。"""
+    return f"13:25 起由出場程式用委託序號查這筆、查到全部成交就平倉。{_exit_took_over()}"
+
+
 def _close_yourself(h: Handoff, order: str) -> str:
     """要人自己平微台的那一句（`Who.USER`），期限照 `handoff.deadline`。`order` 是要送的單。
 
     結算日的近月 13:30 就停止交易，一般日到日盤 13:45 收盤；過了一般日的期限只能在夜盤平。
-    結算日寫成 13:45 的話，使用者以為還有時間，其實 13:30 之後就賣不掉了。
-    （結算日過了 13:30 就不是要人平，是 `Who.EXCHANGE`。）
+    結算日寫成 13:45 的話，使用者以為還有時間，其實 13:30 之後就賣不掉了。結算日過了 13:30
+    就不是要人平了（`Who.EXCHANGE`）：不能再平，由交易所了結。
     """
+    if h.who is Who.EXCHANGE:
+        return (f"今天是結算日，近月 {SETTLEMENT_CLOSE:%H:%M} 已經停止交易，不能再平：PTS 還在的"
+                "微台部位由交易所以最後結算價現金了結。結算後請到券商 APP 確認帳戶。")
     if h.settles_today:
         return (f"請在 {SETTLEMENT_CLOSE:%H:%M} 前自行{order}：今天是結算日，近月 "
                 f"{SETTLEMENT_CLOSE:%H:%M} 停止交易，之後還在的口數由交易所以最後結算價現金了結。")
@@ -427,10 +437,13 @@ def _check_account(record: position_file.PositionRecord, at: datetime) -> str:
     if h.who is Who.BROKER:
         return (f"大台、小台標了當沖，券商 {DAY_TRADE_CLOSE:%H:%M} 會強平："
                 f"{DAY_TRADE_CLOSE:%H:%M} 之後請到券商 APP 確認帳戶裡已經沒有 PTS 的部位。")
-    if h.who is Who.EXCHANGE:
-        return (f"今天是結算日，近月 {SETTLEMENT_CLOSE:%H:%M} 已經停止交易，不能再平：PTS 還在的"
-                "微台部位由交易所以最後結算價現金了結。結算後請到券商 APP 確認帳戶。")
-    return _close_yourself(h, _uncertain_close_order(record))
+    todo = _close_yourself(h, _uncertain_close_order(record))
+    if handoff.exit_looks_up(record) and not h.passed:
+        # 盤中留下的進場、13:25 查不到：部位檔原封不動，還是這一筆查得到的不確定。使用者自己平掉
+        # 之後再執行出場程式，它會再查一次——這時查到全部成交，就照部位檔再平一次（同 `exit_incomplete`）
+        todo += ("\n自己平掉之後，不要再執行出場程式：它會再用委託序號查這筆，查到全部成交就照部位檔"
+                 "平倉，開出反向新倉。")
+    return todo
 
 
 def exit_incomplete(*, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
@@ -781,7 +794,7 @@ def stop_today_entry_unresolved(*, at: datetime, record: position_file.PositionR
     name = _PRODUCT_TEXT[record.product]
     h = handoff.decide(record, at=at, exit_done=False)
     if h.exit_started:
-        todo = f"13:25 起由出場程式用委託序號查這筆、查到全部成交就平倉。{_exit_took_over()}"
+        todo = _exit_looked_up()
     else:
         todo = (f"{name}不必現在處理："
                 + _exit_looks_up(name, _CLOSE_SIDE_TEXT[record.direction],

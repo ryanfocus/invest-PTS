@@ -225,27 +225,33 @@ def _close(record: position_file.PositionRecord | None, *,
 def _report(closed: closing.Closed, now: datetime) -> int:
     """平倉的結果。和出場程式最大的不同：剩下的口數**不叫人自己平**——部位檔記著這次平掉的，
     剩下的照常由 13:25 的出場程式（微台）或券商 13:30 的當沖強平（大台、小台）了結，叫人自己平，
-    13:25 就是再平一次（`messages.stop_today_left`）。部位檔沒記到的話，最後另外講。"""
+    13:25 就是再平一次（`messages.stop_today_left`）。
+
+    部位檔沒跟上（`closing.Closed.file_behind`）的話只講那一則（停用出場程式的排程、照「實際」
+    自己平）：「剩下的照常由 13:25 處理」是看帳上講的，13:25 的出場程式照的卻是舊檔，兩則放在
+    一起就是互相矛盾的指示。
+    """
     record = closed.record
     if closed.result is closing.Result.NOTHING_OPEN:
         _say(messages.stop_today_position(record, now))
+        return 0
+    if closed.file_behind:
+        if closed.result in (closing.Result.ON_FILE_UNCERTAIN, closing.Result.EXIT_UNCERTAIN):
+            _say(messages.exit_uncertain(at=now, record=record, lookup=closed.lookup))
+        _say(messages.stop_today_not_on_file(at=now, record=record, on_file=closed.on_file,
+                                             reason=closed.file_error))
+        return 1
+    if closed.result is closing.Result.CLOSED:
+        _say(messages.stop_today_closed(at=now, record=record, lots=closed.closed_lots))
         return 0
     if closed.result is closing.Result.LEFT:
         _say(messages.stop_today_left(at=now, record=record, lots=closed.closed_lots,
                                       reason=messages.stop_shortfall(closed)))
     elif closed.result is closing.Result.ENTRY_UNRESOLVED:
         _say(messages.stop_today_entry_unresolved(at=now, record=record, lookup=closed.lookup))
-    elif closed.result is not closing.Result.CLOSED:
+    else:
         _say(messages.exit_uncertain(at=now, record=record, lookup=closed.lookup))
-    if closed.file_behind:
-        # 13:25 的出場程式只認部位檔：照舊檔把已經平掉的再平一次
-        _say(messages.stop_today_not_on_file(at=now, record=record, on_file=closed.on_file,
-                                             reason=closed.file_error))
-        return 1
-    if closed.result is not closing.Result.CLOSED:
-        return 1
-    _say(messages.stop_today_closed(at=now, record=record, lots=closed.closed_lots))
-    return 0
+    return 1
 
 
 def _secrets() -> settings.Secrets:

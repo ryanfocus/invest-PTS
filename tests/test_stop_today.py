@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from broker import SELL, FillQuery, LoginFailed, OrderFailed
+from broker import SELL, FillQuery, FillUnknown, LoginFailed, OrderFailed
 from broker.fake import FakeBroker
 from conftest import REPO_ROOT
 from day_script import (DAY, PREVIOUS_DAY, at, calm_history, clock, contracts,
@@ -680,6 +680,29 @@ def test_a_close_that_cannot_be_written_to_the_position_file_says_so(monkeypatch
         "收盤後再啟用排程。",
     ]
     assert out[-2] == "也不要再執行收工指令：它一樣只認部位檔。"
+
+
+def test_lots_left_when_the_file_cannot_keep_up_are_not_promised_to_the_exit_program(
+        monkeypatch, capsys):
+    """安全審查找到的：13 口，部位檔一直寫不進去。10 口那筆不知道成交、查到全部成交；3 口那筆
+    只成交 1 口，重試也沒再成交——帳上還剩 2 口，檔裡卻還是 13 口沒平。13:25 的出場程式照檔做，
+    不會「只平剩下的 2 口」：不能再講「剩下的照常由 13:25 平掉、不要自己平」，只講部位檔那一則
+    （停用出場程式的排程、照「實際」自己平）。兩則放在一起就是互相矛盾的指示。"""
+    _on_file(entries=[{"order_seq": "2315609990001", "lots": 13, "price": 45100.0}])
+    lock_position_file(monkeypatch)
+
+    code, brokers, _ = _stop("--close", order_errors=[
+        FillUnknown("30 秒內沒等到委託 2315610000001 結束", order_seq="2315610000001")],
+        fill_queries=[FillQuery(lots=10, avg_price=45200.0)], fills=[1, 0, 0, 0])
+
+    assert code == 1
+    assert [o.lots for o in brokers[0].orders] == [10, 3, 2, 2, 2]
+    out = _lines(capsys)
+    assert not any("照常由 13:25" in line or "不要自己平" in line for line in out)
+    assert out[-6:-4] == [
+        "【要你處理】PTS 部位檔沒記到收工指令這次的平倉",
+        "實際：平倉 11 口，還剩多單 2 口；部位檔記的是平倉 0 口",
+    ]
 
 
 def test_without_a_futures_account_close_does_not_log_in(tmp_path, monkeypatch, capsys):

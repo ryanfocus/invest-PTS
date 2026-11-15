@@ -277,9 +277,32 @@ def test_an_uncertain_entry_on_file_sends_nothing_and_says_what_is_known():
         "券商的成交紀錄：查不到這筆委託的成交\n"
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
         "請在日盤 13:45 收盤前自行賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。\n"
+        f"{_DO_NOT_RUN_AGAIN}\n"
         "2026/11/09 13:25:00",
     ]
     assert _file() == content
+
+
+# 13:25 查不到盤中那筆進場時：檔裡還是同一筆查得到的不確定，自己平掉之後再執行出場程式，它會再查、
+# 查到全部成交就照檔再平一次
+_DO_NOT_RUN_AGAIN = ("自己平掉之後，不要再執行出場程式：它會再用委託序號查這筆，查到全部成交就照部位檔"
+                     "平倉，開出反向新倉。")
+
+
+def test_closing_by_hand_after_an_unconfirmed_entry_and_running_again_would_close_twice():
+    """安全審查找到的：13:25 查到盤中那筆只成交 1 口（委託 2 口），告警請人自己平 4～5 口。
+    使用者照著平了 5 口，13:35 又手動執行一次出場程式：這時查到全部成交，就照部位檔再賣 5 口——
+    5 口空單過夜。所以告警要講「自己平掉之後，不要再執行出場程式」；過了期限的重跑不送單，就不講。"""
+    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY", requested=2))
+    _, sent, _ = _run(fill_queries=[FillQuery(lots=1, avg_price=45160.0)])
+    assert sent[0].splitlines()[-2] == _DO_NOT_RUN_AGAIN
+
+    broker, _, _ = _run(at=_at("13:35"), fill_queries=[FillQuery(lots=2, avg_price=45160.0)])
+    assert [o.lots for o in broker.orders] == [5]       # 告警擋的就是這一筆
+
+    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY", requested=2))
+    _, sent, _ = _run(at=_at("13:50"))
+    assert _DO_NOT_RUN_AGAIN not in sent[0]
 
 
 def test_an_uncertain_micro_entry_confirmed_by_the_lookup_is_closed_as_usual():
@@ -381,7 +404,7 @@ def test_an_uncertain_micro_position_is_reported_with_the_deadline_that_applies(
              uncertain=_uncertain("ENTRY"))
     broker, sent, _ = _run(at=_at(hhmm, day), fill_queries=[FillQuery(lots=None)])
     assert broker.orders == []
-    assert sent[0].splitlines()[-2] == todo
+    assert todo in sent[0].splitlines()
 
 
 def test_an_uncertain_tx_position_is_reported_with_the_brokers_close_in_mind():
