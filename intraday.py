@@ -109,6 +109,7 @@ from typing import Callable, Iterator
 
 import calendar_tw
 import day_settings
+import handoff
 import heartbeat
 import indicators
 import messages
@@ -472,8 +473,7 @@ def _stop_for_unreadable_position_file(config: settings.Config, notify: Callable
         return
     _write_stop(today, f"{today:%Y/%m/%d} 部位檔讀不懂：{exc}")
     _send(config, notify, messages.position_file_unreadable(
-        day=today, reason=str(exc), entry_log=paths.shown_log("intraday", today),
-        stop_log=paths.shown_log("stop", today)))
+        day=today, reason=str(exc), logs=handoff.fill_logs(today)))
 
 
 def _missing_bars(previous: datetime, t: datetime) -> set[datetime]:
@@ -646,11 +646,11 @@ _ENTRY_SIDE = {strategy.LONG: BUY, strategy.SHORT: SELL}
 
 
 class _FillNotOnFile(Exception):
-    """單已經成交，部位檔卻寫不進去。`record` 是含這一筆的**真實**部位，`on_file` 是送單前
-    那一份（還沒有檔就是 None）：檔裡是它的成交，加上送單前記下的「不確定」。"""
+    """單已經成交，部位檔卻寫不進去。`record` 是含這一筆的**真實**部位，`on_file` 是檔裡的那一份：
+    送單前記下的「不確定」（沒有委託序號，13:25 的出場程式查不了）。"""
 
     def __init__(self, fill: position_file.Fill, record: position_file.PositionRecord,
-                 on_file: position_file.PositionRecord | None, cause: Exception):
+                 on_file: position_file.PositionRecord, cause: Exception):
         super().__init__(f"{type(cause).__name__}: {cause}")
         self.fill = fill
         self.record = record
@@ -661,16 +661,18 @@ class _Uncertain(Exception):
     """進場單送出去了，卻不知道成交幾口。訊息是不確定的原因。
 
     `file_error` 是 None 代表部位檔記下了這一筆的序號與已知口數；否則是寫不進去的原因，
-    部位檔還是送單前記下的「不確定」（少了序號）——出場程式照樣不自動平倉。
+    部位檔還是送單前記下的「不確定」（少了序號）——出場程式照樣不自動平倉。`on_file` 是檔裡的
+    那一份（13:25 的出場程式照它決定查不查，`handoff.decide`）。
     """
 
     def __init__(self, *, order_seq: str, requested_lots: int, known_filled: int, reason: str,
-                 file_error: str | None):
+                 file_error: str | None, on_file: position_file.PositionRecord):
         super().__init__(reason)
         self.order_seq = order_seq
         self.requested_lots = requested_lots
         self.known_filled = known_filled
         self.file_error = file_error
+        self.on_file = on_file
 
 
 class _Orders:
@@ -711,20 +713,19 @@ class _Orders:
         request = OrderRequest(contract=self._contract, side=_ENTRY_SIDE[direction], lots=lots,
                                trading_day=self._today,
                                deadline=datetime.combine(self._today, ENTRY_CUTOFF))
-        self._mark_sending(direction, lots)
+        marker = self._mark_sending(direction, lots)
         try:
             result = self._broker.place_order(request)
         except OrderFailed:
             self._unmark()
             raise
         except FillUnknown as exc:
-            raise self._uncertain(direction, lots, exc.order_seq, exc.known_filled,
-                                  str(exc)) from exc
+            raise self._uncertain(marker, exc.order_seq, exc.known_filled, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             # broker 的契約是只拋上面兩種，但它沒做到的時候，這裡分不出單出去了沒有。
             # 分不清就是「可能有部位」（broker/__init__.py 的分界線）：當成沒送出去的話，
             # 部位檔不記，出場程式以為今天沒進場，部位直接過夜。
-            raise self._uncertain(direction, lots, "", 0,
+            raise self._uncertain(marker, "", 0,
                                   f"送單時發生意外（{type(exc).__name__}）：{exc}") from exc
         if not result.filled_lots:
             logger.warning("委託 %s 沒有成交（市價 IOC 當下沒有對手價），部位不變",
@@ -742,12 +743,13 @@ class _Orders:
             # 不管為什麼寫不進去（檔案被防毒鎖住、磁碟滿、權限），結果都一樣：帳上有、
             # 檔裡沒有。讓它當成一般例外冒出去的話，程式帶著 traceback 結束，一則告警都
             # 沒有，13:25 出場程式照舊檔平倉（沒有檔就什麼都不平）。
-            raise _FillNotOnFile(fill, record, self.record, exc) from exc
+            raise _FillNotOnFile(fill, record, marker, exc) from exc
         self.record = record
         return fill
 
-    def _mark_sending(self, direction: str, lots: int) -> None:
-        """送單前把部位檔記成「不確定」：這一筆還沒有序號、已知成交 0 口。寫不進去就不送。"""
+    def _mark_sending(self, direction: str, lots: int) -> position_file.PositionRecord:
+        """送單前把部位檔記成「不確定」：這一筆還沒有序號、已知成交 0 口。寫不進去就不送。
+        回傳寫進去的那一份。"""
         marker = replace(self._current(direction), status=position_file.UNCERTAIN,
                          uncertain=position_file.UncertainOrder(
                              stage=position_file.ENTRY, order_seq="", requested_lots=lots,
@@ -759,6 +761,7 @@ class _Orders:
             # 確定沒有部位——和被拒同一種處境，今天不再進場（下一分鐘多半也寫不進去）。
             raise OrderFailed(f"送單前部位檔寫不進去，沒有送出委託"
                               f"（{type(exc).__name__}: {exc}）") from exc
+        return marker
 
     def _unmark(self) -> None:
         """確定沒有多出部位（被拒、0 口）：部位檔改回送單前的樣子——今天第一筆的話，就是沒有檔。
@@ -784,31 +787,34 @@ class _Orders:
             last_trading_day=self._contract.last_trading_day,
             status=position_file.CONFIRMED, entries=())
 
-    def _uncertain(self, direction: str, lots: int, order_seq: str, known_filled: int,
-                   reason: str) -> _Uncertain:
-        """把送出去卻不知道成交幾口的那一筆記進部位檔，狀態改成「不確定」。
+    def _uncertain(self, marker: position_file.PositionRecord, order_seq: str,
+                   known_filled: int, reason: str) -> _Uncertain:
+        """把送出去卻不知道成交幾口的那一筆記進部位檔：補上送單前記下的 `marker` 少的序號與
+        已知口數，狀態還是「不確定」。
 
         已經確認的成交照留在 `entries`：它們是真的。不確定的那一筆不放進 `entries`——
         不知道口數，也沒有成交價——而是記在 `uncertain`，出場程式看到就不自動平倉。
         """
-        def uncertain(file_error: str | None) -> _Uncertain:
+        lots = marker.uncertain.requested_lots
+
+        def uncertain(file_error: str | None,
+                      on_file: position_file.PositionRecord) -> _Uncertain:
             return _Uncertain(order_seq=order_seq, requested_lots=lots,
-                              known_filled=known_filled, reason=reason, file_error=file_error)
+                              known_filled=known_filled, reason=reason, file_error=file_error,
+                              on_file=on_file)
 
         try:
-            order = position_file.UncertainOrder(
+            record = replace(marker, uncertain=position_file.UncertainOrder(
                 stage=position_file.ENTRY, order_seq=order_seq, requested_lots=lots,
-                known_filled=known_filled)
-            record = replace(self._current(direction), status=position_file.UNCERTAIN,
-                             uncertain=order)
+                known_filled=known_filled))
             position_file.write(record)
         except Exception as exc:  # noqa: BLE001
             # 寫不進去（檔案被鎖、磁碟滿），或 broker 給的數字組不成一筆記錄：部位檔還是
             # 送單前記下的「不確定」，只是少了序號。冒出 `run()` 的話程式帶著 traceback 結束，
             # 一則告警都沒有；所以照樣告警，序號寫在告警裡。
-            return uncertain(f"{type(exc).__name__}: {exc}")
+            return uncertain(f"{type(exc).__name__}: {exc}", marker)
         self.record = record
-        return uncertain(None)
+        return uncertain(None, record)
 
 
 def _held(record: position_file.PositionRecord | None) -> strategy.Position | None:
@@ -904,9 +910,8 @@ class _Trading:
         logger.error("今天稍早送出的委託 %s（%d 口）不知道成交幾口，送出它的那一輪沒來得及告警",
                      u.order_seq or "（沒有序號）", u.requested_lots)
         self.say(messages.fill_unknown(
-            at=now, product=record.product, direction=record.direction, lots=u.requested_lots,
-            order_seq=u.order_seq, known_filled=u.known_filled, reason=why,
-            held_lots=record.entered_lots, file_error=None))
+            at=now, on_file=record, lots=u.requested_lots, order_seq=u.order_seq,
+            known_filled=u.known_filled, reason=why, file_error=None))
 
     def rsi(self, today: list[indicators.ClosedBar]) -> float | None:
         if self.history is None:
@@ -1103,10 +1108,8 @@ class _Trading:
             logger.error("這筆的序號寫不進部位檔，檔裡是送單前記下的「不確定」：%s",
                          exc.file_error)
         self.say(messages.fill_unknown(
-            at=now, product=self._product, direction=decision.direction,
-            lots=exc.requested_lots, order_seq=exc.order_seq, known_filled=exc.known_filled,
-            reason=str(exc), held_lots=self.position.lots if self.position else 0,
-            file_error=exc.file_error))
+            at=now, on_file=exc.on_file, lots=exc.requested_lots, order_seq=exc.order_seq,
+            known_filled=exc.known_filled, reason=str(exc), file_error=exc.file_error))
 
     def _not_on_file(self, exc: _FillNotOnFile, now: datetime) -> None:
         """成交了、部位檔卻沒記到：告警（「部位還在」），今天不再進場。
@@ -1117,15 +1120,12 @@ class _Trading:
         """
         record, fill = exc.record, exc.fill
         self._stop(now, f"成交 {fill.lots} 口（委託 {fill.order_seq}）寫不進部位檔：{exc}")
-        on_file = exc.on_file.entered_lots if exc.on_file is not None else 0
         self.position = _held(record)
         logger.error("成交 %s %d 口 @ %g（委託 %s）寫不進部位檔，帳上共 %d 口、檔裡 %d 口，"
                      "今天不再進場：%s", record.direction, fill.lots, fill.price,
-                     fill.order_seq, record.entered_lots, on_file, exc)
-        self.say(messages.fill_not_on_file(
-            at=now, product=record.product, direction=record.direction, lots=fill.lots,
-            price=fill.price, order_seq=fill.order_seq, total_lots=record.entered_lots,
-            on_file_lots=on_file, reason=str(exc)))
+                     fill.order_seq, record.entered_lots, exc.on_file.entered_lots, exc)
+        self.say(messages.fill_not_on_file(at=now, record=record, on_file=exc.on_file, fill=fill,
+                                           reason=str(exc)))
 
     def _simulate(self, decision: strategy.Enter, now: datetime, *,
                   trigger: float | None = None) -> None:

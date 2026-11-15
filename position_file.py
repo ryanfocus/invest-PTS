@@ -159,9 +159,8 @@ class PositionRecord:
         # 進場單處理；掛著不確定的委託卻說已確認，出場程式就會照著不完整的口數平倉。
         if (self.status == UNCERTAIN) != (self.uncertain is not None):
             raise ValueError(f"狀態是 {self.status}，不確定的委託卻是 {self.uncertain}")
-        exited = sum(f.lots for f in self.exits)
-        if exited > self.entered_lots:
-            raise ValueError(f"平倉 {exited} 口，比進場的 {self.entered_lots} 口還多")
+        if self.exited_lots > self.entered_lots:
+            raise ValueError(f"平倉 {self.exited_lots} 口，比進場的 {self.entered_lots} 口還多")
 
     @property
     def contract(self) -> ContractInfo:
@@ -180,13 +179,19 @@ class PositionRecord:
         return sum(f.lots for f in self.entries)
 
     @property
+    def exited_lots(self) -> int:
+        """已經平掉的口數。這一次平了幾口要拿它前後相減，**不能**拿還沒平的口數相減：盤中留下的
+        不確定進場在平倉前被查到成交時，進場口數也跟著變多了。"""
+        return sum(f.lots for f in self.exits)
+
+    @property
     def open_lots(self) -> int:
         """還沒平掉的口數：進場減出場。出場程式平的就是這幾口，不多也不少（規格第 32 條）。
 
         **0 就是已了結**：出場明細的口數等於進場，部位檔不另外存一個「已了結」旗標——
         兩份記載同一件事，總有一天會互相矛盾，而出場程式要拿著它去下單。
         """
-        return self.entered_lots - sum(f.lots for f in self.exits)
+        return self.entered_lots - self.exited_lots
 
     @property
     def avg_price(self) -> float | None:

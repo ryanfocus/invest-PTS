@@ -50,18 +50,18 @@ import logging
 import os
 import sys
 import time as time_module
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Callable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import calendar_tw  # noqa: E402
 import exit_program  # noqa: E402
+import handoff  # noqa: E402
 import intraday  # noqa: E402
 import messages  # noqa: E402
 import paths  # noqa: E402
 import position_file  # noqa: E402
-import schedule  # noqa: E402  （同在 tools/：出場程式幾點被叫醒）
 import settings  # noqa: E402
 import state_files  # noqa: E402
 import strategy  # noqa: E402
@@ -69,11 +69,6 @@ from broker import Broker  # noqa: E402
 
 # 固定的名字：當成腳本執行時 `__name__` 是 `__main__`，log 裡看不出是誰
 logger = logging.getLogger("stop_today")
-
-# 平倉送到出場程式被叫醒（`schedule.EXIT_START`，13:25）的前一分鐘為止：收工指令和出場程式
-# 不會同時送單
-_BEFORE_EXIT = timedelta(minutes=1)
-
 
 def main(argv: list[str] | None = None, *,
          connect: Callable[[settings.Secrets], Broker] | None = None,
@@ -152,8 +147,7 @@ def _stop_alone(now: datetime, *, close: bool,
     except position_file.Unreadable as exc:
         # 不知道帳上有幾口、是哪個商品：不送單（和出場程式同一條規則）
         _say(messages.stop_today_position_file_unreadable(
-            at=clock(), reason=str(exc), entry_log=paths.shown_log("intraday", today),
-            exit_log=paths.shown_log("exit", today), stop_log=paths.shown_log("stop", today)))
+            at=clock(), reason=str(exc), logs=handoff.fill_logs(today)))
         return 1
     if not close:
         return _show(record, clock())
@@ -164,9 +158,9 @@ def _show(record: position_file.PositionRecord | None, now: datetime) -> int:
     """部位檔的現況與誰會了結。不確定的話照 13:25 出場程式會怎麼做來講：它會先查的，現在沒事要做
     （回 0，但要講不要自己平）；它不查、不送的，要人自己處理（回 1）。"""
     if record is None or record.status != position_file.UNCERTAIN:
-        _say(messages.stop_today_position(record))
+        _say(messages.stop_today_position(record, now))
         return 0
-    if exit_program.entry_to_look_up(record):
+    if handoff.exit_looks_up(record):
         _say(messages.stop_today_entry_unresolved(at=now, record=record, lookup=None))
         return 0
     _say(messages.exit_uncertain(at=now, record=record))
@@ -212,9 +206,9 @@ def _close(record: position_file.PositionRecord | None, *,
         _say(messages.stop_today_after_cutoff())
         return _show(record, now)
     if record is None or (record.uncertain is None and not record.open_lots):
-        _say(messages.stop_today_position(record))
+        _say(messages.stop_today_position(record, now))
         return 0
-    if record.status == position_file.UNCERTAIN and not exit_program.entry_to_look_up(record):
+    if record.status == position_file.UNCERTAIN and not handoff.exit_looks_up(record):
         _say(messages.exit_uncertain(at=now, record=record))
         return 1
     try:
@@ -225,7 +219,7 @@ def _close(record: position_file.PositionRecord | None, *,
              "（出場程式用的是同一份 .env）。")
         return 1
     broker = connect(secrets)
-    until = datetime.combine(record.trading_day, schedule.EXIT_START) - _BEFORE_EXIT
+    until = handoff.stop_command_until(record.trading_day)
     closing = exit_program.close_now(broker, record, until=until, clock=clock, sleep=sleep,
                                      say=_say, tell=_Tell(record, until))
     if closing.record != closing.on_file:
@@ -236,14 +230,8 @@ def _close(record: position_file.PositionRecord | None, *,
     if closing.ending != exit_program.Ending.CLOSED:
         return 1            # `_Tell` 已經講了剩下的、或不確定的怎麼辦
     _say(messages.stop_today_closed(at=clock(), record=closing.record,
-                                    lots=_exited(closing.record) - _exited(record)))
+                                    lots=closing.record.exited_lots - record.exited_lots))
     return 0
-
-
-def _exited(record: position_file.PositionRecord) -> int:
-    """部位檔記到的平倉口數。這一次平了幾口要拿它前後相減，**不能**拿還沒平的口數相減：
-    盤中留下的不確定進場查到成交時，平倉之前進場口數就先變多了。"""
-    return record.entered_lots - record.open_lots
 
 
 def _secrets() -> settings.Secrets:
@@ -267,18 +255,15 @@ class _Tell:
 
     def ran_out(self, *, record: position_file.PositionRecord, rounds: int,
                 problem: str) -> str:
-        exit_at = self._until + _BEFORE_EXIT
-        why = f"收工指令只送到 {exit_at:%H:%M} 出場程式啟動之前"
+        why = f"收工指令只送到 {handoff.EXIT_START:%H:%M} 出場程式啟動之前"
         if not rounds:
             return f"已經過了 {self._until:%H:%M}，沒有送出平倉單（{why}）"
         return ((f"平倉單沒能送出（最後一次：{problem}），" if problem
                  else "市價 IOC 沒有全部成交，") + f"重試到 {self._until:%H:%M} 仍未完成（{why}）")
 
     def left(self, *, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
-        # 13:25 之後出場程式已經起來、正等著這個收工指令做完：不能再講「照常由 13:25 平掉」
         return messages.stop_today_left(at=at, record=record, reason=reason,
-                                        lots=_exited(record) - _exited(self._before),
-                                        exit_started=at >= self._until + _BEFORE_EXIT)
+                                        lots=record.exited_lots - self._before.exited_lots)
 
     def unresolved(self, *, at: datetime, record: position_file.PositionRecord,
                    lookup: str | None) -> str:

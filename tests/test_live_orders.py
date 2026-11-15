@@ -331,7 +331,7 @@ def test_a_fill_that_cannot_be_written_to_the_position_file_is_reported_and_ends
         "帳上 PTS 共多單 1 口，部位檔只記到 0 口，而且停在送單前記下的「不確定」\n"
         "原因：PermissionError: [Errno 13] 存取被拒\n"
         "13:25 的出場程式看到「不確定」不會自動平倉，盤中程式今天不再進場。"
-        "請到券商 APP 確認帳戶。微台沒有當沖強平，要你自己在 13:30 前賣出微台 1 口"
+        "請到券商 APP 確認帳戶。微台沒有當沖強平。請在日盤 13:45 收盤前自行賣出微台 1 口"
         "（PTS 今天全部的口數）。\n"
         "2026/11/09 08:50:00",
     ]
@@ -555,10 +555,11 @@ def test_a_position_file_that_cannot_be_read_stops_the_day_and_says_so(text, mar
     assert len(sent) == 1
     assert sent[0].startswith("【要你處理】PTS 部位檔讀不懂，盤中程式今天不進場\n")
     assert sent[0].splitlines()[2:4] == [
-        "今天 PTS 可能已經有部位。13:25 的出場程式同樣讀不懂這個檔，不會替你平倉：交易微台的話，"
-        "請在日盤 13:45 收盤前自行平掉；大台、小台標了當沖，券商 13:30 會強平。",
+        "今天 PTS 可能已經有部位。13:25 的出場程式同樣讀不懂這個檔，不會替你平倉：微台要自行平掉"
+        "（日盤 13:45 收盤；今天如果是結算日，到期的近月 13:30 就停止交易，之後由交易所以最後結算價"
+        "現金了結）；大台、小台標了當沖，券商 13:30 會強平。",
         "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 "
-        "logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」"
+        "logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」"
         "的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
     ]
     with open(position_file.path_for(DAY), encoding="utf-8") as fh:

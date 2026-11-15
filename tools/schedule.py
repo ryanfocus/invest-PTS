@@ -72,13 +72,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import paths  # noqa: E402
 import strategy  # noqa: E402
+from handoff import EXIT_START  # noqa: E402
 
 _NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 
 # 盤中程式 08:40 啟動（規格「兩支程式」一節）：開盤 08:45 之前登入、訂閱好，累計筆數從開盤前
-# 就記（ticket 03）。出場程式 13:25：13:20 進場截止之後、券商 13:30 當沖強平之前（ADR-0002）。
+# 就記（ticket 03）。出場程式 13:25（`handoff.EXIT_START`）：13:20 進場截止之後、券商 13:30
+# 當沖強平之前（ADR-0002）。
 INTRADAY_START = time(8, 40)
-EXIT_START = time(13, 25)
 
 
 @dataclass(frozen=True)

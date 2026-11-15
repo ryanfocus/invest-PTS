@@ -132,9 +132,58 @@ def test_without_close_an_uncertain_micro_entry_is_left_for_1325_to_look_up(caps
     assert code == 0
     assert connected == []
     assert _lines(capsys)[-2] == (
-        "微台不必現在處理：13:25 的出場程式會先用委託序號向券商查一次，查到全部成交就照常平倉"
-        "（賣出微台 4 口）；查不到確定的口數會發 Discord，寫明要平幾口。在那之前不要自己平："
+        "微台不必現在處理：13:25 的出場程式會先用委託序號向券商查這筆成交了幾口，查到全部成交就照常"
+        "平倉（賣出微台 4 口）；查不到確定的口數會發一則 Discord，寫明要平幾口。在那之前不要自己平："
         "不然 13:25 會再平一次，開出反向新倉。")
+
+
+def test_after_1325_the_micro_position_is_not_promised_to_the_exit_program(capsys):
+    """14:05 才執行（不帶 `--close`）：13:25 的出場程式早就起來了——它可能平完了、可能平不完而
+    告警了。部位檔還記著 3 口，就不能再說「13:25 的出場程式會平掉」：照它的告警做，不要自己平。"""
+    _on_file()
+
+    code, _, _ = _stop(at="14:05:00")
+
+    assert code == 0
+    out = _lines(capsys)
+    assert out[-2:] == [
+        "PTS 今天還沒平的部位：微台多單 3 口（TM2611），13:25 起由出場程式照部位檔平倉。"
+        "Discord 收到「部位還在」或「委託送出去了，但…」的告警時，照那一則的口數處理。",
+        "在那之前不要自己平：出場程式會照部位檔再平一次，開出反向新倉。",
+    ]
+    assert not any("出場程式會平掉" in line for line in out)
+
+
+def test_after_1325_an_uncertain_micro_entry_is_not_promised_to_a_1325_lookup(capsys):
+    """同上，部位檔記著盤中留下的進場不確定（有序號）：13:25 已經查過了（查不到的話已經發了
+    Discord）。不能再說「13:25 會先查」。"""
+    _on_file(status="UNCERTAIN", uncertain={"stage": "ENTRY", "order_seq": "2315609990003",
+                                            "requested_lots": 1, "known_filled": 0})
+
+    code, _, _ = _stop(at="13:40:00")
+
+    assert code == 0
+    assert _lines(capsys)[-3:-1] == [
+        "13:25 起由出場程式用委託序號查這筆、查到全部成交就平倉。Discord 收到「部位還在」或"
+        "「委託送出去了，但…」的告警時，照那一則的口數處理。",
+        "在那之前不要自己平：出場程式會照部位檔再平一次，開出反向新倉。",
+    ]
+
+
+def test_after_the_day_session_an_uncertain_close_is_for_the_night_session(capsys):
+    """14:05 執行，部位檔記著一筆不確定的平倉：要人自己平，期限看**現在**——日盤已經收了，
+    叫人「13:45 收盤前」平是過期的期限。"""
+    _on_file(status="UNCERTAIN", uncertain={"stage": "EXIT", "order_seq": "2315610000009",
+                                            "requested_lots": 3, "known_filled": 0})
+
+    code, _, _ = _stop(at="14:05:00")
+
+    assert code == 1
+    out = _lines(capsys)
+    assert out[-2] == (
+        "日盤 13:45 已經收盤，請在夜盤自行賣出微台（TM2611）：部位檔的多單 3 口，減掉委託序號 "
+        "2315610000009 實際成交的口數，也就是 0～3 口（到券商 APP 用委託序號查這筆成交了幾口）。")
+    assert not any("收盤前" in line for line in out)
 
 
 def test_on_a_non_trading_day_it_says_so_and_does_nothing(capsys, env):
@@ -797,8 +846,8 @@ def test_an_uncertain_micro_entry_the_lookup_cannot_confirm_is_left_for_1325(cap
         "不確定的委託：進場買進微台 1 口（委託序號 2315609990003），已知至少成交 0 口",
         "券商的成交紀錄：查不到這筆委託的成交",
         "部位檔記到的部位（不含這一筆）：多單 3 口",
-        "微台不必現在處理：13:25 的出場程式會再用委託序號向券商查一次，查到全部成交就照常平倉"
-        "（賣出微台 4 口）；查不到確定的口數會發 Discord，寫明要平幾口。在那之前不要自己平："
+        "微台不必現在處理：13:25 的出場程式會再用委託序號向券商查這筆成交了幾口，查到全部成交就照常"
+        "平倉（賣出微台 4 口）；查不到確定的口數會發一則 Discord，寫明要平幾口。在那之前不要自己平："
         "不然 13:25 會再平一次，開出反向新倉。",
         "2026/11/09 10:00:00",
     ]
