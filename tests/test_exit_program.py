@@ -263,20 +263,69 @@ def _uncertain(stage: str, *, seq="2315609990003", requested=1, known=0) -> dict
 
 
 def test_an_uncertain_entry_on_file_sends_nothing_and_says_what_is_known():
-    """今天稍早有一筆進場單送出去了、卻不知道成交幾口（盤中程式記下「不確定」）。帳上可能是
-    3 口，也可能是 4 口：照 3 口平，可能留 1 口過夜；照 4 口平，可能開出 1 口空單。
-    不猜，一張單都不送，把知道的都講出來。檔案原封不動。"""
+    """今天稍早有一筆進場單送出去了、卻不知道成交幾口（盤中程式記下「不確定」）。13:25 先用
+    委託序號查券商紀錄（規格第 50 條）；查不到的話，帳上可能是 3 口，也可能是 4 口：照 3 口平，
+    可能留 1 口過夜；照 4 口平，可能開出 1 口空單。不猜，一張單都不送，把知道的都講出來。
+    檔案原封不動。"""
     content = _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY"))
-    broker, sent, _ = _run(login_error=AssertionError("不確定時不該登入"))
+    broker, sent, _ = _run(fill_queries=[FillQuery(lots=None)])
+    assert broker.queries == [("2315609990003", DAY, 1)]
     assert broker.orders == []
     assert sent == [
         "【要你處理】PTS 委託送出去了，但不知道成交幾口，出場程式不再送單\n"
         "不確定的委託：進場買進微台 1 口（委託序號 2315609990003），已知至少成交 0 口\n"
+        "券商的成交紀錄：查不到這筆委託的成交\n"
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
         "請在日盤 13:45 收盤前自行賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。\n"
         "2026/11/09 13:25:00",
     ]
     assert _file() == content
+
+
+def test_an_uncertain_micro_entry_confirmed_by_the_lookup_is_closed_as_usual():
+    """盤中程式留下一筆不確定的進場單（委託序號有記下）。13:25 先用序號查券商紀錄：這筆 1 口
+    全部成交 @ 45160。補進部位檔、回到已確認，照常平掉 PTS 全部的 4 口，不打擾人。
+    盤中那則告警請使用者等到 13:25、不要自己平，靠的就是這一步。"""
+    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY"))
+    broker, sent, _ = _run(fill_queries=[FillQuery(lots=1, avg_price=45160.0)])
+    assert broker.queries == [("2315609990003", DAY, 1)]
+    assert [(o.side, o.lots) for o in broker.orders] == [(SELL, 4)]
+    assert sent == []
+    on_file = _file()
+    assert on_file["status"] == "CONFIRMED"
+    assert on_file["entries"][-1] == {"order_seq": "2315609990003", "lots": 1, "price": 45160.0}
+    assert sum(fill["lots"] for fill in on_file["exits"]) == 4
+
+
+ENTRY_LOOKUPS = {
+    "查不到": (1, FillQuery(lots=None), "查不到這筆委託的成交", 0),
+    "查詢失敗": (1, FillQuery(lots=None, failure="查詢錯誤（M999）"), "查詢失敗：查詢錯誤（M999）", 0),
+    "只成交一部分": (2, FillQuery(lots=1, avg_price=45160.0), "成交 1 口（委託 2 口）", 1),
+}
+
+
+@pytest.mark.parametrize("requested, answer, said, known", ENTRY_LOOKUPS.values(),
+                         ids=ENTRY_LOOKUPS.keys())
+def test_an_uncertain_entry_the_lookup_cannot_confirm_is_reported_and_nothing_is_sent(
+        requested, answer, said, known):
+    """只有「全部成交」能確定帳上的口數。只成交一部分時，查詢萬一漏了一列，照少算的口數平，
+    微台就過夜——所以和查不到、查詢失敗一樣：不送單，告警附上券商紀錄。查到的成交口數是
+    確定的下限，記進部位檔。"""
+    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY", requested=requested))
+    broker, sent, _ = _run(fill_queries=[answer])
+    assert broker.orders == []
+    assert sent[0].splitlines()[2] == f"券商的成交紀錄：{said}"
+    assert _file()["status"] == "UNCERTAIN"
+    assert _file()["uncertain"]["known_filled"] == known
+
+
+def test_an_uncertain_entry_cannot_be_looked_up_when_the_login_fails():
+    """帳密、憑證這類登入失敗：查不了，照實講。告警照樣寫明要平幾口的算式，請人用委託序號自己查。"""
+    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY"))
+    broker, sent, _ = _run(login_error=LoginFailed("代碼 300 帳號密碼錯誤"))
+    assert broker.orders == []
+    assert broker.queries == []
+    assert sent[0].splitlines()[2] == "券商的成交紀錄：沒能查詢（代碼 300 帳號密碼錯誤）"
 
 
 def test_an_uncertain_exit_on_file_is_never_sent_again():
@@ -314,9 +363,9 @@ def test_an_uncertain_micro_position_is_reported_with_the_deadline_that_applies(
     _intraday_ran(day)
     _on_file(day, last_trading_day=last_trading_day, status="UNCERTAIN",
              uncertain=_uncertain("ENTRY"))
-    broker, sent, _ = _run(at=_at(hhmm, day))
+    broker, sent, _ = _run(at=_at(hhmm, day), fill_queries=[FillQuery(lots=None)])
     assert broker.orders == []
-    assert sent[0].splitlines()[3] == todo
+    assert sent[0].splitlines()[-2] == todo
 
 
 def test_an_uncertain_tx_position_is_reported_with_the_brokers_close_in_mind():
@@ -337,9 +386,9 @@ def test_an_uncertain_first_entry_has_nothing_on_file_but_is_still_reported():
     """第一筆進場就不確定：部位檔裡一筆成交都沒有，只有那一筆不確定的委託。這不是「沒有部位」——
     當成沒有部位安靜結束的話，可能成交了的那口微台就過夜。"""
     _on_file(entries=[], status="UNCERTAIN", uncertain=_uncertain("ENTRY"))
-    broker, sent, _ = _run()
+    broker, sent, _ = _run(fill_queries=[FillQuery(lots=None)])
     assert broker.orders == []
-    assert sent[0].splitlines()[2] == "部位檔記到的部位（不含這一筆）：多單 0 口"
+    assert "部位檔記到的部位（不含這一筆）：多單 0 口" in sent[0].splitlines()
 
 
 # --- 平倉單沒送出去：每分鐘重試、最多 3 次（規格第 34 條）---

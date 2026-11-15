@@ -78,33 +78,44 @@ def fill_unknown(*, at: datetime, product: str, direction: str, lots: int, order
 
     `known_filled` 是已知**至少**成交的口數：對帳時至少要看到這麼多。
 
-    微台要人自己平的那一句寫成**要送的單**：買賣別、商品，口數寫成算式與範圍（確認的口數加上
-    這筆實際成交的）。帳戶 APP 看到的是淨部位，含使用者自己的長期部位與 OS 的口數，只寫
-    「平掉 PTS 的部位」的話，使用者分不出要平幾口。
+    微台有委託序號、序號也寫進部位檔時，**請人等 13:25**：出場程式會先用序號查券商紀錄，
+    查到全部成交就照常平倉（`exit_program._MicroExit._look_up_entry`）；查不到才再發一則。
+    要人在那之前**不要自己平**——自己平了，13:25 查到成交又平一次，就是反向新倉。
+    出場程式查不了的時候（沒拿到序號、序號沒寫進去），要人自己平的那一句寫成**要送的單**：
+    買賣別、商品，口數寫成算式與範圍（確認的口數加上這筆實際成交的）。帳戶 APP 看到的是淨部位，
+    含使用者自己的長期部位與 OS 的口數，只寫「平掉 PTS 的部位」的話，使用者分不出要平幾口。
     """
     name = _PRODUCT_TEXT[product]
     holding = _HOLDING_TEXT[direction]
+    close = _CLOSE_SIDE_TEXT[direction]
     seq = f"委託序號 {order_seq}" if order_seq else "沒拿到委託序號"
     known = f"，已知至少成交 {known_filled} 口" if known_filled else ""
     missing = "" if file_error is None else f"（這筆的委託序號沒寫進去：{file_error}）"
-    on_file = (f"部位檔已記為「不確定」{missing}：盤中程式今天不再進場，"
-               "13:25 的出場程式也不會自動平倉。")
-    if product in DAY_TRADE_CODES:
-        who_closes = _broker_closes_today(name)
+    exit_looks_up = product not in DAY_TRADE_CODES and order_seq and file_error is None
+    if exit_looks_up:
+        on_file = "部位檔已記為「不確定」：盤中程式今天不再進場。"
+        todo = (f"{name}不必現在處理：13:25 的出場程式會先用委託序號向券商查這筆成交了幾口，"
+                f"查到全部成交就照常平倉（{close}{name} {held_lots + lots} 口）；查不到確定的口數會"
+                "再發一則，寫明要平幾口。在那之前不要自己平：不然 13:25 會再平一次，開出反向新倉。")
     else:
-        if held_lots:
-            count = (f"部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的口數，也就是 "
-                     f"{_span(held_lots + known_filled, held_lots + lots)}")
+        on_file = (f"部位檔已記為「不確定」{missing}：盤中程式今天不再進場，"
+                   "13:25 的出場程式也不會自動平倉。")
+        if product in DAY_TRADE_CODES:
+            who_closes = _broker_closes_today(name)
         else:
-            count = f"這筆實際成交幾口就平幾口（{_span(known_filled, lots)}）"
-        who_closes = (f"{name}沒有當沖強平，要你自己在 13:30 前"
-                      f"{_CLOSE_SIDE_TEXT[direction]}{name}：{count}。")
+            if held_lots:
+                count = (f"部位檔已確認的{holding} {held_lots} 口，加上這筆實際成交的口數，也就是 "
+                         f"{_span(held_lots + known_filled, held_lots + lots)}")
+            else:
+                count = f"這筆實際成交幾口就平幾口（{_span(known_filled, lots)}）"
+            who_closes = f"{name}沒有當沖強平，要你自己在 13:30 前{close}{name}：{count}。"
+        todo = f"請到券商 APP 確認這筆成交了幾口。{who_closes}"
     return (
         "【要你處理】PTS 委託送出去了，但不知道成交幾口\n"
         f"這次：{_SIDE_TEXT[direction]}{name} {lots} 口（{seq}）{known}\n"
         f"原因：{reason}\n"
         f"{on_file}\n"
-        f"請到券商 APP 確認這筆成交了幾口。{who_closes}\n"
+        f"{todo}\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 

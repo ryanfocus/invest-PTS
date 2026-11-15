@@ -176,14 +176,14 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
         return Ending.POSITION_FILE_UNREADABLE
     if record is None:
         return Ending.NO_POSITION
-    if record.status == position_file.UNCERTAIN:
+    if record.status == position_file.UNCERTAIN and not _entry_to_look_up(record):
         # 不知道帳上有幾口：照檔裡的口數平，可能留下沒平的口數，也可能多平開出反向新倉。
         # 出場單不確定時更不能再送——它很可能已經成交了（規格第 50 條）。
         # 這一條排在商品前面：大台、小台雖然不送單，不確定一樣要講。
         logger.error("部位檔記著一筆不確定的委託（%s），不送任何單", record.uncertain)
         say(messages.exit_uncertain(at=now, record=record, closed=now >= _deadline(record)))
         return Ending.UNCERTAIN
-    if not record.open_lots:
+    if record.uncertain is None and not record.open_lots:
         logger.info("部位檔的出場口數已經等於進場口數，部位已經了結")
         return Ending.ALREADY_CLOSED
     if record.product in DAY_TRADE_CODES:
@@ -237,6 +237,18 @@ def _report_missed(today: date, now: datetime, say: Callable[[str], bool]) -> No
             told = say(messages.exit_missed(at=now, record=record))
         if told:
             _mark_done(day, f"那天沒有跑完，{now:%Y-%m-%d %H:%M} 才發現")
+
+
+def _entry_to_look_up(record: position_file.PositionRecord) -> bool:
+    """盤中程式留下的「不確定」，13:25 能不能用委託序號向券商查（`_MicroExit._look_up_entry`）。
+
+    只查微台的進場單：大台、小台交給券商 13:30 當沖強平，查到也不會送單（而且大台、小台的
+    成交列欄位還沒實機驗證，ticket 11）；出場單的不確定是出場程式自己留下的，當時已經查過；
+    沒有委託序號（送單前記下的「不確定」、序號沒寫進去）就沒有東西可查。
+    """
+    u = record.uncertain
+    return (u is not None and u.stage == position_file.ENTRY and bool(u.order_seq)
+            and record.product not in DAY_TRADE_CODES)
 
 
 def _logs(day: date) -> dict[str, str]:
@@ -353,6 +365,9 @@ class _MicroExit:
         登入也算在一輪裡：網路、群益主機的問題（`LoginUnavailable`，13:25 剛從睡眠醒來、網路
         還沒好就是這樣）時一張平倉單都還沒送出去，帳上確定沒有異動，和「平倉單沒送出去」一樣
         一分鐘後再登入、再試（規格第 34 條）。帳密、憑證這類登入失敗一分鐘後再試也一樣，立刻講。
+
+        部位檔記著盤中程式留下的進場不確定時（`_entry_to_look_up`），登入之後先查券商紀錄，
+        確定了才送平倉單；確定不了就一張都不送（`_unresolved`）。
         """
         rounds = 0
         problem = ""
@@ -372,8 +387,15 @@ class _MicroExit:
                     continue
                 except BrokerError as exc:
                     # 密碼、憑證這類問題，一分鐘後再試也一樣；早點講，13:45 前還有時間讓人自己平
+                    if self._ledger.record.uncertain is not None:
+                        return self._unresolved(f"沒能查詢（{exc}）")
                     return self._incomplete(str(exc))
                 logged_in = True
+            if self._ledger.record.uncertain is not None:
+                try:
+                    self._look_up_entry()
+                except _ExitUncertain as exc:
+                    return self._unresolved(exc.lookup)
             try:
                 problem = self._send_round()
             except _ExitUncertain as exc:
@@ -387,6 +409,10 @@ class _MicroExit:
             if not self._ledger.record.open_lots:
                 return Ending.CLOSED
 
+        if self._ledger.record.uncertain is not None:
+            # 進場不確定還沒查到：登入一直沒成功，或已經過了期限（出場程式太晚才執行）
+            return self._unresolved(f"沒能查詢（登入沒有成功，最後一次：{problem}）" if problem
+                                    else None)
         if rounds > _RETRIES:
             return self._incomplete(
                 f"平倉單重試 {_RETRIES} 次都沒能送出（最後一次：{problem}）" if problem
@@ -478,6 +504,46 @@ class _MicroExit:
         if found.failure:
             raise _ExitUncertain(f"查詢失敗：{found.failure}")
         raise _ExitUncertain("查不到這筆委託的成交")
+
+    def _look_up_entry(self) -> None:
+        """盤中程式留下一筆不確定的進場委託（規格第 50 條）：用它的委託序號查券商紀錄（兩段查詢）。
+
+        到 13:25 那筆市價 IOC 早就結束了，券商紀錄也定案了，比盤中當下查可靠。查到全部成交：
+        補進進場明細、回到已確認，呼叫端照常平倉——盤中那則告警請使用者等到 13:25、不要自己平，
+        靠的就是這一步。其他結局都拋 `_ExitUncertain`。**只成交一部分也不算確定**：查詢萬一漏了
+        一列，照少算的口數平，微台就過夜。查到的口數是確定的下限，記進部位檔，人工對帳時少查一次。
+        查不到不是 0 口（`broker.FillQuery`）。
+        """
+        record = self._ledger.record
+        u = record.uncertain
+        found = self._broker.query_fills(u.order_seq, self._today, u.requested_lots)
+        if found.lots == u.requested_lots:
+            confirmed = replace(
+                record, entries=record.entries + (
+                    position_file.Fill(u.order_seq, found.lots, found.avg_price),),
+                status=position_file.CONFIRMED, uncertain=None)
+            logger.info("進場成交（成交查詢確認）：%s %d 口 @ %g（委託 %s），累計 %d 口",
+                        record.direction, found.lots, found.avg_price, u.order_seq,
+                        confirmed.entered_lots)
+            self._ledger.save(confirmed)
+            return
+        if found.lots:
+            if found.lots > u.known_filled:
+                self._ledger.save(replace(record, uncertain=replace(u, known_filled=found.lots)))
+            raise _ExitUncertain(f"成交 {found.lots} 口（委託 {u.requested_lots} 口）")
+        if found.failure:
+            raise _ExitUncertain(f"查詢失敗：{found.failure}")
+        raise _ExitUncertain("查不到這筆委託的成交")
+
+    def _unresolved(self, lookup: str | None) -> Ending:
+        """進場不確定沒能確認：一張單都不送，告警附上查到的（`lookup`，沒查就是 None；規格第 50 條）。"""
+        record = self._ledger.record
+        at = self._clock()
+        logger.error("部位檔記著一筆不確定的進場委託（%s），沒能確認，不送任何單：%s",
+                     record.uncertain, lookup)
+        self._say(messages.exit_uncertain(at=at, record=record, lookup=lookup,
+                                          closed=at >= self._deadline))
+        return Ending.UNCERTAIN
 
     def _incomplete(self, reason: str) -> Ending:
         """還有沒平的口數，而且出場程式不會再送了：告警「部位還在」，寫明還剩幾口。

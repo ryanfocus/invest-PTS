@@ -16,10 +16,13 @@ import os
 
 import pytest
 
-from broker import FillUnknown, OrderFailed
+from broker import SELL, FillQuery, FillUnknown, OrderFailed
+from broker.fake import FakeBroker
 from day_script import (DAY, SENDING_MARKER, at, lock_position_file_once_sent, make_config,
                         position_content, position_on_file as _file, rally, restarted_at,
                         run_day, trade, until, write_position_file)
+from recording import RecordingNotifier
+import exit_program
 import intraday
 import paths
 import position_file
@@ -167,9 +170,8 @@ def test_an_order_sent_without_a_fill_report_is_on_file_as_uncertain_and_ends_en
         "【要你處理】PTS 委託送出去了，但不知道成交幾口\n"
         "這次：買進微台 1 口（委託序號 2315610000001）\n"
         "原因：30 秒內沒等到委託 2315610000001 結束\n"
-        "部位檔已記為「不確定」：盤中程式今天不再進場，13:25 的出場程式也不會自動平倉。\n"
-        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平，要你自己在 13:30 前賣出微台："
-        "這筆實際成交幾口就平幾口（0～1 口）。\n"
+        "部位檔已記為「不確定」：盤中程式今天不再進場。\n"
+        "微台不必現在處理：13:25 的出場程式會先用委託序號向券商查這筆成交了幾口，查到全部成交就照常平倉（賣出微台 1 口）；查不到確定的口數會再發一則，寫明要平幾口。在那之前不要自己平：不然 13:25 會再平一次，開出反向新倉。\n"
         "2026/11/09 08:50:00",
     ]
 
@@ -195,18 +197,36 @@ def test_an_uncertain_order_after_earlier_fills_keeps_them_and_says_what_is_know
 
 
 def test_on_the_micro_the_alert_counts_the_confirmed_lots_the_user_must_also_close():
-    """微台：08:50 成交 1 口，08:51 那筆不確定。出場程式看到「不確定」就整個不平，連那 1 口
-    確認過的也不平——所以要人自己平的是「確認的 1 口，加上這筆實際成交的」。只說「這筆」
-    的話，使用者平掉不確定的那幾口，確認的那 1 口就過夜了。"""
+    """微台：08:50 成交 1 口，08:51 那筆不確定。13:25 出場程式先用委託序號查券商紀錄，查到全部
+    成交就照常平倉——平的是「確認的 1 口，加上這筆」合起來的 2 口，告警寫的也是這個數字。
+    在那之前不要自己平：自己平了，13:25 查到成交又平一次，就是反向新倉。"""
     _, sent = _run(_all_morning(), order_errors=[
         None, FillUnknown("30 秒內沒等到委託 2315610000002 結束", order_seq="2315610000002")])
 
     assert len(sent) == 2
-    assert sent[1].splitlines()[4] == (
-        "請到券商 APP 確認這筆成交了幾口。微台沒有當沖強平，要你自己在 13:30 前賣出微台："
-        "部位檔已確認的多單 1 口，加上這筆實際成交的口數，也就是 1～2 口。")
+    assert sent[1].splitlines()[4] == "微台不必現在處理：13:25 的出場程式會先用委託序號向券商查這筆成交了幾口，查到全部成交就照常平倉（賣出微台 2 口）；查不到確定的口數會再發一則，寫明要平幾口。在那之前不要自己平：不然 13:25 會再平一次，開出反向新倉。"
     assert _file()["entries"] == [{"order_seq": "2315610000001", "lots": 1, "price": 45150.0}]
     assert _file()["status"] == "UNCERTAIN"
+
+
+def test_the_exit_program_looks_up_the_uncertain_entry_and_closes_everything_without_a_word():
+    """盤中與出場兩支程式只靠部位檔溝通。08:50 成交 1 口，08:51 那筆不確定（委託序號有記下），
+    盤中那則告警請使用者等 13:25。13:25 出場程式讀同一份部位檔，用序號查到那筆 1 口全部成交，
+    照常平掉 PTS 全部的 2 口，不再發訊息。"""
+    _run(_all_morning(), order_errors=[
+        None, FillUnknown("30 秒內沒等到委託 2315610000002 結束", order_seq="2315610000002")])
+
+    exit_broker = FakeBroker(fill_price=45200.0,
+                             fill_queries=[FillQuery(lots=1, avg_price=45160.0)])
+    notifier = RecordingNotifier()
+    exit_program.run(exit_broker, LIVE, notify=notifier, clock=lambda: at("13:25:00"),
+                     sleep=lambda seconds: None)
+
+    assert exit_broker.queries == [("2315610000002", DAY, 1)]
+    assert [(o.side, o.lots) for o in exit_broker.orders] == [(SELL, 2)]
+    # 劇本只演到 08:53，心跳停在那裡：出場程式照講「盤中程式…之後就沒有再跑」，與這裡無關
+    assert [m for m in notifier.sent if "盤中程式" not in m.splitlines()[0]] == []
+    assert _file()["status"] == "CONFIRMED"
 
 
 def test_when_the_order_seq_cannot_be_written_the_file_still_says_uncertain_from_before_sending(
