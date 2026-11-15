@@ -5,16 +5,20 @@
 
 | 檔案 | 寫的 | 讀的 | 說明在 |
 |------|------|------|--------|
-| `position-YYYYMMDD.json` | 盤中程式（進場）、出場程式（出場） | 兩者 | `position_file` |
+| `position-YYYYMMDD.json` | 盤中程式（進場）、出場程式與收工指令（出場） | 三者 | `position_file` |
 | `heartbeat.json` | 盤中程式 | 出場程式；盤中程式（今天收工了沒） | `heartbeat` |
-| `entries-stopped-YYYYMMDD.txt` | 盤中程式 | 盤中程式（重啟） | `intraday.stop_path` |
+| `entries-stopped-YYYYMMDD.txt` | 盤中程式、收工指令 | 盤中程式（啟動時與每個時鐘事件） | `intraday.stop_path` |
+| `stop-seen-YYYYMMDD.txt` | 盤中程式（看到停止進場記錄） | 收工指令 | `intraday.stop_seen_path` |
 | `login-failed-YYYYMMDD.txt` | 盤中程式 | 盤中程式（下一次被叫醒） | `intraday.login_failed_path` |
 | `exit-done-YYYYMMDD.txt` | 出場程式 | 出場程式（之後每一次執行） | `exit_program.done_path` |
 | `day-settings-YYYYMMDD.json` | 盤中程式（當天第一次啟動） | 盤中程式（重啟） | `day_settings` |
 | `sim-position-YYYYMMDD.json` | 盤中程式（模擬模式） | 盤中程式（重啟）；出場程式**絕不讀** | `sim_position` |
-| `intraday.lock` | 盤中程式 | — | `intraday._alone` |
+| `intraday.lock` | 盤中程式 | 收工指令（盤中程式在不在跑） | `intraday._alone` |
+| `stop_today.lock` | 收工指令 | — | `tools/stop_today.py` |
 
-兩支程式之間只靠部位檔與心跳記錄溝通（規格「兩支程式」一節）；其他的都只有寫它的那支程式讀。
+兩支程式之間只靠部位檔與心跳記錄溝通（規格「兩支程式」一節）。使用者盤中下的收工指令
+（`tools/stop_today.py`）另外靠停止進場記錄與確認記錄和盤中程式說好「不再進場」；其他的都只有
+寫它的那支程式讀。
 
 兩種寫法，各有理由：
 
@@ -23,14 +27,19 @@
   * **標記檔**（`write_marker`／`read_marker`）：**檔案存在就算數**，內容只是寫給人看的原因。
     直接寫、不經置換：寫到一半也一樣算數；部位檔被防毒鎖住、`os.replace` 失敗的時候，這裡照樣
     寫得進去——停止進場記錄最需要的正是那種時候。
+
+`.lock` 檔是「同一時間只有一個」的鎖（`exclusive`），內容不重要。
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sys
 import tempfile
 from datetime import date
+from typing import Iterator
 
 import paths
 
@@ -98,3 +107,38 @@ def read_json(path: str) -> object | None:
         return None
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+@contextlib.contextmanager
+def exclusive(path: str) -> Iterator[bool]:
+    """鎖住 `path`（作業系統的檔案鎖，不等）：交出 True；別的行程拿著、鎖不到就交出 False。
+
+    用檔案鎖、不用「檔案在不在」：行程不管怎麼死，鎖都跟著放掉；留下一個檔案的話，當掉之後的
+    每一次都會以為還有人在跑。鎖檔本身留著，不刪。同一個行程裡另開一次也鎖不到（Windows 的鎖
+    跟著檔案代碼走）。
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            _lock(fd, True)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            _lock(fd, False)
+    finally:
+        os.close(fd)
+
+
+def _lock(fd: int, on: bool) -> None:
+    """鎖住（或放掉）檔案的第一個位元組，鎖不到立刻拋 OSError、不等。"""
+    if sys.platform == "win32":
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)        # msvcrt 鎖的是「目前位置起」的位元組
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if on else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if on else fcntl.LOCK_UN)

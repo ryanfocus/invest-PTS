@@ -39,6 +39,10 @@
 再送一次、再告警一次。部位檔記著「不確定」卻沒有停止進場記錄，就是送單的那一輪來不及告警：
 重啟後的這一輪替它告警（`_Trading.report_uncertain_entry_left_by_last_run`）。
 
+使用者也會盤中寫它：收工指令（`tools/stop_today.py`，規格第 61 條）。所以每個時鐘事件都看一次
+（`_Trading.look_for_stop_record`），看到就不再進場、取消等待中的突破進場，寫下確認記錄
+（`stop_seen_path`）——收工指令等到它才平倉。
+
 ## 可靠度（ticket 09）
 
   * **心跳記錄**（`_Pulse`、`heartbeat`）：每分鐘寫一次，13:20 收工時寫「收工了」（這一輪在
@@ -319,6 +323,7 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 break
             if isinstance(event, Clock):
                 pulse.beat(event.time)
+                trading.look_for_stop_record(event.time)
                 lookups.on_clock(event.time)
                 outage = watch.check(event.time)
                 if outage is not None:
@@ -851,6 +856,9 @@ class _Trading:
                 logger.warning("今天稍早已經停止進場，重啟後照樣不進場：%s", earlier)
         # 部位檔讀不懂（`_stop_for_unreadable_position_file`）：一開始就不進場
         self._stopped = self._stopped or stopped
+        # 寫過確認記錄了沒有（`look_for_stop_record`）。啟動時讀到停止進場記錄也一樣要寫，
+        # 在第一個時鐘事件寫（那時才有「現在」，見模組說明「時間」）。
+        self._stop_seen = False
         # 排在停止進場的判斷之後：模擬部位讀不懂時，`_simulated_so_far` 會再把它打開
         self.position = _held(record) if live else self._simulated_so_far()
         # 交易商品的現價：部位不虧用它，模擬也成交在它
@@ -948,9 +956,32 @@ class _Trading:
         self._execute(strategy.Enter(breakout.direction, breakout.condition, breakout.lots),
                       trade.time, trigger=breakout.trigger)
 
+    def look_for_stop_record(self, now: datetime) -> None:
+        """每個時鐘事件（每秒）看一次停止進場記錄：使用者盤中可能執行收工指令
+        （`tools/stop_today.py`），只在啟動時看的話，盤中程式要到重啟才知道。成本只是查一次
+        檔案在不在。
+
+        看到的那一刻今天不再進場、取消等待中的突破進場（同報價中斷，不恢復），寫下確認記錄
+        （`stop_seen_path`），只記 log、不發 Discord（使用者自己下的指令）。今天已經因為別的原因
+        停止進場、或啟動時就讀到記錄，照樣寫確認記錄：收工指令等的是「盤中程式知道了」，
+        不是「為什麼停」。寫過一次就不再看。
+        """
+        if self._stop_seen:
+            return
+        why = state_files.read_marker(stop_path(self._today))
+        if why is None:
+            return
+        self._stop_seen = True
+        if not self._stopped:
+            self._stopped = True
+            logger.warning("看到停止進場記錄，今天不再進場：%s", why.splitlines()[-1])
+        self.cancel_breakout("看到停止進場記錄")
+        _write_stop_seen(self._today, now)
+
     def cancel_breakout(self, why: str) -> None:
-        """取消等待中的突破進場。沒有進場，不發訊息。兩個時候：13:20 進場截止（規格第 26 條），
-        與報價中斷告警的那一刻（`_QuoteWatch`）。取消就是沒了，之後不恢復。"""
+        """取消等待中的突破進場。沒有進場，不發訊息。三個時候：13:20 進場截止（規格第 26 條）、
+        報價中斷告警的那一刻（`_QuoteWatch`），與看到停止進場記錄（`look_for_stop_record`）。
+        取消就是沒了，之後不恢復。"""
         if self.breakout is not None:
             logger.info("%s，取消等待中的突破進場（%s，觸發價 %g）", why,
                         self.breakout.condition.value, self.breakout.trigger)
@@ -1286,8 +1317,9 @@ def stop_path(day: date) -> str:
     今天出過事，重啟後照常加碼。所以寫成檔，重啟時看到它就不進場。
 
     只有盤中程式自己讀，出場程式不看（兩支程式之間只靠部位檔與心跳記錄，規格「兩支程式」
-    一節）。**檔案存在就是停過**，內容只是寫給人看的原因；讀不懂（寫到一半斷電、被改壞）也一樣
-    不進場（`state_files.read_marker`）。
+    一節）。使用者盤中執行收工指令（`tools/stop_today.py`）時也會寫，所以盤中程式每個時鐘事件
+    都看一次（`_Trading.look_for_stop_record`）。**檔案存在就是停過**，內容只是寫給人看的原因；
+    讀不懂（寫到一半斷電、被改壞）也一樣不進場（`state_files.read_marker`）。
     """
     return state_files.daily("entries-stopped", day)
 
@@ -1307,6 +1339,31 @@ def _write_stop(day: date, line: str) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error("停止進場記錄寫不進 %s（%s: %s）：盤中程式若重啟，今天可能會再進場",
                      path, type(exc).__name__, exc)
+
+
+def stop_seen_path(day: date) -> str:
+    """那個交易日的確認記錄：盤中程式看到停止進場記錄了，今天不再進場（`look_for_stop_record`）。
+
+    收工指令（`tools/stop_today.py`）寫下停止進場記錄之後等的就是它，等到了才平倉。它只在
+    盤中程式的事件迴圈裡寫，所以它出現時，正在等成交回報的那一筆進場委託（最長 30 秒以上）
+    一定已經處理完、記進部位檔，或記成「不確定」了；之後盤中程式不再寫部位檔。沒等到就平倉的話，
+    那一筆成交時盤中程式用記憶體裡的部位整份覆寫部位檔，收工指令記下的平倉就不見了，13:25 的
+    出場程式再照舊檔平一次。標記檔：存在就算數，內容只是給人看的（`state_files`）。
+    """
+    return state_files.daily("stop-seen", day)
+
+
+def _write_stop_seen(day: date, now: datetime) -> None:
+    """寫不進去只記 log：收工指令等不到確認，會請使用者過一兩分鐘再執行一次，不會平倉。"""
+    path = stop_seen_path(day)
+    try:
+        state_files.write_marker(path, f"{now:%Y/%m/%d %H:%M:%S} 盤中程式看到停止進場記錄，"
+                                       "今天不再進場")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("確認記錄寫不進 %s（%s: %s）：收工指令等不到確認，這一次不會平倉",
+                     path, type(exc).__name__, exc)
+        return
+    logger.info("看到停止進場記錄，已寫下確認記錄 %s", path)
 
 
 def _send(config: settings.Config, notify: Callable[[str], bool], text: str) -> None:
@@ -1358,6 +1415,17 @@ def _lock_path() -> str:
     return os.path.join(paths.state_dir(), "intraday.lock")
 
 
+def is_running() -> bool:
+    """現在有沒有盤中程式在跑（收工指令問的，`tools/stop_today.py`）：用 `_alone` 同一把鎖試著鎖
+    一次，鎖到就是沒有，立刻放掉。
+
+    放掉之前那一瞬間被排程叫醒的盤中程式會以為「另一個正在跑」而結束，下一分鐘再起來——代價只有
+    這樣。不看「行程在不在」：鎖就是盤中程式自己認的那一個（當掉的行程，鎖跟著放掉）。
+    """
+    with _alone() as alone:
+        return not alone
+
+
 @contextlib.contextmanager
 def _alone() -> Iterator[bool]:
     """同一時間只有一個盤中程式（ticket 09、10）：鎖住 `state/intraday.lock`，鎖不到就是
@@ -1367,35 +1435,11 @@ def _alone() -> Iterator[bool]:
     叫醒的那一個行程：有人在命令列手動再跑一次，或排程只砍掉了外層的行程（venv 的
     `python.exe` 是一層轉手、真正的直譯器是它的子行程），第二個就起來了。
 
-    用作業系統的檔案鎖，不用「檔案在不在」：行程不管怎麼死，鎖都跟著放掉；留下一個檔案的話，
-    當掉之後的每一次重啟都會以為還有人在跑。鎖檔本身留著，不刪。
+    用作業系統的檔案鎖，不用「檔案在不在」（`state_files.exclusive`）：行程不管怎麼死，鎖都
+    跟著放掉；留下一個檔案的話，當掉之後的每一次重啟都會以為還有人在跑。
     """
-    path = _lock_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT)
-    try:
-        try:
-            _lock(fd, True)
-        except OSError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            _lock(fd, False)
-    finally:
-        os.close(fd)
-
-
-def _lock(fd: int, on: bool) -> None:
-    """鎖住（或放掉）檔案的第一個位元組，鎖不到立刻拋 OSError、不等。"""
-    if sys.platform == "win32":
-        import msvcrt
-        os.lseek(fd, 0, os.SEEK_SET)        # msvcrt 鎖的是「目前位置起」的位元組
-        msvcrt.locking(fd, msvcrt.LK_NBLCK if on else msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if on else fcntl.LOCK_UN)
+    with state_files.exclusive(_lock_path()) as alone:
+        yield alone
 
 
 def _setup_logging(today: date) -> None:
