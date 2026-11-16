@@ -31,9 +31,12 @@ Python 要 **64 位元**，和群益元件的位元數一致（用 `元件\x64` 
 ```powershell
 cd <專案資料夾>
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -X utf8 -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+`-X utf8` 不能省：`requirements.txt` 的註解是中文（UTF-8），繁體中文版 Windows 上 pip 會用系統編碼
+（cp950）讀它，直接 `UnicodeDecodeError` 失敗（2026-11-16 在這台電腦上遇到，pip 24.0）。
 
 全綠代表程式本身沒問題，**不代表連得上券商**：測試跑的全是假 broker，一個也不會登入群益。
 
