@@ -248,7 +248,7 @@ def behind(actual: PositionRecord, on_file: PositionRecord) -> bool:
     當成不確定。
 
     只差在不確定那一筆「已知至少成交幾口」不算：那是給人對帳的下限，下一個讀它的會再查一次，
-    叫人「不要再執行出場程式」反而是錯的。
+    告警「部位檔沒記到這次的平倉」反而是錯的。
     """
     def kept(record: PositionRecord) -> tuple:
         u = record.uncertain

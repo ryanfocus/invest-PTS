@@ -21,6 +21,7 @@ from broker.fake import FakeBroker
 from day_script import (DAY, SETTLEMENT_DAY, WEBHOOK, main_env, make_config, position_content,
                         position_on_file as _file, settings_yaml, write_position_file)
 from recording import RecordingNotifier
+from notifiers import discord
 import exit_program
 import heartbeat
 import position_file
@@ -277,32 +278,29 @@ def test_an_uncertain_entry_on_file_sends_nothing_and_says_what_is_known():
         "券商的成交紀錄：查不到這筆委託的成交\n"
         "部位檔記到的部位（不含這一筆）：多單 3 口\n"
         "請在日盤 13:45 收盤前自行賣出微台（TM2611）：部位檔的多單 3 口，加上委託序號 2315609990003 實際成交的口數，也就是 3～4 口（到券商 APP 用委託序號查這筆成交了幾口）。\n"
-        f"{_DO_NOT_RUN_AGAIN}\n"
         "2026/11/09 13:25:00",
     ]
     assert _file() == content
 
 
-# 13:25 查不到盤中那筆進場時：檔裡還是同一筆查得到的不確定，自己平掉之後再執行出場程式，它會再查、
-# 查到全部成交就照檔再平一次
-_DO_NOT_RUN_AGAIN = ("自己平掉之後，不要再執行出場程式：它會再用委託序號查這筆，查到全部成交就照部位檔"
-                     "平倉，開出反向新倉。")
-
-
-def test_closing_by_hand_after_an_unconfirmed_entry_and_running_again_would_close_twice():
+def test_once_an_unconfirmed_entry_is_handed_over_running_again_sends_nothing():
     """安全審查找到的：13:25 查到盤中那筆只成交 1 口（委託 2 口），告警請人自己平 4～5 口。
-    使用者照著平了 5 口，13:35 又手動執行一次出場程式：這時查到全部成交，就照部位檔再賣 5 口——
-    5 口空單過夜。所以告警要講「自己平掉之後，不要再執行出場程式」；過了期限的重跑不送單，就不講。"""
+    使用者人在外面，用券商 APP 照著平了 5 口——人在外面碰不到那台電腦。13:35 出場程式又被執行一次
+    （有人手動執行、在工作排程器按了「執行」）：這時查得到全部成交，照部位檔就會再賣 5 口，
+    5 口空單過夜。
+
+    告警送出去，今天的部位就交給使用者了：再執行一次不登入、不查、不送單，也不再講一次。
+    所以告警裡沒有「不要再執行出場程式」——那是在外面的人做不到、也不該由使用者擋的事。"""
     _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY", requested=2))
     _, sent, _ = _run(fill_queries=[FillQuery(lots=1, avg_price=45160.0)])
-    assert sent[0].splitlines()[-2] == _DO_NOT_RUN_AGAIN
+    assert len(sent) == 1
+    assert "執行出場程式" not in sent[0]
+    content = _file()
 
-    broker, _, _ = _run(at=_at("13:35"), fill_queries=[FillQuery(lots=2, avg_price=45160.0)])
-    assert [o.lots for o in broker.orders] == [5]       # 告警擋的就是這一筆
-
-    _on_file(status="UNCERTAIN", uncertain=_uncertain("ENTRY", requested=2))
-    _, sent, _ = _run(at=_at("13:50"))
-    assert _DO_NOT_RUN_AGAIN not in sent[0]
+    again, sent, _ = _run(at=_at("13:35"), login_error=AssertionError("同一天不該再登入"),
+                          fill_queries=[FillQuery(lots=2, avg_price=45160.0)])
+    assert (again.orders, again.queries, sent) == ([], [], [])
+    assert _file() == content
 
 
 def test_an_uncertain_micro_entry_confirmed_by_the_lookup_is_closed_as_usual():
@@ -449,8 +447,8 @@ def test_after_three_retries_the_lots_still_open_are_reported():
     """13:25 送出、13:26／13:27／13:28 重試三次，全部被拒：還剩 3 口。13:30 之前告警，
     寫明還剩幾口、要送什麼單，以及最後一次被拒的原因。部位檔沒有任何出場。
 
-    部位檔還是「3 口沒平」：使用者自己賣掉之後，出場程式只要再被執行一次（手動、排程補跑），
-    就照檔再賣 3 口，開出反向新倉過夜。告警要把這件事講出來。"""
+    部位檔還是「3 口沒平」，但告警不叫人「不要再執行出場程式」：同一天再執行也不會送單
+    （`test_once_the_alert_has_gone_out_running_again_the_same_day_sends_nothing`）。"""
     content = _on_file()
     broker, sent, time = _run(order_errors=[OrderFailed("保證金不足")] * 4)
     assert len(broker.orders) == 4
@@ -459,7 +457,6 @@ def test_after_three_retries_the_lots_still_open_are_reported():
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 3 口\n"
         "原因：平倉單重試 3 次都沒能送出（最後一次：保證金不足）\n"
         "請在日盤 13:45 收盤前自行賣出微台 3 口（TM2611）。\n"
-        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 3 口再賣出一次，開出反向新倉。\n"
         "2026/11/09 13:28:00",
     ]
     assert _file() == content
@@ -489,7 +486,6 @@ def test_lots_still_open_after_partial_fills_and_three_retries_are_reported():
         "【要你處理】PTS 部位還在：微台平倉沒有完成，還剩多單 1 口\n"
         "原因：市價 IOC 沒有全部成交，重試 3 次仍有剩餘\n"
         "請在日盤 13:45 收盤前自行賣出微台 1 口（TM2611）。\n"
-        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 1 口再賣出一次，開出反向新倉。\n"
         "2026/11/09 13:28:00",
     ]
 
@@ -978,13 +974,99 @@ def test_with_discord_off_the_position_is_still_closed_and_nothing_is_sent():
     assert sent == []
 
 
+# --- 一天只處理一次：告警送出去，今天的部位就交給使用者了 ---
+#
+# 使用者多半人在外面，照告警用券商 APP 自己平，碰不到那台電腦。出場程式同一天再被執行
+# （手動、在工作排程器按「執行」）的話，照部位檔再平一次就是反向新倉，所以它自己不再送單。
+
+
+FIRST_RUNS = {
+    "部位還在": dict(order_errors=[OrderFailed("保證金不足")] * 4),
+    "成交一部分後重試完": dict(fills=[1, 1, 0, 0]),
+    "登入失敗": dict(login_error=LoginFailed("代碼 300 帳號密碼錯誤")),
+    "平倉單不確定": dict(order_errors=[_SENT_BUT_UNKNOWN], fill_queries=[FillQuery(lots=None)]),
+    "平完了": dict(),
+}
+
+
+@pytest.mark.parametrize("first", FIRST_RUNS.values(), ids=FIRST_RUNS.keys())
+def test_once_the_alert_has_gone_out_running_again_the_same_day_sends_nothing(first):
+    """13:25 那一次做完、告警送出去了。使用者照告警自己平掉，之後出場程式又被執行一次：
+    不登入、不送單、不再講一次，部位檔原封不動。"""
+    _on_file()
+    _run(**first)
+    content = _file()
+
+    again, sent, _ = _run(at=_at("13:35"), login_error=AssertionError("同一天不該再登入"))
+    assert (again.orders, again.queries, sent) == ([], [], [])
+    assert _file() == content
+
+
+def test_when_the_alert_did_not_go_out_running_again_the_same_day_still_closes():
+    """13:25 網路斷了：平倉單、「部位還在」的告警都送不出去，沒有人被告知要自己平。
+    網路回來之後有人再執行一次：照常平倉——今天的部位還沒交給任何人。"""
+    _on_file()
+    exit_program.run(FakeBroker(fill_price=45200.0, login_error=_OFFLINE), make_config(),
+                     notify=_Offline(), clock=_Time(_at("13:25")).clock,
+                     sleep=lambda seconds: None)
+
+    again, sent, _ = _run(at=_at("13:35"))
+    assert [(o.side, o.lots) for o in again.orders] == [(SELL, 3)]
+    assert sent == []
+
+
+def test_a_crash_alert_hands_the_day_over_too(tmp_path, monkeypatch):
+    """登入時程式本身出錯：告警請人看帳戶、自己平。送出去就交給使用者了，再執行一次不送單。"""
+    main_env(tmp_path, monkeypatch)
+    _on_file()
+    time = _Time(_at("13:25"))
+    code, _ = _main(time=time, broker=_BreaksAt(time, _at("13:25")))
+    assert code == 1
+
+    again, sent, _ = _run(at=_at("13:35"), login_error=AssertionError("同一天不該再登入"))
+    assert (again.orders, sent) == ([], [])
+
+
+CRASHES = {
+    "進場截止之後": ("13:25", True, False),
+    "告警沒送出去": ("13:25", False, True),
+    "進場截止之前": ("10:00", True, True),
+}
+
+
+@pytest.mark.parametrize("hhmm, told, closes_later", CRASHES.values(), ids=CRASHES.keys())
+def test_a_crash_hands_the_day_over_only_once_told_and_after_the_entry_cutoff(
+        hhmm, told, closes_later, tmp_path, monkeypatch):
+    """還沒讀到今天的部位就出錯（這裡是看日曆）：一樣告警、一樣交給使用者，再執行不送單。
+    告警沒送出去就沒有人被告知，再執行照常平；13:20 進場截止之前（有人在盤中手動執行）也不算：
+    13:25 的出場還沒輪到，照常要平。"""
+    posted = main_env(tmp_path, monkeypatch)
+    if not told:
+        monkeypatch.setattr(discord, "send", lambda text, webhook: False)
+    _on_file()
+
+    def broken(day):
+        raise RuntimeError("日曆讀不到")
+    monkeypatch.setattr(exit_program.calendar_tw, "is_trading_day", broken)
+    code, _ = _main(at=_at(hhmm))
+    assert code == 1
+    if told:
+        assert posted.sent[0].startswith("【要你處理】PTS 出場程式意外中止\n")
+    monkeypatch.setattr(exit_program.calendar_tw, "is_trading_day", lambda day: True)
+
+    later, _, _ = _run(at=_at("13:35"))
+    assert [o.lots for o in later.orders] == ([3] if closes_later else [])
+
+
 # --- 平倉成交了，部位檔卻寫不進去 ---
 
 
 def test_a_close_that_cannot_be_written_still_closes_everything_and_says_so(monkeypatch):
     """23 口：寫檔一直失敗（防毒鎖住檔案）。平倉照送完——微台不能過夜，記憶體裡的口數是對的；
-    最後告警：部位檔還記著 23 口沒平，**不要再執行出場程式**，它會照檔再平一次。"""
+    最後告警：部位檔還記著 23 口沒平，帳上以「實際」為準，寫不進去的原因要在下一個交易日之前
+    排除。檔裡的 23 口不會被再平一次：出場記錄另外寫得進去，同一天再執行就不送單。"""
     content = _on_file(entries=_lots(*[1] * 20, 3))
+    replace = os.replace
 
     def denied(src, dst):
         raise PermissionError(13, "存取被拒")
@@ -995,20 +1077,26 @@ def test_a_close_that_cannot_be_written_still_closes_everything_and_says_so(monk
         "【要你處理】PTS 部位檔沒記到出場程式這次的平倉\n"
         "實際：平倉 23 口，還剩多單 0 口；部位檔記的是平倉 0 口\n"
         "原因：PermissionError: [Errno 13] 存取被拒\n"
-        "不要再執行出場程式：它只認部位檔，會把已經平掉的口數再平一次，開出反向新倉。\n"
+        "帳上以上面的「實際」為準：出場程式今天不會再照這份檔送單（一天只處理一次）。\n"
+        "部位檔寫不進去的原因（例如防毒鎖住、磁碟滿）請在下一個交易日 08:40 之前排除："
+        "盤中程式送單前寫不進部位檔就不會進場。\n"
         "2026/11/09 13:25:00",
     ]
     assert _file() == content
+
+    monkeypatch.setattr(os, "replace", replace)
+    again, sent, _ = _run(at=_at("13:30"))
+    assert (again.orders, sent) == ([], [])
 
 
 @pytest.mark.parametrize("answer, left", [(FillQuery(lots=None), "0～3"),
                                           (FillQuery(lots=2, avg_price=45210.0), "0～1")],
                          ids=["查不到", "查到成交 2 口"])
-def test_an_uncertain_exit_that_cannot_be_written_warns_against_running_again(
+def test_an_uncertain_exit_that_cannot_be_written_is_reported_with_what_the_file_missed(
         answer, left, monkeypatch):
     """最危險的一種：平倉單不確定、查不到，而「不確定」這件事也寫不進部位檔。檔裡看起來是
-    「3 口還沒平」，再執行一次出場程式就會再送一筆——那筆很可能是反向新倉。兩則告警：
-    不確定那一筆，以及不要重跑。
+    「3 口還沒平」（同一天再執行一次也不會照它送單，出場記錄擋著）。兩則告警：不確定那一筆，
+    以及部位檔沒記到什麼。
 
     第二則是最新的那一則，不能把不確定的平倉講成「確定平倉 0 口、還剩 3 口」：那張單可能
     已經全部成交，使用者照「還剩 3 口」去賣，就開出 3 口反向新倉。帳上剩幾口是一個範圍。"""
@@ -1084,7 +1172,6 @@ CRASH_DEADLINES = {
         "收盤；今天如果是結算日，到期的近月 13:30 就停止交易，之後由交易所以最後結算價現金"
         "了結）。大台、小台由券商 13:30 當沖強平。",
         "PTS 的口數：logs/intraday-20261109.log 最後一筆「進場成交」的累計口數，減掉 logs/exit-20261109.log 與 logs/stop-20261109.log 裡每一筆「平倉成交」的口數（有「不知道成交幾口」的委託時，另外到券商 APP 用委託序號查）。只平這個口數。",
-        "自己平掉之後，不要再執行出場程式：它只認部位檔，會把你平掉的口數再平一次，開出反向新倉。",
     ]),
     "日盤收盤後": ("13:50", [
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。日盤 13:45 已經收盤，"
@@ -1099,8 +1186,8 @@ CRASH_DEADLINES = {
 def test_when_the_program_breaks_the_alarm_gives_the_deadline_that_applies(
         hhmm, todo, tmp_path, monkeypatch):
     """出場程式當掉時不知道部位檔裡是什麼，也就不知道今天是不是結算日：兩種期限都講；
-    13:45 之後才當掉，要人做的是夜盤（規格第 41、55 條）。收盤前還要講不要重跑：
-    使用者自己平掉之後再執行一次，它會照部位檔再平一次。
+    13:45 之後才當掉，要人做的是夜盤（規格第 41、55 條）。不講不要重跑：告警送出去就交給
+    使用者了，同一天再執行不送單（`test_a_crash_alert_hands_the_day_over_too`）。
     13:25 起跑，登入卡到 `hhmm` 才出錯。"""
     posted = main_env(tmp_path, monkeypatch)
     _on_file()

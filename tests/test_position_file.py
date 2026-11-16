@@ -115,7 +115,7 @@ BEHIND = {
 
 @pytest.mark.parametrize("actual, on_file, lags", BEHIND.values(), ids=BEHIND.keys())
 def test_the_file_is_behind_only_when_the_next_reader_would_act_wrongly(actual, on_file, lags):
-    """部位檔寫不進去時，什麼樣的落後要叫人「不要再執行出場程式」：下一個讀它的會照檔再平一次、
+    """部位檔寫不進去時，什麼樣的落後要告警「部位檔沒記到這次的平倉」：下一個讀它的會照檔再平一次、
     或把不確定的當成確定。已知成交口數是給人對帳的下限，下一個讀它的會再查，不算。"""
     assert position_file.behind(actual, on_file) is lags
 

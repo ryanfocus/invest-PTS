@@ -437,13 +437,7 @@ def _check_account(record: position_file.PositionRecord, at: datetime) -> str:
     if h.who is Who.BROKER:
         return (f"大台、小台標了當沖，券商 {DAY_TRADE_CLOSE:%H:%M} 會強平："
                 f"{DAY_TRADE_CLOSE:%H:%M} 之後請到券商 APP 確認帳戶裡已經沒有 PTS 的部位。")
-    todo = _close_yourself(h, _uncertain_close_order(record))
-    if handoff.exit_looks_up(record) and not h.passed:
-        # 盤中留下的進場、13:25 查不到：部位檔原封不動，還是這一筆查得到的不確定。使用者自己平掉
-        # 之後再執行出場程式，它會再查一次——這時查到全部成交，就照部位檔再平一次（同 `exit_incomplete`）
-        todo += ("\n自己平掉之後，不要再執行出場程式：它會再用委託序號查這筆，查到全部成交就照部位檔"
-                 "平倉，開出反向新倉。")
-    return todo
+    return _close_yourself(h, _uncertain_close_order(record))
 
 
 def exit_incomplete(*, at: datetime, record: position_file.PositionRecord, reason: str) -> str:
@@ -456,9 +450,8 @@ def exit_incomplete(*, at: datetime, record: position_file.PositionRecord, reaso
     期限看告警這一刻（`handoff.decide`）：一般日是日盤 13:45 收盤，過了只能在夜盤平；結算日的
     近月 13:30 就停止交易，過了就不能再平，由交易所以最後結算價現金了結。
 
-    期限之前還要講**不要重跑**：部位檔原封不動，還是「這幾口沒平」。使用者自己平掉之後，
-    出場程式只要再被執行一次（手動、排程補跑），就照檔再平一次，開出反向新倉過夜。
-    過了期限的重跑不會送單，就不講。
+    不講「不要重跑」：部位檔雖然還記著這幾口，出場程式同一天只處理一次（`exit_program.done_path`），
+    使用者自己平掉之後再被執行也不會照檔再平。何況使用者多半人在外面，碰不到那台電腦。
     """
     lots = record.open_lots
     side = _CLOSE_SIDE_TEXT[record.direction]
@@ -470,9 +463,6 @@ def exit_incomplete(*, at: datetime, record: position_file.PositionRecord, reaso
     else:
         todo = _close_yourself(
             h, f"{side}{_PRODUCT_TEXT[record.product]} {lots} 口（{record.order_code}）")
-    if not h.passed:
-        todo += (f"\n自己平掉之後，不要再執行出場程式：它只認部位檔，會把這 {lots} 口再{side}一次，"
-                 "開出反向新倉。")
     return (
         f"【要你處理】PTS 部位還在：微台平倉沒有完成，還剩{_HOLDING_TEXT[record.direction]} "
         f"{lots} 口\n"
@@ -591,9 +581,11 @@ def _missed_reason(day: str) -> str:
 
 def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,
                      on_file: position_file.PositionRecord, reason: str) -> str:
-    """出場程式平倉了，部位檔卻寫不進去。平倉照樣做完了，要人做的只有一件事：**不要重跑**。
+    """出場程式平倉了，部位檔卻寫不進去。平倉照樣做完了：帳上以「實際」為準。
 
-    出場程式只認部位檔：檔裡還記著沒平的口數，再執行一次就會把已經平掉的再平一次。
+    檔裡還記著沒平的口數，但出場程式同一天只處理一次（`exit_program.done_path`），不會照它再平。
+    要人做的是排除寫不進去的原因：盤中程式送單前寫不進部位檔就不送，原因不排除，下一個交易日
+    就不會進場。
 
     有一筆平倉單不確定時（`record.uncertain`），「實際」只說得出範圍：那一筆成交了幾口不知道，
     帳上剩的介於「全部成交」與「只成交已知的口數」之間。講成確定的「還剩 N 口」的話，
@@ -604,7 +596,9 @@ def exit_not_on_file(*, at: datetime, record: position_file.PositionRecord,
         "【要你處理】PTS 部位檔沒記到出場程式這次的平倉\n"
         f"{_not_on_file_facts(record, on_file)}"
         f"原因：{reason}\n"
-        "不要再執行出場程式：它只認部位檔，會把已經平掉的口數再平一次，開出反向新倉。\n"
+        "帳上以上面的「實際」為準：出場程式今天不會再照這份檔送單（一天只處理一次）。\n"
+        "部位檔寫不進去的原因（例如防毒鎖住、磁碟滿）請在下一個交易日 08:40 之前排除："
+        "盤中程式送單前寫不進部位檔就不會進場。\n"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 
@@ -694,18 +688,14 @@ def exit_crashed(*, at: datetime, reason: str, logs: handoff.FillLogs) -> str:
     """出場程式本身出錯中止。不知道做到哪裡，只能請人看帳戶。
 
     還剩幾口也不知道（可能平到一半），講從哪裡算（`_count_from_logs`）。
-    收盤前同樣要講不要重跑（理由見 `exit_incomplete`）。"""
+    不講「不要重跑」（理由見 `exit_incomplete`）。"""
     closed = handoff.day_closed(at)
-    rerun = ("" if closed else
-             "自己平掉之後，不要再執行出場程式：它只認部位檔，會把你平掉的口數再平一次，"
-             "開出反向新倉。\n")
     return (
         "【要你處理】PTS 出場程式意外中止\n"
         f"原因：{reason}\n"
         "今天 PTS 的微台部位可能沒有平完：請到券商 APP 確認帳戶。"
         f"{_close_micro_any_day(closed)}。大台、小台由券商 {DAY_TRADE_CLOSE:%H:%M} 當沖強平。\n"
         f"{_count_from_logs(logs)}\n"
-        f"{rerun}"
         f"{at:%Y/%m/%d %H:%M:%S}"
     )
 

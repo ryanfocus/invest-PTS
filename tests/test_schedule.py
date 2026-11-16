@@ -134,8 +134,7 @@ def test_the_intraday_program_is_woken_from_0840_every_minute_until_the_1320_cut
 
 
 def test_the_exit_program_is_woken_once_at_1325_and_never_rerun(venv):
-    """出場程式不設任何重跑（ticket 08）：告警之後使用者可能已經自己平掉剩下的口數，再跑一次，
-    它照部位檔再平一次，就是反向新倉。"""
+    """出場程式不設任何重跑（ticket 08）：一天只處理一次今天的部位，告警之後就交給使用者了。"""
     task = _install(venv).definitions[EXIT]
 
     trigger = task.find("t:Triggers/t:CalendarTrigger", _NS)

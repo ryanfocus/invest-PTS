@@ -111,7 +111,7 @@ TASKS = (
     Task(name="PTS 出場程式", program="exit", start=EXIT_START,
          time_limit=timedelta(hours=1),
          description=(f"PTS 出場程式。每天 {EXIT_START:%H:%M} 一次：平掉微台、檢查盤中程式今天"
-                      "有沒有跑。刻意不設重跑（告警之後再跑一次會把你自己平掉的口數再平一次）。"
+                      "有沒有跑。一天只處理一次今天的部位，刻意不設重跑。"
                       "由 tools/schedule.py 建立。")),
 )
 

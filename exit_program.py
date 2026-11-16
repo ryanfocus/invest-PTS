@@ -46,9 +46,13 @@
 
 ## 給排程（ticket 10）
 
-**不要設定失敗時自動重跑。** 告警之後使用者可能已經自己平掉剩下的口數；這時再跑一次，
-出場程式照部位檔把那幾口再平一次，就是反向新倉（「部位還在」的告警也叫人自己平掉之後
-不要再執行出場程式）。`main()` 只有在程式本身出錯、或設定有錯時回 1，告警過的結局也回 0。
+**一天只處理一次今天的部位。** 告警送出去，今天的微台就交給使用者了（了結交接）：使用者可能人在
+外面，照告警用券商 APP 自己平掉，碰不到這台電腦。這時要是出場程式再被執行一次（有人手動執行、
+在工作排程器按「執行」），照部位檔把那幾口再平一次，就是反向新倉。所以一開始先看今天的出場記錄
+（`done_path`）：在就不登入、不送單（`Ending.ALREADY_HANDLED`）。告警裡因此不必叫人「不要再執行
+出場程式」——那是人在外面做不到、也不該由使用者擋的事。
+
+排程本身也不設失敗時自動重跑：`main()` 只有在程式本身出錯、或設定有錯時回 1，告警過的結局也回 0。
 
 排程叫醒它的入口是 `scheduled.py`，排程本身由 `tools/schedule.py` 建立。出場程式的排程每天都會
 叫醒它，所以 `logs/` 的 30 天清除也由它在做完正事之後執行（`housekeeping`）。
@@ -109,6 +113,8 @@ class Ending(enum.Enum):
     SETTLED_BY_EXCHANGE = "結算日 13:30 近月停止交易時微台還沒平完，由交易所以最後結算價了結，已告警"
     NOT_CLOSED = "微台平倉沒有完成，已告警"
     EXIT_UNCERTAIN = "平倉委託不確定，不再送單，已告警"
+    # 今天的出場記錄已經在：之前那一次已經平掉，或告警交給了券商、交易所、使用者
+    ALREADY_HANDLED = "今天的部位已經處理過，這次沒有登入、沒有送單"
 
 
 @dataclass(frozen=True)
@@ -153,18 +159,37 @@ def run(broker: Broker, config: settings.Config | BrokenSettings, *,
         ending = Ending.TOO_EARLY
     else:
         with _after_stop_command(clock=clock, sleep=sleep):
-            # 等過收工指令的話，開始處理今天部位的「現在」已經不是被叫醒的那一刻
-            ending = _exit_today(broker, config, today=today, now=clock(), clock=clock,
-                                 sleep=sleep, say=say)
-            if alerts.all_sent:
-                _mark_done(today, ending.value)
-            else:
-                # 告警沒送到，使用者就不知道今天的事（網路斷了的話，平倉多半也沒做成）。不寫出場
-                # 記錄：下一次執行（補跑或下一個交易日）會把今天還在的微台再講一次（`_report_missed`）。
-                logger.error("有告警沒有送出去，不寫今天的出場記錄：下一次執行會再講一次今天的部位")
+            ending = _once_a_day(broker, config, today=today, clock=clock, sleep=sleep,
+                                 alerts=alerts)
     # 之前的交易日留下的排在今天的出場之後：這裡出了什麼事，都擋不到今天的微台平倉
     _report_missed(today, now, say)
     return _end(ending)
+
+
+def _once_a_day(broker: Broker, config: settings.Config | BrokenSettings, *, today: date,
+                clock: Callable[[], datetime], sleep: Callable[[float], None],
+                alerts: "_Alerts") -> Ending:
+    """今天的部位一天只處理一次（模組說明「給排程」）：今天的出場記錄已經在就什麼都不做；
+    處理完、告警都送出去了，才寫下出場記錄。"""
+    handled = state_files.read_marker(done_path(today))
+    if handled is not None:
+        # 告警叫人自己平的口數，使用者可能已經平掉了：出場程式不知道，照部位檔再平就是反向新倉
+        logger.error("今天的部位出場程式已經處理過（%s），一天只處理一次：這次不登入、不送單。"
+                     "當時做了什麼、要你做什麼，看 %s 與當時的 Discord 告警", handled,
+                     paths.shown_log("exit", today))
+        return Ending.ALREADY_HANDLED
+    # 等過收工指令的話，開始處理今天部位的「現在」已經不是被叫醒的那一刻。程式本身出錯的話
+    # 往外拋，由 `main()` 告警、寫出場記錄（`_scheduled_exit`）
+    ending = _exit_today(broker, config, today=today, now=clock(), clock=clock, sleep=sleep,
+                         say=alerts.say)
+    if alerts.all_sent:
+        _mark_done(today, ending.value)
+    else:
+        # 告警沒送到，使用者就不知道今天的事（網路斷了的話，平倉多半也沒做成）。不寫出場記錄：
+        # 下一次執行（補跑或下一個交易日）會把今天還在的微台再講一次（`_report_missed`），
+        # 今天之內再執行一次也照常處理——沒有人被告知要自己平。
+        logger.error("有告警沒有送出去，不寫今天的出場記錄：下一次執行會再講一次今天的部位")
+    return ending
 
 
 @contextlib.contextmanager
@@ -231,7 +256,7 @@ def _exit_today(broker: Broker, config: settings.Config | BrokenSettings, *, tod
     if isinstance(config, BrokenSettings) and closed.result in _WENT_TO_BROKER:
         say(messages.exit_settings_broken(at=clock(), error=config.error))
     if closed.file_behind:
-        # 部位檔沒記到這次做的事。再執行一次出場程式，它會照舊檔把已經平掉的口數再平一次。
+        # 部位檔沒記到這次做的事：之後看這份檔的都會照舊檔講（再執行一次出場程式則有出場記錄擋著）
         logger.error("部位檔沒記到出場程式這次的平倉：實際還剩 %d 口（%s），檔裡還剩 %d 口（%s）",
                      closed.record.open_lots, closed.record.status, closed.on_file.open_lots,
                      closed.on_file.status)
@@ -308,6 +333,7 @@ def done_path(day: date) -> str:
 
     之後每一次執行都會往回看（`_report_missed`），看到它就知道那一天不必再講——部位檔永遠
     記著告警過的那幾口（使用者自己平掉，出場程式不會知道），沒有這份記錄就會每天再講一次。
+    同一天再執行一次也看它（`_once_a_day`）：在就不再送單。
 
     **做完、而且告警都送出去了才寫**：那天跑到一半當掉、被砍掉、斷電，或網路斷了、告警沒送到
     的話沒有這份記錄，下一次執行就會把那天當成沒跑完、照部位檔再講一次。寧可多講一次，不要安靜。
@@ -447,8 +473,13 @@ def _scheduled_exit(connect: Callable[[settings.Secrets], Broker], *,
     except Exception as exc:  # noqa: BLE001
         logger.exception("出場程式意外中止")
         now = clock()
-        _send(config, notify, messages.exit_crashed(
+        told = _send(config, notify, messages.exit_crashed(
             at=now, reason=f"{type(exc).__name__}: {exc}", logs=handoff.fill_logs(now.date())))
+        # 告警請人看帳戶、自己平：送出去就和其他告警一樣交給使用者了，寫下出場記錄（`_once_a_day`）。
+        # 進場截止之前不寫：13:25 的出場還沒輪到，寫了它就不平
+        if (told and now.time() >= strategy.ENTRY_CUTOFF
+                and state_files.read_marker(done_path(now.date())) is None):
+            _mark_done(now.date(), "出場程式意外中止，已告警")
         return 1
     return status
 
