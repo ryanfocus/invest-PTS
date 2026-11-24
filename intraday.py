@@ -140,6 +140,10 @@ _MAX_LAG = timedelta(seconds=30)
 # 連續這麼久沒有即時的大台報價，就發 Discord（規格第 53 條）。
 _OUTAGE_ALERT = timedelta(minutes=3)
 
+# 一筆成交之後，累計成交筆數最晚多久會反映它。群益沒有成交時也每 5 秒左右推一次累計筆數
+# （2026-11-24 實機），有成交時推得更密；比這還晚才變的筆數，代表那段時間有成交、程式卻沒收到。
+_COUNTS_LAG = timedelta(seconds=30)
+
 # 確認記錄（`stop_seen_path`）寫不進去時，隔多久再寫一次。收工指令每秒看一次、等 2 分鐘，
 # 這個間隔要遠短於那個；不每秒重試，是為了不讓 log 每秒多一行錯誤。
 _SEEN_RETRY = timedelta(seconds=10)
@@ -333,9 +337,10 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 outage = watch.check(event.time)
                 if outage is not None:
                     # 告警講「報價恢復之前不會進場」：只停了累計筆數時成交照常，等待中的
-                    # 突破進場還會被碰到（見 `_QuoteWatch`）
+                    # 突破進場還會被碰到（見 `_QuoteWatch`）。不發 Discord 的那幾次也一樣要取消。
                     trading.cancel_breakout("報價中斷")
-                    _send(config, notify, outage)
+                    if outage.notify:
+                        _send(config, notify, outage.message)
             if isinstance(event, TxTrade):
                 if not confirmed and indicators.in_day_session(event.time):
                     confirmed = True
@@ -361,11 +366,11 @@ def run(broker: Broker, config: settings.Config, *, today: date,
                 # 先判斷、再盯價：讓 K 棒結束的這一筆，已經是下一根的第一筆成交，
                 # 剛設下的突破進場也要看它（回測裡它就是下一根的開盤價）。
                 if _live(event.time):
-                    watch.trade_at = event.time
+                    watch.on_trade(event.time)
                     trading.on_tx_trade(event)
             elif isinstance(event, TxTradeCounts):
                 raw.counts(event)
-                watch.counts_at = event.time
+                watch.on_counts(event)
                 state = indicators.add_counts(state, event)
             elif isinstance(event, ProductTrade):
                 trading.product_price = event.price
@@ -1188,7 +1193,15 @@ class _QuoteWatch:
        兩者看起來一模一樣（`run()` 的說明）。照樣告警，訊息裡講清楚臨時休市的話不必處理：
        不講的話，真的斷線時一整天沒人知道。
 
-    一次中斷只發一則。兩路都恢復之後再斷，是新的一次。
+    **沒有成交不等於報價中斷。** 漲跌停鎖住、極冷清的時候，幾分鐘才一筆成交是真的（2026-11-24
+    大台 09:03 起鎖在漲停一整天，只看「3 分鐘沒有收到成交」的話那天發了 21 則假告警）。分辨靠
+    累計成交筆數：群益沒有成交時照樣每 5 秒左右推一次，只是數字不變。所以大台成交這一路只有在
+    「最後收到的那筆成交之後，累計筆數還在增加」（`_COUNTS_LAG` 以後）時才算斷了——交易所有成交、
+    程式卻沒收到。累計筆數這一路本身停了，照舊算中斷（整個報價斷了也是從這一路看出來）。
+    今天還沒收到任何成交時照舊算中斷：開盤時就斷線與臨時休市分不出來，照樣告警（規格第 40、53 條）。
+
+    一次中斷只算一次；恢復之後再斷，是新的一次。每一次都寫 log、都取消等待中的突破進場，但**一天只發
+    第一則 Discord**：使用者盤中在外面，碰不到這台電腦，同一天再收到幾則也做不了什麼。
     """
 
     def __init__(self, today: date):
@@ -1196,32 +1209,63 @@ class _QuoteWatch:
         self._open = datetime.combine(today, calendar_tw.DAY_SESSION_OPEN)
         self._end = datetime.combine(today, ENTRY_CUTOFF)
         self._started: datetime | None = None
-        self.trade_at: datetime | None = None       # 最後一筆即時收到的大台成交
-        self.counts_at: datetime | None = None      # 最後一次累計成交筆數
+        self._trade_at: datetime | None = None      # 最後一筆即時收到的大台成交
+        self._counts_at: datetime | None = None     # 最後一次累計成交筆數
+        self._total: int | None = None              # 最後一次的累計成交筆數（買進＋賣出）
+        self._total_changed_at: datetime | None = None
         self._alerted_at: datetime | None = None
+        self._reported = False
 
-    def check(self, now: datetime) -> str | None:
-        """本機時鐘走到 `now`：該告警就回傳訊息。"""
+    def on_trade(self, t: datetime) -> None:
+        """即時收到一筆大台成交。"""
+        self._trade_at = t
+
+    def on_counts(self, event: TxTradeCounts) -> None:
+        """收到一次累計成交筆數。"""
+        total = event.buy_count + event.sell_count
+        if total != self._total:
+            self._total, self._total_changed_at = total, event.time
+        self._counts_at = event.time
+
+    def check(self, now: datetime) -> _Outage | None:
+        """本機時鐘走到 `now`：一次新的中斷滿 3 分鐘就回傳它（`notify` 只有今天第一次是 True）。"""
         if self._started is None:
             self._started = now
         if self._alerted_at is not None:
-            if (self.trade_at is not None and self.counts_at is not None
-                    and min(self.trade_at, self.counts_at) > self._alerted_at):
-                self._alerted_at = None             # 兩路都恢復了，這一次中斷結束
+            if self._down_since() > self._alerted_at:
+                self._alerted_at = None             # 恢復了，這一次中斷結束
             else:
                 return None
         if not self._open <= now < self._end:
             return None
-        since = max(self._open, self._started)
-        if self.trade_at is not None and self.counts_at is not None:
-            since = max(since, min(self.trade_at, self.counts_at))
-        if now - since < _OUTAGE_ALERT:
+        if now - self._down_since() < _OUTAGE_ALERT:
             return None
         self._alerted_at = now
-        logger.error("大台報價中斷超過 %d 分鐘：最後的即時成交 %s，最後的累計成交筆數 %s",
-                     _OUTAGE_ALERT.seconds // 60, self.trade_at, self.counts_at)
-        return messages.quote_outage(at=now, trade_at=self.trade_at, counts_at=self.counts_at,
-                                     outage=_OUTAGE_ALERT)
+        notify, self._reported = not self._reported, True
+        logger.error("大台報價中斷超過 %d 分鐘：最後的即時成交 %s，最後的累計成交筆數 %s%s",
+                     _OUTAGE_ALERT.seconds // 60, self._trade_at, self._counts_at,
+                     "" if notify else "（今天已經通知過，這次不再發 Discord）")
+        return _Outage(messages.quote_outage(at=now, trade_at=self._trade_at,
+                                             counts_at=self._counts_at, outage=_OUTAGE_ALERT),
+                       notify)
+
+    def _down_since(self) -> datetime:
+        """報價從什麼時候開始算斷了：兩路裡比較早斷的那一路；兩路都好好的就是最近一次收到的時刻。
+        不早於開盤與這一輪的第一個時鐘（晚啟動、重啟之前的空白是心跳記錄的事）。"""
+        floor = max(self._open, self._started)
+        since = floor if self._counts_at is None else max(floor, self._counts_at)
+        if self._trade_at is None:
+            return floor
+        if (self._total_changed_at is not None
+                and self._total_changed_at > self._trade_at + _COUNTS_LAG):
+            since = min(since, max(floor, self._trade_at))   # 有成交、沒收到
+        return since
+
+
+@dataclass(frozen=True)
+class _Outage:
+    message: str
+    notify: bool            # 今天第一次中斷才發 Discord
 
 
 # ── 心跳記錄 ─────────────────────────────────────────────────────────────

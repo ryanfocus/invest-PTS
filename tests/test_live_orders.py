@@ -632,7 +632,7 @@ def test_fills_of_other_orders_on_the_shared_reply_line_never_become_ptss_positi
                                 "累計：多單 1 口，均價 45152\n"
                                 "2026/11/09 08:50:00")
     assert [m.splitlines()[0] for m in notifier.sent[1:]] == [
-        "【要你處理】PTS 盤中報價中斷超過 3 分鐘"]
+        "PTS 盤中報價中斷超過 3 分鐘"]
 
 
 def test_every_entry_fill_is_logged_with_the_running_total_the_alerts_point_to(caplog):

@@ -6,6 +6,7 @@
 斷言送出的委託與發出的訊息。
 """
 
+import logging
 from datetime import timedelta
 
 from broker.fake import FakeBroker
@@ -29,12 +30,26 @@ def _silence(start: str, end: str, step: int = 10) -> list:
     return events
 
 
+def _quiet(start: str, end: str, *, buy: int, sell: int, rising: bool = False) -> list:
+    """`start` 到 `end`（含）之間沒有大台成交，群益照樣每 5 秒推一次累計成交筆數（時鐘之後 2 秒）。
+
+    `rising=False`：數字不變——交易所真的沒有成交（漲跌停鎖住、極冷清；2026-11-24 實機就是這樣）。
+    `rising=True`：每次多一筆——交易所一直有成交，是程式收不到逐筆成交。"""
+    t, stop = at(start), at(end)
+    events, n = [], 0
+    while t <= stop:
+        n += rising
+        events += [clock(t), counts(t + timedelta(seconds=2), buy=buy + n, sell=sell)]
+        t += timedelta(seconds=5)
+    return events
+
+
 def _heads(sent: list[str]) -> list[str]:
     """每一則訊息的第一行。"""
     return [m.splitlines()[0] for m in sent]
 
 
-_OUTAGE = "【要你處理】PTS 盤中報價中斷超過 3 分鐘"
+_OUTAGE = "PTS 盤中報價中斷超過 3 分鐘"
 
 
 def test_no_entries_while_quotes_are_down_and_one_alert_after_three_minutes():
@@ -55,11 +70,11 @@ def test_no_entries_while_quotes_are_down_and_one_alert_after_three_minutes():
         "2026/11/09 08:50:00", "2026/11/09 08:53:20", "2026/11/09 09:01:00",
         "2026/11/09 09:02:00"]
     assert sent[1] == (
-        "【要你處理】PTS 盤中報價中斷超過 3 分鐘\n"
+        "PTS 盤中報價中斷超過 3 分鐘\n"
         "最後收到的大台成交：08:50:30；累計成交筆數：08:50:20\n"
-        "報價恢復之前不會進場；恢復之後盤中程式自己接著判斷，不另外通知。已經有的部位照常了結。\n"
-        "請檢查這台電腦的網路與群益的報價連線。網路正常、報價卻一直沒有回來的話，"
-        "先關掉盤中程式再重新執行：它會從部位檔與原始行情記錄接著做。\n"
+        "報價恢復之前不會進場；恢復之後盤中程式自己接著判斷。已經有的部位照常了結（微台由 13:25 的"
+        "出場程式平倉，大台、小台由券商 13:30 當沖強平），不必處理。\n"
+        "今天之後再中斷，不另外通知。\n"
         "2026/11/09 08:53:20")
 
 
@@ -107,15 +122,65 @@ def test_a_waiting_breakout_is_cancelled_when_an_outage_is_reported():
         (_OUTAGE, "2026/11/09 10:04:00")]
 
 
-def test_each_separate_outage_is_reported_once():
-    """一次中斷只發一則（中斷 4 分鐘也是一則）；恢復之後又斷了 3 分鐘，是新的一次，再發一則。
-    兩次都從比較早斷的筆數（:20）算起。"""
+def test_a_later_outage_that_is_not_sent_still_cancels_the_waiting_breakout():
+    """同 test_a_waiting_breakout_is_cancelled_when_an_outage_is_reported，只是 09:10～09:14 先斷過
+    一次（09:12:20 發了今天的那一則）。10:04:00 第二次中斷不發 Discord，但「報價恢復之前不會進場」
+    照樣要做到：等待中的突破進場照樣取消，10:04:30、10:05:30 碰到 45180 都不進場。"""
+    events = (rally("08:45", 5) + rally("08:50", 20, open_=45150, step=0, bichai=500)
+              + _silence("09:10:40", "09:14:50")
+              + rally("09:15", 45, open_=45150, step=0, bichai=500)
+              + minute("10:00", 45150, 45180, bichai=1600)
+              + minute("10:01", 45170, 45175) + minute("10:02", 45170, 45175)
+              + minute("10:03", 45170, 45175) + minute("10:04", 45175, 45180)
+              + [clock(at("10:05:00")), trade(at("10:05:00"), 45175),
+                 counts(at("10:05:20"), buy=20000, sell=21700), trade(at("10:05:30"), 45180),
+                 product_trade(at("10:05:40"), 45180), trade(at("10:06:00"), 45175)])
+    broker, sent = _run(events)
+
+    assert [o.lots for o in broker.orders] == [1]
+    assert [(m.splitlines()[0], m.splitlines()[-1]) for m in sent] == [
+        ("PTS 做多：買進微台 1 口 @ 45150", "2026/11/09 08:50:00"),
+        (_OUTAGE, "2026/11/09 09:12:20")]
+
+
+def test_only_the_first_outage_of_the_day_is_sent(caplog):
+    """一次中斷只算一次（中斷 4 分鐘也是一次）；恢復之後又斷了 3 分鐘，是新的一次。兩次都從比較早
+    斷的筆數（:20）算起，都寫進 log，但**只有第一次發 Discord**：使用者盤中在外面，碰不到這台電腦，
+    同一天再收到幾則也做不了什麼（2026-11-24 一天收到 21 則）。第一則已經講了「今天之後再中斷，
+    不另外通知」。"""
+    caplog.set_level(logging.ERROR, logger="intraday")
     events = (rally("08:45", 2) + _silence("08:46:40", "08:51:00")
               + rally("08:51", 2) + _silence("08:52:40", "08:56:00")
               + rally("08:56", 2))
     _, sent = _run(events, config=make_config())
-    assert [m.splitlines()[-1] for m in sent if m.startswith(_OUTAGE)] == [
-        "2026/11/09 08:49:20", "2026/11/09 08:55:20"]
+    assert [m.splitlines()[-1] for m in sent if m.startswith(_OUTAGE)] == ["2026/11/09 08:49:20"]
+    assert [r.getMessage().split("：")[0] for r in caplog.records
+            if "報價中斷" in r.getMessage()] == ["大台報價中斷超過 3 分鐘"] * 2
+
+
+def test_a_locked_market_with_no_trades_is_not_an_outage():
+    """漲跌停鎖住（2026-11-24 大台 09:03 起鎖在漲停 40324 幾乎一整天）：幾分鐘才一筆成交，群益照樣
+    每 5 秒推一次累計成交筆數，數字沒變——交易所沒有成交，報價沒有斷。不告警。原本只看「3 分鐘沒有
+    收到成交」，那天發了 21 則假的報價中斷告警。
+
+    08:50:30 之後 3 分半沒有成交、08:54:00 一筆（筆數跟著多 1）、之後又 4 分鐘沒有成交。"""
+    events = (rally("08:45", 6) + _quiet("08:50:40", "08:53:55", buy=20000, sell=21500)
+              + [clock(at("08:54:00")), trade(at("08:54:00"), 45160),
+                 counts(at("08:54:02"), buy=20001, sell=21500)]
+              + _quiet("08:54:05", "08:58:00", buy=20001, sell=21500))
+    _, sent = _run(events, config=make_config())
+    assert not [m for m in sent if "報價中斷" in m]
+
+
+def test_trades_that_stop_arriving_while_the_counts_keep_rising_are_an_outage():
+    """逐筆成交斷了、累計成交筆數照常推來而且一直增加：交易所一直有成交，程式卻收不到——K 棒與
+    盯價都瞎了，是報價中斷。3 分鐘從最後收到的那筆成交（08:50:30）算起。"""
+    events = rally("08:45", 6) + _quiet("08:50:40", "08:55:00", buy=20000, sell=21500,
+                                        rising=True)
+    _, sent = _run(events, config=make_config())
+    outages = [m for m in sent if m.startswith(_OUTAGE)]
+    assert [m.splitlines()[1:2] + m.splitlines()[-1:] for m in outages] == [
+        ["最後收到的大台成交：08:50:30；累計成交筆數：08:53:27", "2026/11/09 08:53:30"]]
 
 
 def test_no_quotes_after_the_open_may_be_a_day_off_and_the_alert_says_so():
@@ -126,13 +191,25 @@ def test_no_quotes_after_the_open_may_be_a_day_off_and_the_alert_says_so():
                counts(at("08:40:01"), buy=0, sell=0)] + _silence("08:44:00", "08:49:00"))
     _, sent = _run(events, config=make_config())
     assert sent == [
-        "【要你處理】PTS 盤中報價中斷超過 3 分鐘\n"
+        "PTS 盤中報價中斷超過 3 分鐘\n"
         "最後收到的大台成交：今天還沒有；累計成交筆數：08:40:01\n"
-        "報價恢復之前不會進場；恢復之後盤中程式自己接著判斷，不另外通知。已經有的部位照常了結。\n"
-        "今天如果臨時休市（例如颱風假），不必處理。\n"
-        "請檢查這台電腦的網路與群益的報價連線。網路正常、報價卻一直沒有回來的話，"
-        "先關掉盤中程式再重新執行：它會從部位檔與原始行情記錄接著做。\n"
+        "報價恢復之前不會進場；恢復之後盤中程式自己接著判斷。已經有的部位照常了結（微台由 13:25 的"
+        "出場程式平倉，大台、小台由券商 13:30 當沖強平），不必處理。\n"
+        "今天還沒有收到任何成交：如果是臨時休市（例如颱風假），就是這個原因。\n"
+        "今天之後再中斷，不另外通知。\n"
         "2026/11/09 08:48:00"]
+
+
+def test_no_trades_today_is_still_reported_even_if_the_counts_keep_coming():
+    """開盤後一筆今天的成交都沒有，累計成交筆數卻照常每 5 秒推來（數字不變）。「沒有成交、筆數沒變」
+    平常代表市場鎖住、不是斷線（test_a_locked_market_with_no_trades_is_not_an_outage），但那要今天
+    已經有過成交：一筆都沒有時分不出是臨時休市還是開盤就斷線，照舊在 08:48 告警（規格第 40、53 條）。"""
+    events = ([clock(at("08:40:00")), trade(at("13:44:59", PREVIOUS_DAY), 44100)]
+              + _quiet("08:40:05", "08:49:00", buy=0, sell=0))
+    _, sent = _run(events, config=make_config())
+    assert [(m.splitlines()[0], m.splitlines()[-1]) for m in sent] == [
+        (_OUTAGE, "2026/11/09 08:48:00")]
+    assert "今天還沒有收到任何成交：如果是臨時休市（例如颱風假），就是這個原因。" in sent[0]
 
 
 def test_after_a_late_start_the_three_minutes_count_from_the_start():

@@ -135,7 +135,7 @@ def test_a_day_off_found_only_by_the_quotes_is_not_reported_as_the_program_not_r
     events = ([trade(at("13:44:59", PREVIOUS_DAY), 44100)]
               + [e for e in whole_morning() if isinstance(e, Clock)])
     _, sent = _intraday(events)
-    assert [m.splitlines()[0] for m in sent] == ["【要你處理】PTS 盤中報價中斷超過 3 分鐘"]
+    assert [m.splitlines()[0] for m in sent] == ["PTS 盤中報價中斷超過 3 分鐘"]
     assert _heartbeat()["finished"] is True
 
     _, sent = _exit()
